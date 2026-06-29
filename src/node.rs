@@ -1,0 +1,5743 @@
+//! The node event loop — the orchestration that turns the tested pieces into a
+//! running Hop node. See DESIGN.md §3 (it spans every layer).
+//!
+//! A [`Node`] is driven by [`BearerEvent`]s from a bearer and produces opaque
+//! bytes to send back over it. Per connection it:
+//! 1. runs a Noise XX handshake ([`crate::link`]), exchanging a signed binding so
+//!    each side learns the other's *hop address* (Ed25519), not just its link key;
+//! 2. once up, offers its stored bundles via binary spray-and-wait ([`crate::routing`])
+//!    and gossips its directory of adverts ([`crate::discover`]);
+//! 3. on receiving a bundle addressed to itself, delivers it to the inbox;
+//!    otherwise stores it for onward relay.
+//!
+//! The loop is transport-agnostic and fully testable without a radio: feed it
+//! events, drain its outgoing bytes, read its inbox. v1 sends each message as one
+//! link packet; MTU fragmentation (`link::fragment`) wraps this when a bearer
+//! needs it — a TODO for the BLE shim.
+
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::bundle::{
+    Bundle, BundleFlags, BundleId, BundleOpts, Destination, Payload, StreamId,
+};
+use crate::stream::StreamReassembler;
+use crate::crypto::{self, short_addr, Identity, PubKeyBytes, ShortAddr, SignedPreKey, Tag, XPubKeyBytes};
+use crate::error::{Error, Result};
+use crate::dnssec;
+use crate::hps;
+use crate::discover::{Advert, AdvertId, AdvertKind, Directory};
+use crate::link::{BearerEvent, LinkHandshake, LinkId, LinkSession, Role};
+use crate::route::RouteTable;
+use crate::routing::{BundleMeta, ForwardDecision, Router, SprayAndWait};
+use crate::{short_app, AppId, FABRIC_APP};
+use crate::app::AppKeys;
+use crate::session::Session;
+use crate::store::{MemoryStore, Store};
+
+/// A link packet on the wire: a Noise handshake message, or an encrypted record.
+#[derive(Serialize, Deserialize)]
+enum LinkPacket {
+    Handshake(Vec<u8>),
+    Data(Vec<u8>),
+    /// One fragment of a record too large for a single Noise message (max 65535 bytes).
+    /// `idx`/`cnt` order reassembly; each fragment's `ct` is independently Noise-encrypted,
+    /// so the receiver decrypts in order and concatenates the plaintext before decoding the
+    /// [`Wire`]. Without this, an oversized record (e.g. a large `hps://` broadcast) would be
+    /// silently dropped at `encrypt` (DESIGN.md §20).
+    DataFrag { idx: u16, cnt: u16, ct: Vec<u8> },
+}
+
+/// Max plaintext bytes per Noise transport message. Noise caps a message at 65535 bytes
+/// including the 16-byte AEAD tag; we leave headroom for the postcard `LinkPacket` framing.
+const MAX_RECORD_PLAINTEXT: usize = 60_000;
+
+/// Claims the peer's hop address during the Noise handshake. No signature needed:
+/// the sealing key is derived from the address (Montgomery), so the peer is bound to
+/// the address iff `address_to_x(address)` equals the static key Noise authenticated.
+#[derive(Serialize, Deserialize)]
+struct LinkAuth {
+    address: PubKeyBytes,
+}
+
+/// An application record exchanged over an established link.
+#[derive(Serialize, Deserialize)]
+enum Wire {
+    Bundle(Bundle),
+    Advert(Advert),
+}
+
+struct Handshaking {
+    hs: LinkHandshake,
+    verified: Option<PubKeyBytes>,
+}
+
+struct Established {
+    session: LinkSession,
+    peer: PubKeyBytes,
+    sent_bundles: HashSet<crate::bundle::BundleId>,
+    sent_adverts: HashSet<crate::discover::AdvertId>,
+    /// Reassembly of an in-progress fragmented record (DESIGN.md §20): accumulated decrypted
+    /// plaintext and the next fragment index expected. `frag_cnt == 0` means none in progress.
+    frag_buf: Vec<u8>,
+    frag_next: u16,
+}
+
+/// Per-PEER gossip dedup that SURVIVES link re-establishment. The per-`Established` `sent_*` sets
+/// are wiped on every (re)connect; on a flapping BLE link that re-floods the whole directory to the
+/// peer each cycle — the resource-exhaustion field bug (tx >> rx, real messages starve). We snapshot
+/// them here on Disconnect, keyed by peer address, and restore them on the next Up to the same peer.
+#[derive(Default)]
+struct PeerSent {
+    adverts: HashSet<crate::discover::AdvertId>,
+    bundles: HashSet<crate::bundle::BundleId>,
+}
+
+// Boxed because a Noise handshake state is much larger than an established session.
+enum LinkState {
+    Handshaking(Box<Handshaking>),
+    Up(Box<Established>),
+}
+
+/// Tracking for a locally-originated bundle awaiting an end-to-end ACK (§7).
+#[derive(Clone, Copy)]
+struct PendingTx {
+    copies: u16,
+    created_at: u64,
+    lifetime_ms: u32,
+    next_retx_at: u64,
+    /// Current backoff gap; doubles each retransmit up to [`MAX_RETX_INTERVAL_MS`].
+    retx_interval: u64,
+}
+
+/// Default *initial* gap between retransmission attempts for an unacked bundle. Short so a copy
+/// lost on a flaky local BLE link (drop mid-send) recovers in seconds, not half a minute; it then
+/// backs off exponentially up to [`MAX_RETX_INTERVAL_MS`], so a days-long hop still costs only a
+/// handful of retransmits rather than thousands. (Reconnects re-offer pending bundles immediately
+/// via the link-up path, so this is the fallback for losses without a reconnect.)
+pub const DEFAULT_RETX_INTERVAL_MS: u64 = 5_000;
+
+/// Ceiling on the retransmission backoff (15 min). Past this, retries pace at this rate
+/// for the rest of the bundle's lifetime.
+pub const MAX_RETX_INTERVAL_MS: u64 = 900_000;
+
+/// How often to re-gossip adverts (prekeys/presence) over already-up links, so a forward-secret
+/// session can form without a reconnect (the "move out of range and back to send" bug). Cheap —
+/// receivers dedup unchanged adverts.
+pub const REGOSSIP_INTERVAL_MS: u64 = 12_000;
+
+/// How many distinct peers a delivery-ACK is replicated to before it stops spreading
+/// (DESIGN.md §7). Until then it rides along to every new contact — the ACK both confirms
+/// delivery and vaccinates the mesh, so it's worth replicating, but bounded.
+pub const ACK_REPLICATION_TARGET: usize = 3;
+
+/// Hard cap on a delivery-ACK's lifetime (7 days). The ACK otherwise lives as long as the
+/// message it confirms.
+pub const MAX_ACK_LIFETIME_MS: u32 = 7 * 86_400_000;
+
+/// Don't re-emit a delivery-ACK for the same message more often than this — a burst of
+/// duplicate copies can't trigger an ACK storm (the re-ACK recovers a lost ACK; §7).
+pub const REACK_MIN_INTERVAL_MS: u64 = 30_000;
+
+/// Default cap on relayed (not-ours) bundles held for forwarding. Our own messages
+/// are never counted or evicted; relayed ones decay under this bound.
+pub const DEFAULT_MAX_RELAYED: usize = 128;
+
+/// After we've relayed a not-ours bundle to ≥1 peer, keep it at least this long before
+/// it becomes eviction-eligible — so in a populated area it can be handed off again, and
+/// so a flood of big transfers can't immediately evict freshly-relayed traffic (DESIGN.md
+/// §6). Under cap pressure, eviction *prefers* such already-relayed, past-grace bundles
+/// and only drops a not-yet-relayed bundle when nothing else can be freed.
+pub const EVICT_GRACE_MS: u64 = 180_000; // 3 minutes
+
+/// Default cap on the learned-route table (DESIGN.md §27). Mobile-tier; cloud nodes
+/// raise it via [`Node::set_route_capacity`] to become the long-memory backbone.
+pub const DEFAULT_MAX_ROUTES: usize = 2_048;
+
+/// Default cap on the "bundles I forwarded" memory used to correlate a returning
+/// delivery-ACK with the forward path. Bounded; pruned by age in [`Node::tick`].
+pub const DEFAULT_MAX_FORWARDED: usize = 4_096;
+
+/// TTL for a published prekey advert (7 days). Re-publish before it lapses so peers
+/// can always open a session (DESIGN.md §25).
+pub const PREKEY_TTL_MS: u32 = 604_800_000;
+
+/// §39 P4 receiver-beacon: how long a laid gradient entry lives without a refresh. Kept SHORT
+/// (relative to [`PREKEY_TTL_MS`]) so a moved/silent recipient stops attracting bundles within
+/// one TTL — no permanent black-hole. Refresh interval must be well under this.
+pub const RECV_BEACON_TTL_MS: u32 = 90_000;
+/// How often a "route-to-me" recipient re-emits its beacon to keep the gradient fresh. Well
+/// under [`RECV_BEACON_TTL_MS`] so a single missed beacon self-heals; the gradient tracks a
+/// mobile recipient at this cadence.
+pub const RECV_BEACON_REFRESH_MS: u64 = 30_000;
+/// Leading bits of the mailbox-tag used as the routable gradient prefix (the `k` of §39). Kept
+/// at the full tag width for v1 (k = 128): a sharp gradient with no false-sharing. The privacy
+/// floor (k=0 ⇒ full flood) is available by setting this to 0; dialing k *down* trades
+/// routability for a larger anonymity set, only worth it once flooding hurts.
+pub const RECV_BEACON_PREFIX_BITS: u8 = 128;
+/// Cap on the soft-state gradient table (bounds a Sybil flooding fake mailbox-tags; signed
+/// beacons stop *hijack*, this stops *bloat*). On overflow the nearest-to-expiry entry is evicted.
+pub const MAX_RECV_GRADIENT: usize = 4_096;
+
+/// TTL for an `hps://` discoverable-topic advert (7 days). Re-publish before it lapses so
+/// same-app peers keep seeing the topic (DESIGN.md §32).
+pub const HPS_TOPIC_TTL_MS: u32 = 604_800_000;
+
+/// Floor on a cached HNS record's lifetime (DESIGN.md §30): even a 0-TTL DNS answer is held
+/// briefly so a burst of lookups for the same domain coalesces.
+pub const MIN_HNS_TTL_MS: u64 = 1_000;
+
+/// Ceiling on a cached HNS record's lifetime (1 day) — a stale endpoint address can't linger
+/// forever even if DNS hands back an absurd TTL.
+pub const MAX_HNS_TTL_MS: u64 = 86_400_000;
+
+/// How often to re-attempt a still-unresolved HNS query (delay-tolerant resolution, §30).
+pub const HNS_RETRY_INTERVAL_MS: u64 = 15_000;
+
+/// Delivery tracking for a message we originated (for status: Sending/Sent N/Delivered).
+#[derive(Default)]
+struct TxInfo {
+    /// Distinct peers we've handed a copy to (the "Sent N" count).
+    relayed: HashSet<PubKeyBytes>,
+    /// The destination ACKed it back across the network.
+    delivered: bool,
+    /// Hops the original message took to *reach* the destination (forward path length).
+    delivered_hops: u8,
+    /// **Forward-path** latency to the destination in ms (the destination's receive time
+    /// minus our send time, as it reported in the ACK) — the A→B leg, not the round trip.
+    delivered_ms: u32,
+}
+
+/// §39 P4: one soft-state gradient entry — "the recipient behind this mailbox-tag is reachable
+/// via `inbound`." Recorded from a signed [`AdvertKind::RecvBeacon`]; the closest (fewest-hop)
+/// fresh beacon wins, and a higher `seq` from a new direction supersedes (handles a moved
+/// recipient). Pruned at `expires_at`.
+#[derive(Clone, Copy, Debug)]
+struct GradientEntry {
+    /// The link a matching private bundle should be forwarded down (next hop toward the recipient).
+    inbound: LinkId,
+    /// Distance to the recipient in advert-hops (lower = closer; breaks ties when re-pointing).
+    hops: u8,
+    /// `beacon.created_at + ttl_ms` — dropped once the clock passes this (no refresh ⇒ no route).
+    expires_at: u64,
+    /// The beacon's per-publisher `seq`; a strictly-higher seq supersedes even from a new link.
+    seq: u64,
+}
+
+/// A queued message for the UI: either ours awaiting send, or a peer's awaiting relay.
+#[derive(Clone, Debug)]
+pub struct QueuedMessage {
+    pub id: BundleId,
+    /// True if we originated it (pinned — never evicted). False = relaying for a peer.
+    pub own: bool,
+    /// Destination device address, if addressed to one.
+    pub to: Option<PubKeyBytes>,
+    pub priority: u8,
+    /// Hops travelled so far.
+    pub hops: u8,
+}
+
+/// The plaintext inside a forward-secret session message — what the ratchet
+/// encrypts, so `content_type` rides end-to-end like the body.
+#[derive(Serialize, Deserialize)]
+struct SessionInner {
+    content_type: String,
+    body: Vec<u8>,
+}
+
+/// Per-peer forward-secret session state (DESIGN.md §25).
+#[derive(Clone, Serialize, Deserialize)]
+struct PeerSession {
+    session: Session,
+    /// For an initiator that hasn't heard back yet: the X3DH material to repeat in a
+    /// `SessionInit` so any copy can bootstrap the peer. `None` once confirmed (we've
+    /// received a message from them) or for a responder.
+    init_material: Option<(XPubKeyBytes, XPubKeyBytes)>, // (ek_pub, spk_pub)
+    /// The initiator ephemeral that established this session, remembered so a *new*
+    /// `SessionInit` (a peer that reinstalled / lost its ratchet) is recognized as a fresh
+    /// handshake and **rebuilds** the session instead of failing to decrypt (DESIGN.md §25).
+    established_by: Option<XPubKeyBytes>,
+}
+
+/// Device-to-device content held until we can ratchet it (DESIGN.md §25): we never static-seal
+/// user content, so if the peer's prekey isn't known yet the message waits here.
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingContent {
+    display_id: BundleId, // the handle returned to the UI (stable across the deferral)
+    dst: PubKeyBytes,
+    content_type: String,
+    body: Vec<u8>,
+    request_ack: bool,
+    private: bool, // §39: send untraceably (no cleartext src/dst, floods, recognized by tag)
+}
+
+/// A decrypted user message ready for the inbox — uniform across static-sealed and
+/// forward-secret session messages.
+pub struct ReadMessage {
+    pub from: PubKeyBytes,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+/// An internet-egress HTTP request a gateway should fulfill (Use Case A, §9).
+pub struct HttpReqItem {
+    pub from: PubKeyBytes,
+    pub id: BundleId,
+    /// The domain this request targets. A `hops://` endpoint MUST validate this against the
+    /// single domain it is authorized to serve and refuse anything else (no open proxy).
+    pub host: String,
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub max_resp: u32,
+}
+
+/// A cached HNS record (DESIGN.md §30). `address` is `None` for a negative (no such hops
+/// endpoint) entry. Both honor the DNS TTL via `expires_at_ms`.
+#[derive(Clone, Copy)]
+pub struct HnsEntry {
+    pub address: Option<PubKeyBytes>,
+    pub expires_at_ms: u64,
+}
+
+/// A finished HNS resolution surfaced to the app. `address` is `None` when the domain has no
+/// `_hopaddress` record (resolution error — e.g. `hops://thisdoesnotexist.com`).
+pub struct HnsResult {
+    pub domain: String,
+    pub address: Option<PubKeyBytes>,
+}
+
+/// The outcome of starting an HNS resolution (DESIGN.md §30).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HnsLookup {
+    /// Served from a fresh cache entry. `Some(addr)` resolved; `None` is a cached negative.
+    Cached(Option<PubKeyBytes>),
+    /// A lookup was kicked off (real DNS via the host, or a mesh query); the result will
+    /// arrive via [`Node::take_hns_results`].
+    Pending,
+    /// This node can't resolve on its own (no internet) and no resolver was given. Call
+    /// [`Node::resolve_hns_via`] with a known internet-connected peer (e.g. a relay).
+    NeedsResolver,
+}
+
+/// An HTTP response a gateway sealed back to the requester.
+pub struct HttpRespItem {
+    pub from: PubKeyBytes,
+    pub for_id: BundleId,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// The built-in identity service (DESIGN.md §29): call it on any address to learn that
+/// node's display name + kind. Answered by the node itself, not the app.
+pub const SERVICE_IDENTIFY: &str = "hop.identify";
+
+/// What kind of node this is, reported by [`SERVICE_IDENTIFY`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeKind {
+    Device,
+    Relay,
+    Gateway,
+    /// A `hops://` origin endpoint (DESIGN.md §30); its `name` is the domain it serves.
+    Endpoint,
+}
+
+/// The reply body of [`SERVICE_IDENTIFY`]: who a node is. `name` is `None` when unset
+/// (a device by default) — callers fall back to the short address. A relay sets its name
+/// to its region domain. Carries the full `address` so a caller can resolve a short trace
+/// hop it received against the responder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityRecord {
+    pub name: Option<String>,
+    pub kind: NodeKind,
+    pub address: PubKeyBytes,
+}
+
+/// A service request addressed to this node that the embedding app should fulfill
+/// (built-in `hop.` services are answered by the node and never surface here).
+pub struct ServiceReqItem {
+    pub from: PubKeyBytes,
+    /// The request bundle's id — pass it to [`Node::send_service_response`] to reply.
+    pub id: BundleId,
+    pub service: String,
+    pub method: String,
+    pub args: Vec<u8>,
+}
+
+/// A service response sealed back to us (as the caller).
+pub struct ServiceRespItem {
+    pub from: PubKeyBytes,
+    pub for_id: BundleId,
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// In-progress reassembly of an inbound **carrier stream** (DESIGN.md §20): a bundle too
+/// large to send in one shot is split into ordered chunks; when they're all here the
+/// original bundle bytes are reconstructed and re-processed as if received whole. Keyed
+/// by `(sender, stream_id)`.
+struct IncomingStream {
+    reassembler: StreamReassembler,
+    data: Vec<u8>,
+    at: u64, // last activity, for pruning abandoned transfers
+}
+
+/// A bundle whose encoding exceeds this is carried as a stream of `STREAM_CHUNK`-sized
+/// chunks (transparently); anything smaller goes as one bundle. Sized to fit comfortably
+/// in one link record on every bearer (well under the 1 MiB frame cap).
+const STREAM_CHUNK: usize = 48 * 1024;
+
+/// Reserved content-type for a content-less re-establishment ping sent to heal a desynced
+/// ratchet (DESIGN.md §25). The receiver rebuilds the session as a side effect and does not
+/// surface it as a user message.
+const SESSION_ESTABLISH_CT: &str = "hop.session.establish";
+
+/// A running Hop node, generic over its [`Store`] backend (in-memory by default;
+/// `hop-store-sqlite` for persistence).
+pub struct Node<S: Store = MemoryStore> {
+    identity: Identity,
+    pub store: S,
+    router: SprayAndWait,
+    pub directory: Directory,
+    now_ms: u64,
+    /// Last time we re-gossiped adverts to all live links (so prekeys/presence propagate over
+    /// STABLE links, not just at link-up — see the re-gossip in `tick`).
+    last_regossip_ms: u64,
+    /// Last time we emitted our §39 P4 receiver-beacon (re-emitted on [`RECV_BEACON_REFRESH_MS`]).
+    last_recv_beacon_ms: u64,
+    /// "Route-to-me" mode: emit a receiver-beacon so private bundles route to us via the gradient.
+    /// Default on (the common case — be reachable); a max-privacy passive recipient sets it off and
+    /// only recognizes what floods past, advertising no linkable mailbox handle (DESIGN.md §39).
+    route_to_me: bool,
+    links: HashMap<LinkId, LinkState>,
+    /// Per-peer gossip dedup, preserved across link flaps so a reconnect doesn't re-flood the directory.
+    peer_sent: HashMap<PubKeyBytes, PeerSent>,
+    outgoing: Vec<(LinkId, Vec<u8>)>,
+    inbox: Vec<Bundle>,
+    /// Locally-originated bundles awaiting an ACK, retransmitted until acked/expired.
+    pending: HashMap<BundleId, PendingTx>,
+    retx_interval_ms: u64,
+    /// Monotonic sequence for our own published adverts (supersession, §16).
+    advert_seq: u64,
+    /// Delivery status for messages we originated (Sending/Sent N/Delivered).
+    tx: HashMap<BundleId, TxInfo>,
+    /// Insertion order of relayed (not-ours) bundles, for capacity eviction.
+    relay_order: Vec<BundleId>,
+    max_relayed: usize,
+    /// First time we relayed each not-ours bundle to a peer (custody policy, §6): eviction
+    /// prefers bundles we've already handed off and held past [`EVICT_GRACE_MS`].
+    relay_fwd: HashMap<BundleId, u64>,
+    /// Our current signed prekey (published so peers can open sessions to us).
+    prekey: SignedPreKey,
+    /// Retained prekey secrets by public, so late session inits still resolve.
+    spk_secrets: HashMap<XPubKeyBytes, [u8; 32]>,
+    /// §39 P4 soft-state routing gradient: mailbox-tag → the next hop *toward* that recipient.
+    /// Laid by recipients' signed [`AdvertKind::RecvBeacon`]s as they flood a few hops; a node
+    /// then forwards a matching **private** bundle down `inbound` instead of blind-flooding. Soft
+    /// state — pruned by `expires_at` in [`Node::tick`], superseded by a fresher/closer beacon,
+    /// capped at [`MAX_RECV_GRADIENT`]. Empty ⇒ flood fallback (the privacy floor / cold start).
+    recv_gradient: HashMap<Tag, GradientEntry>,
+    /// §39 P5: mailbox-tags whose recipient just (re)beaconed here — i.e. a want-beacon. The host
+    /// drains these via [`take_wanted_mailboxes`] and reloads that mailbox's durable blind spool, so
+    /// an offline-deposited private bundle is pulled the moment the recipient comes back. Bounded.
+    wanted_mailboxes: Vec<Tag>,
+    /// Forward-secret sessions, by peer address (DESIGN.md §25).
+    sessions: HashMap<PubKeyBytes, PeerSession>,
+    /// Bundle ids we've been "vaccinated" against by a passing delivery ACK — we
+    /// drop them on sight so a delivered message stops propagating (epidemic
+    /// recovery, DESIGN.md §6). Pruned by age in [`Node::tick`].
+    immune: HashMap<BundleId, u64>,
+    /// Egress HTTP requests addressed to us (as a gateway) awaiting fulfillment (§9).
+    http_requests: Vec<HttpReqItem>,
+    /// HTTP responses sealed back to us (as a requester).
+    http_responses: Vec<HttpRespItem>,
+    /// Learned reachability per endpoint, from observed deliveries (DESIGN.md §27):
+    /// orders transmissions (best first) and eviction (flush unknown-dst first).
+    routes: RouteTable,
+    /// Device-addressed bundles we've forwarded/originated, `id → (src, dst, at)`. A
+    /// returning delivery-ACK for one of these means we're on its path → learn the
+    /// route. Bounded; pruned by age in [`Node::tick`].
+    forwarded: HashMap<BundleId, (PubKeyBytes, PubKeyBytes, u64)>,
+    /// This node's app key material (DESIGN.md §32): the public [`AppId`] stamped on hps
+    /// adverts/handshakes, plus the secret-derived discovery/MAC keys that isolate this app's
+    /// `hps://` channels from other apps. Set by the embedding app via [`Node::set_app_keys`].
+    /// Defaults to the open fabric. Deliberately separate from [`Self::trace_app`] so enabling
+    /// hps isolation doesn't reveal the app on every forwarded hop.
+    app: AppKeys,
+    /// The app label stamped into trace hops (DESIGN.md §27). Devices leave this at the generic
+    /// [`FABRIC_APP`] (they show as "device"); only infra relays set it (to [`crate::relay_app_id`])
+    /// so a relay hop reads "Hop Relay". Set via [`Node::set_app`].
+    trace_app: AppId,
+    /// This node's display name, returned by the built-in `hop.identify` service
+    /// (DESIGN.md §29). `None` by default (a device) → callers show the short address;
+    /// a relay sets it to its region domain.
+    name: Option<String>,
+    /// What kind of node this is, returned by `hop.identify`. Defaults to `Device`.
+    kind: NodeKind,
+    /// Egress service requests addressed to us that the app must fulfill (custom,
+    /// non-`hop.` services). Built-in services are answered by the node itself.
+    service_requests: Vec<ServiceReqItem>,
+    /// Service responses sealed back to us as a caller.
+    service_responses: Vec<ServiceRespItem>,
+    /// In-progress inbound carrier-stream reassembly, keyed by `(sender, stream_id)` (§20).
+    incoming_streams: HashMap<(PubKeyBytes, StreamId), IncomingStream>,
+    /// Monotonic counter for our outbound stream ids.
+    stream_seq: u64,
+    /// Delivery-ACKs we originated, → the distinct peers we've handed each to. The ACK
+    /// keeps riding to new contacts until it reaches [`ACK_REPLICATION_TARGET`] peers,
+    /// then stops (DESIGN.md §7).
+    ack_replicate: HashMap<BundleId, HashSet<PubKeyBytes>>,
+    /// Last time we emitted a delivery-ACK for a given delivered message id — throttles
+    /// re-ACKs so duplicate floods can't cause an ACK storm.
+    last_ack: HashMap<BundleId, u64>,
+    /// Carrier chunk id → the original message id it carries (DESIGN.md §20). Lets a chunked
+    /// message report real relay progress ("Sent N") and ownership under its *original* id,
+    /// even though the bytes travel as separate carrier bundles.
+    carrier_owner: HashMap<BundleId, BundleId>,
+    /// Content awaiting a forward-secret session (DESIGN.md §25): device-to-device content is
+    /// **never** static-sealed — if we don't yet hold the peer's prekey it's queued here and
+    /// sent the moment one arrives, so every content message is ratcheted (always a 🔒).
+    pending_content: Vec<PendingContent>,
+    /// Real bundle id → the UI-facing id it should report under, for content that was deferred
+    /// (and whose eventual ratcheted bundle has a different id than the handle we returned).
+    tx_alias: HashMap<BundleId, BundleId>,
+    /// Monotonic counter making each deferred-content handle id unique.
+    pending_seq: u64,
+    /// Last time we asked a peer to reset a desynced session — throttles reset requests so a
+    /// burst of undecryptable messages can't cause a reset storm (DESIGN.md §25).
+    last_reset_req: HashMap<PubKeyBytes, u64>,
+    /// Whether this node can reach the public internet (and thus public DNS). Any node with
+    /// this set resolves HNS itself — no relay round-trip required (DESIGN.md §30). Off by
+    /// default; a relay or an internet-connected phone turns it on.
+    internet: bool,
+    /// HNS resolution cache: `domain → (address?, expires_at_ms)`. `None` is a negative
+    /// (NXDOMAIN-like) cache entry. Honors the DNS TTL and propagates like a DNS resolver.
+    hns_cache: HashMap<String, HnsEntry>,
+    /// Domains we need the host to look up in real DNS (drained by [`Node::take_dns_lookups`]),
+    /// with the in-flight set so we ask for each only once.
+    dns_lookups: Vec<String>,
+    dns_inflight: HashSet<String>,
+    /// Remote HNS queries awaiting our DNS answer: `domain → [(asker, query_id)]`. When the
+    /// host feeds the answer back we seal an [`Payload::HnsAnswer`] to each asker.
+    dns_waiters: HashMap<String, Vec<(PubKeyBytes, BundleId)>>,
+    /// Completed HNS resolutions for the app to consume ([`Node::take_hns_results`]).
+    hns_results: Vec<HnsResult>,
+    /// Domains we're still trying to resolve (DESIGN.md §30). Resolution is delay-tolerant:
+    /// if no internet/peer can answer right now, the domain stays here and is re-attempted as
+    /// peers connect, when we gain internet, and periodically — until it resolves or the caller
+    /// stops caring. Cleared once a record (positive or negative) arrives.
+    pending_resolves: HashSet<String>,
+    /// Last time we re-attempted pending resolutions, to throttle the periodic retry.
+    last_resolve_retry_ms: u64,
+    /// `hps://` topics we host, by path → keys (DESIGN.md §32).
+    services: HashMap<String, hps::ServiceConfig>,
+    /// `hps://` topics we've subscribed to, by path → the keys we were handed.
+    subscriptions: HashMap<String, HpsSubscription>,
+    /// Received, decrypted, sender-verified pub/sub messages for the app to drain.
+    hps_inbox: Vec<HpsMessage>,
+    /// Pending join requests for RequestToJoin topics we host: path → requester addresses.
+    hps_pending: HashMap<String, Vec<PubKeyBytes>>,
+    /// Invites we (host) have sent and await acceptance: (path, dest) → sent_at.
+    hps_invites_out: HashMap<(String, PubKeyBytes), u64>,
+    /// Invites we (member) have received and not yet accepted.
+    hps_invites_in: Vec<HpsInviteItem>,
+    /// Reach tally for topics we host: path → unique acking addresses (current epoch).
+    hps_reach: HashMap<String, std::collections::HashSet<PubKeyBytes>>,
+    /// Retained-member set for rekey: path → member addresses (joins/approvals/invites/acks).
+    hps_members: HashMap<String, std::collections::HashSet<PubKeyBytes>>,
+    /// Live discovery advert id per hosted Discoverable path (for tombstoning on rekey).
+    hps_adverts: HashMap<String, crate::discover::AdvertId>,
+    /// (topic_tag, epoch) we've already reach-acked, so a flood of broadcasts doesn't ack-storm.
+    hps_acked: std::collections::HashSet<([u8; 16], u32)>,
+}
+
+/// What we keep for a subscribed `hps://` topic: the content key, plus (for a service) the
+/// service public key to verify broadcasts against — `None` means a channel (verify each post
+/// against its sender's own address).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct HpsSubscription {
+    pub content_key: [u8; 32],
+    pub service_pubkey: Option<[u8; 32]>,
+    /// The topic's host node — needed to re-resolve for reach acks, leave, and rekey.
+    pub host: PubKeyBytes,
+    /// Rekey generation we currently hold; a higher-epoch HpsRekey supersedes it.
+    pub epoch: u32,
+    /// Opaque per-topic tag (matches `HpsPublish.topic_tag`); precomputed for fast routing.
+    pub topic_tag: [u8; 16],
+}
+
+/// A received `hps://` message, after decryption + sender verification.
+pub struct HpsMessage {
+    pub path: String,
+    pub sender: PubKeyBytes,
+    pub body: Vec<u8>,
+}
+
+/// An invite we (member) have received and may accept (DESIGN.md §32 Invite mode).
+#[derive(Clone)]
+pub struct HpsInviteItem {
+    pub path: String,
+    pub host: PubKeyBytes,
+    pub kind: hps::ServiceKind,
+}
+
+/// A topic we host or follow — used to rebuild the app's channel list after a restart (the
+/// node persists topics; the app's in-memory list does not).
+#[derive(Clone)]
+pub struct HpsTopicState {
+    pub host: PubKeyBytes,
+    pub path: String,
+    pub kind: hps::ServiceKind,
+    pub hosting: bool,
+    pub access: hps::AccessMode,
+}
+
+impl Node<MemoryStore> {
+    /// Create a node with an in-memory store.
+    pub fn new(identity: Identity) -> Self {
+        Self::with_store(identity, MemoryStore::new())
+    }
+
+    /// Construct a node from previously-saved identity secret bytes (see
+    /// [`crate::crypto::Identity::to_secret_bytes`]) so the address is stable across
+    /// restarts. Falls back to a fresh identity if the bytes are the wrong length.
+    pub fn from_identity_secret(secret: &[u8]) -> Self {
+        let identity = match <[u8; 32]>::try_from(secret) {
+            Ok(b) => Identity::from_secret_bytes(&b),
+            Err(_) => Identity::generate(),
+        };
+        Self::with_store(identity, MemoryStore::new())
+    }
+
+    /// Test-only: snapshot this node's store (bundles + persisted KV) so a test can simulate
+    /// a process restart / beacon-mode relaunch by rebuilding a node from the same store.
+    #[cfg(test)]
+    fn clone_store(&self) -> MemoryStore {
+        self.store.clone()
+    }
+}
+
+impl<S: Store> Node<S> {
+    /// Create a node with an explicit store backend (e.g. a persistent one).
+    pub fn with_store(identity: Identity, store: S) -> Self {
+        // Deterministic so it survives restarts (peers cache our prekey advert).
+        let prekey = identity.derive_prekey();
+        let mut spk_secrets = HashMap::new();
+        spk_secrets.insert(prekey.public, prekey.secret_bytes());
+        let mut node = Self {
+            identity,
+            store,
+            router: SprayAndWait::new(),
+            directory: Directory::new(),
+            now_ms: 0,
+            last_regossip_ms: 0,
+            last_recv_beacon_ms: 0,
+            route_to_me: true,
+            links: HashMap::new(),
+            peer_sent: HashMap::new(),
+            outgoing: Vec::new(),
+            inbox: Vec::new(),
+            pending: HashMap::new(),
+            retx_interval_ms: DEFAULT_RETX_INTERVAL_MS,
+            advert_seq: 0,
+            tx: HashMap::new(),
+            relay_order: Vec::new(),
+            max_relayed: DEFAULT_MAX_RELAYED,
+            relay_fwd: HashMap::new(),
+            prekey,
+            spk_secrets,
+            recv_gradient: HashMap::new(),
+            wanted_mailboxes: Vec::new(),
+            sessions: HashMap::new(),
+            immune: HashMap::new(),
+            http_requests: Vec::new(),
+            http_responses: Vec::new(),
+            routes: RouteTable::new(DEFAULT_MAX_ROUTES),
+            forwarded: HashMap::new(),
+            app: AppKeys::fabric(),
+            trace_app: FABRIC_APP,
+            name: None,
+            kind: NodeKind::Device,
+            service_requests: Vec::new(),
+            service_responses: Vec::new(),
+            incoming_streams: HashMap::new(),
+            stream_seq: 0,
+            ack_replicate: HashMap::new(),
+            last_ack: HashMap::new(),
+            carrier_owner: HashMap::new(),
+            pending_content: Vec::new(),
+            tx_alias: HashMap::new(),
+            pending_seq: 0,
+            last_reset_req: HashMap::new(),
+            internet: false,
+            hns_cache: HashMap::new(),
+            dns_lookups: Vec::new(),
+            dns_inflight: HashSet::new(),
+            dns_waiters: HashMap::new(),
+            hns_results: Vec::new(),
+            pending_resolves: HashSet::new(),
+            last_resolve_retry_ms: 0,
+            services: HashMap::new(),
+            subscriptions: HashMap::new(),
+            hps_inbox: Vec::new(),
+            hps_pending: HashMap::new(),
+            hps_invites_out: HashMap::new(),
+            hps_invites_in: Vec::new(),
+            hps_reach: HashMap::new(),
+            hps_members: HashMap::new(),
+            hps_adverts: HashMap::new(),
+            hps_acked: std::collections::HashSet::new(),
+        };
+        node.rehydrate();
+        node
+    }
+
+    /// Create a node with an explicit store and app key material (DESIGN.md §17, §32). The app
+    /// secret isolates this app's `hps://` channels from other apps; see [`AppKeys`].
+    pub fn with_store_app(identity: Identity, store: S, app: AppKeys) -> Self {
+        let mut node = Self::with_store(identity, store);
+        node.set_app_keys(app);
+        node
+    }
+
+    /// Rebuild in-memory tracking from a (possibly persistent) store on startup, so a
+    /// restart resumes cleanly: our own undelivered messages keep retransmitting, and
+    /// relayed bundles re-enter the eviction order so the store stays bounded
+    /// (DESIGN.md §5, §6). A no-op on an empty (fresh) store.
+    fn rehydrate(&mut self) {
+        // Restore hosted hps topics (their keys + access/visibility) so they survive a restart
+        // (DESIGN.md §32). Re-advertise discoverable ones.
+        for (key, bytes) in self.store.list_kv("hps/svc/") {
+            let Some(path) = key.strip_prefix("hps/svc/").map(str::to_string) else { continue };
+            if let Ok(cfg) = postcard::from_bytes::<hps::ServiceConfig>(&bytes) {
+                self.services.insert(path, cfg);
+            }
+        }
+        // Restore subscriptions so we keep decrypting topics we follow.
+        for (key, bytes) in self.store.list_kv("hps/sub/") {
+            let Some(path) = key.strip_prefix("hps/sub/").map(str::to_string) else { continue };
+            if let Ok(sub) = postcard::from_bytes::<HpsSubscription>(&bytes) {
+                self.directory.subscribe(path.clone());
+                self.subscriptions.insert(path, sub);
+            }
+        }
+        // Restore pending join requests + the retained-member set for topics we host, so an
+        // approval (and a later rekey) still works after a restart (DESIGN.md §32).
+        for (key, bytes) in self.store.list_kv("hps/pending/") {
+            let Some(path) = key.strip_prefix("hps/pending/").map(str::to_string) else { continue };
+            if let Ok(q) = postcard::from_bytes::<Vec<PubKeyBytes>>(&bytes) {
+                if !q.is_empty() { self.hps_pending.insert(path, q); }
+            }
+        }
+        for (key, bytes) in self.store.list_kv("hps/members/") {
+            let Some(path) = key.strip_prefix("hps/members/").map(str::to_string) else { continue };
+            if let Ok(m) = postcard::from_bytes::<Vec<PubKeyBytes>>(&bytes) {
+                self.hps_members.insert(path, m.into_iter().collect());
+            }
+        }
+        // Restore received/outstanding invites (§32).
+        if let Some(b) = self.store.get_kv("hps/invites_in") {
+            if let Ok(v) = postcard::from_bytes::<Vec<(String, PubKeyBytes, bool)>>(&b) {
+                self.hps_invites_in = v.into_iter().map(|(path, host, ch)| HpsInviteItem {
+                    path, host,
+                    kind: if ch { hps::ServiceKind::Channel } else { hps::ServiceKind::Service },
+                }).collect();
+            }
+        }
+        if let Some(b) = self.store.get_kv("hps/invites_out") {
+            if let Ok(v) = postcard::from_bytes::<Vec<(String, PubKeyBytes)>>(&b) {
+                for k in v { self.hps_invites_out.insert(k, 0); }
+            }
+        }
+        // Restore the deferred-content queue (sent messages awaiting a prekey, §25).
+        if let Some(b) = self.store.get_kv("pending_content") {
+            if let Ok(v) = postcard::from_bytes::<Vec<PendingContent>>(&b) {
+                for pc in &v { self.tx.entry(pc.display_id).or_default(); } // still "Sending…"
+                self.pending_content = v;
+            }
+        }
+
+        // Restore forward-secret sessions so a restart / beacon-mode relaunch resumes the
+        // ratchet instead of desyncing the peer (DESIGN.md §25).
+        for (key, bytes) in self.store.list_kv("session/") {
+            let Some(b58) = key.strip_prefix("session/") else { continue };
+            let Ok(addr_vec) = bs58::decode(b58).into_vec() else { continue };
+            let Ok(addr) = <PubKeyBytes>::try_from(addr_vec.as_slice()) else { continue };
+            if let Ok(ps) = postcard::from_bytes::<PeerSession>(&bytes) {
+                self.sessions.insert(addr, ps);
+            }
+        }
+
+        // Re-feed persisted carrier chunks so a partial large transfer (an image whose
+        // in-memory reassembly was lost to a background suspend/relaunch) resumes instead of
+        // restarting — the relay only still holds the chunks we hadn't yet received (§20, §22).
+        let mut by_stream: std::collections::HashMap<(PubKeyBytes, StreamId), Vec<(u64, bool, Vec<u8>)>> =
+            std::collections::HashMap::new();
+        for (key, val) in self.store.list_kv("strm/") {
+            if val.is_empty() {
+                continue;
+            }
+            if let Some((from, sid, seq)) = parse_stream_key(&key) {
+                by_stream.entry((from, sid)).or_default().push((seq, val[0] != 0, val[1..].to_vec()));
+            }
+        }
+        for ((from, sid), mut chunks) in by_stream {
+            chunks.sort_by_key(|c| c.0);
+            for (seq, fin, bytes) in chunks {
+                if let Some(inner_bytes) = self.accept_stream_chunk(from, sid, seq, bytes, fin) {
+                    if let Ok(inner) = Bundle::from_bytes(&inner_bytes) {
+                        self.on_bundle(0, inner); // completed while we were away → deliver
+                    }
+                }
+            }
+        }
+
+        let me = self.address();
+        for id in self.store.have().ids {
+            let Some(b) = self.store.get(&id) else { continue };
+            if b.inner.src == me && !b.inner.flags.is_ack {
+                // Our own message that wasn't yet ACKed (delivered ones were purged).
+                self.tx.entry(id).or_default();
+                if b.inner.flags.request_ack {
+                    self.pending.insert(
+                        id,
+                        PendingTx {
+                            copies: b.env.copies,
+                            created_at: b.inner.created_at,
+                            lifetime_ms: b.inner.lifetime_ms,
+                            next_retx_at: 0, // re-offer on the next tick
+                            retx_interval: self.retx_interval_ms,
+                        },
+                    );
+                }
+            } else {
+                self.relay_order.push(id); // relayed: subject to eviction bound
+            }
+        }
+        self.evict_relayed_if_needed();
+    }
+
+    /// Export this node's identity secret so it can be persisted and restored.
+    pub fn identity_secret(&self) -> [u8; 32] {
+        self.identity.to_secret_bytes()
+    }
+
+    pub fn address(&self) -> PubKeyBytes {
+        self.identity.address()
+    }
+
+    /// Advance the node's advisory clock (used for advert expiry/discovery).
+    pub fn set_time(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    /// Raise (or lower) the learned-route table capacity (DESIGN.md §27). Cloud nodes
+    /// set this high to become the long-memory backbone; mobile nodes keep the default.
+    pub fn set_route_capacity(&mut self, cap: usize) {
+        self.routes.set_capacity(cap);
+    }
+
+    /// Set the relayed-bundle custody window (`max_relayed`). With the forward-before-evict
+    /// policy this is a *sliding window* of concurrent custody, not a transfer-size limit,
+    /// so a cloud relay can run a large window for many in-flight chunked transfers.
+    pub fn set_max_relayed(&mut self, cap: usize) {
+        self.max_relayed = cap.max(1);
+        self.evict_relayed_if_needed();
+    }
+
+    /// Set the app id this node **publicly stamps** into each trace hop (DESIGN.md §27).
+    ///
+    /// Privacy: this advertises "this node carries app X" to every relay on the path,
+    /// so ONLY public infra nodes should set it — a relay sets [`crate::relay_app_id`]
+    /// to show as "Hop Relay". **End-user devices must leave this at [`FABRIC_APP`]**
+    /// (the default) so they never advertise which app they run. (The FFI deliberately
+    /// exposes no setter for this.)
+    pub fn set_app(&mut self, app: AppId) {
+        self.trace_app = app; // trace-hop label only (relay self-identifies); not an hps app
+    }
+
+    /// Set this node's full app key material from its 32-byte secret (DESIGN.md §17, §32). The
+    /// embedding app calls this so its `hps://` channels/services are isolated from other apps:
+    /// only same-secret peers can discover, join, or be invited to them. The secret is never
+    /// persisted by core — pass it every launch (like the identity seed). Trace-hop labeling is
+    /// unaffected (devices still show as generic "device", §27).
+    pub fn set_app_keys(&mut self, keys: AppKeys) {
+        self.directory.set_app(keys.id);
+        self.app = keys;
+    }
+
+    /// Decayed learned reachability toward `dst` (0.0 if no route is known). Higher
+    /// means this node is a better path to `dst` right now.
+    pub fn route_utility(&self, dst: &PubKeyBytes) -> f64 {
+        self.routes.utility(dst, self.now_ms)
+    }
+
+    /// Whether this node has learned any live route toward `dst`.
+    pub fn knows_route(&self, dst: &PubKeyBytes) -> bool {
+        self.routes.knows(dst, self.now_ms)
+    }
+
+    /// Subscribe the local directory to a service topic.
+    pub fn subscribe(&mut self, topic: impl Into<String>) {
+        self.directory.subscribe(topic);
+    }
+
+    /// Submit a locally-originated bundle for delivery; offers it to live links.
+    /// If it requests an ACK, it's tracked for retransmission until acked/expired.
+    pub fn submit(&mut self, bundle: Bundle) {
+        let id = bundle.id();
+        let track = bundle.inner.flags.request_ack && !bundle.inner.flags.is_ack;
+        let pend = PendingTx {
+            copies: bundle.env.copies,
+            created_at: bundle.inner.created_at,
+            lifetime_ms: bundle.inner.lifetime_ms,
+            next_retx_at: self.now_ms.saturating_add(self.retx_interval_ms),
+            retx_interval: self.retx_interval_ms,
+        };
+        if self.store.put(bundle, self.now_ms) {
+            if track {
+                self.pending.insert(id, pend);
+            }
+            self.offer_bundles_to_all();
+        }
+    }
+
+    /// Number of locally-originated bundles still awaiting an ACK.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Send `body` to `dst` — **untraceably, by default** (DESIGN.md §39). No cleartext
+    /// src/dst: the bundle floods (`Broadcast`) and is recognized only by the holder of
+    /// `dst`'s prekey ("is this mine?"). The content is still forward-secret (the inner
+    /// ratchet) and the sender authenticated (its identity rides *inside* the seal). With
+    /// `request_ack`, the recipient seals a private ACK back so delivery still confirms.
+    ///
+    /// We need `dst`'s published prekey for BOTH the recognition tag and the ratchet, so —
+    /// exactly as the traced path — when we haven't seen it yet we DON'T static-seal: the
+    /// content is queued ("Securing…") and flushes the moment the prekey arrives (§25).
+    ///
+    /// For the opt-in, fully-attributed path (cleartext src/dst, §27 provenance, route
+    /// learning, relay vaccination), use [`send_message_traced`].
+    pub fn send_message(
+        &mut self,
+        dst: PubKeyBytes,
+        content_type: String,
+        body: Vec<u8>,
+        request_ack: bool,
+    ) -> Result<BundleId> {
+        // Resolve the prekey BEFORE encrypting so we never advance the ratchet only to defer
+        // (which would silently drop a real ciphertext and desync the session).
+        let spk_pub = match self.directory.prekey(&dst) {
+            Some(pb) => pb.spk_pub,
+            None => return Ok(self.defer_content(dst, content_type, body, request_ack, true)),
+        };
+        match self.session_payload(&dst, content_type.clone(), body.clone())? {
+            Some(inner) => {
+                let id = self.dispatch_private(dst, spk_pub, inner, request_ack, None)?;
+                self.flush_pending_content(); // a session may have just opened — flush deferrals
+                Ok(id)
+            }
+            None => Ok(self.defer_content(dst, content_type, body, request_ack, true)),
+        }
+    }
+
+    /// Send `body` to `dst` with full §27 provenance — cleartext src/dst, an identity
+    /// signature, route learning, carrier chunking, and relay-vaccinating ACKs. This is the
+    /// **opt-in traced** path; the default [`send_message`] is untraceable (§39). Used for
+    /// the rare cases that need a directed unicast (e.g. control to a directly-connected
+    /// peer) or where the user has explicitly opted into a traceable send.
+    pub fn send_message_traced(
+        &mut self,
+        dst: PubKeyBytes,
+        content_type: String,
+        body: Vec<u8>,
+        request_ack: bool,
+    ) -> Result<BundleId> {
+        // Require ratcheting device-to-device (DESIGN.md §25): if we can build a forward-secret
+        // payload now, send it; otherwise we have no prekey yet — DON'T static-seal, queue the
+        // content and return a stable handle. It flushes the moment a prekey arrives.
+        match self.session_payload(&dst, content_type.clone(), body.clone())? {
+            Some(payload) => {
+                let id = self.dispatch_content(dst, payload, request_ack, None)?;
+                // Sending this may have just established a session to `dst` (the prekey path in
+                // session_payload). Any EARLIER content deferred for the same peer ("Securing…")
+                // can ratchet now — flush it immediately instead of waiting for the next tick,
+                // which won't run if the app backgrounds right after this send. (The stuck-"Securing"
+                // bug: a queued message never left because its flush only ever fired on tick.)
+                self.flush_pending_content();
+                Ok(id)
+            }
+            None => Ok(self.defer_content(dst, content_type, body, request_ack, false)),
+        }
+    }
+
+    /// Queue content we can't ratchet yet (no prekey for `dst`): we never static-seal user
+    /// content (§25). Returns a stable handle the UI shows as "Sending…"; it flushes the
+    /// moment we learn `dst`'s prekey. `private` routes the eventual send through §39.
+    fn defer_content(
+        &mut self,
+        dst: PubKeyBytes,
+        content_type: String,
+        body: Vec<u8>,
+        request_ack: bool,
+        private: bool,
+    ) -> BundleId {
+        self.pending_seq += 1;
+        let h = blake3::hash(
+            &[&dst[..], content_type.as_bytes(), &body, &self.pending_seq.to_be_bytes()].concat(),
+        );
+        let display_id: BundleId = *h.as_bytes();
+        self.tx.entry(display_id).or_default(); // shows as Sending… until ratcheted
+        self.pending_content.push(PendingContent {
+            display_id,
+            dst,
+            content_type,
+            body,
+            request_ack,
+            private,
+        });
+        self.persist_pending_content(); // a sent-but-deferred message must survive restart
+        display_id
+    }
+
+    /// Build + submit a ratcheted content bundle. `display_id` is `Some` when this content was
+    /// deferred (the real bundle id differs from the handle the UI already holds) — we alias the
+    /// real id to it so delivery status lands on the right message.
+    fn dispatch_content(
+        &mut self,
+        dst: PubKeyBytes,
+        payload: Payload,
+        request_ack: bool,
+        display_id: Option<BundleId>,
+    ) -> Result<BundleId> {
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Device(dst),
+            &dst,
+            &payload,
+            BundleOpts {
+                created_at: self.now_ms,
+                flags: BundleFlags { request_ack, ..Default::default() },
+                ..Default::default()
+            },
+        )?;
+        let real = bundle.id();
+        let display = display_id.unwrap_or(real);
+        if display != real {
+            self.tx_alias.insert(real, display);
+        }
+        self.tx.entry(display).or_default(); // track delivery status for the UI
+        // Remember our own send so the returning delivery-ACK teaches us the route (§27).
+        self.forwarded.insert(real, (self.identity.address(), dst, self.now_ms));
+        self.deliver(bundle);
+        Ok(display)
+    }
+
+    /// Build + flood a §39 private bundle: wrap the (already forward-secret) `inner` payload
+    /// with our identity, then seal the whole thing to `dst`'s address inside an anonymous,
+    /// flooding envelope. `display_id` aliases a deferred send's handle (as in
+    /// [`dispatch_content`]). With `request_ack` the envelope is marked so it's retx-tracked
+    /// in `pending` until the recipient's private ACK clears it (the recipient reads that
+    /// cleartext flag to decide whether to ACK). No `forwarded` route-learning and no carrier
+    /// chunking — there's no cleartext dst to route toward (that's the gradient work, P4).
+    fn dispatch_private(
+        &mut self,
+        dst: PubKeyBytes,
+        spk_pub: XPubKeyBytes,
+        inner: Payload,
+        request_ack: bool,
+        display_id: Option<BundleId>,
+    ) -> Result<BundleId> {
+        let wrapped =
+            Payload::Private { sender: self.identity.address(), inner: Box::new(inner) };
+        // §39 P4: stamp the recipient's mailbox-tag so a node holding a gradient toward it can
+        // route this bundle there (instead of blind-flooding) — without any cleartext dst. The
+        // sender already has `spk_pub`, so it computes the SAME tag the recipient beacons.
+        let bundle = Bundle::create_private(
+            &dst,
+            &spk_pub,
+            &wrapped,
+            Some(crypto::mailbox_tag(&spk_pub)), // mailbox-tag = the gradient key (P4 routing; P5 pull)
+            None, // sub-prefix hint (k<128) — unused for v1's full-tag prefix
+            BundleOpts {
+                created_at: self.now_ms,
+                flags: BundleFlags { request_ack, ..Default::default() },
+                ..Default::default()
+            },
+        )?;
+        let real = bundle.id();
+        let display = display_id.unwrap_or(real);
+        if display != real {
+            self.tx_alias.insert(real, display);
+        }
+        self.tx.entry(display).or_default(); // track delivery for the UI (private ACK flips it)
+        self.submit(bundle); // Broadcast → floods to every link; recognized only by `dst`
+        Ok(display)
+    }
+
+    /// Try to flush queued content now that we may know more peers' prekeys (called when a
+    /// prekey advert is accepted, and on tick). Anything still without a prekey stays queued.
+    fn flush_pending_content(&mut self) {
+        if self.pending_content.is_empty() {
+            return;
+        }
+        let mut still = Vec::new();
+        for pc in std::mem::take(&mut self.pending_content) {
+            // A §39 private send also needs the recipient's prekey for its recognition tag —
+            // resolve it before encrypting so we never advance the ratchet only to re-defer.
+            let spk_pub = if pc.private { self.directory.prekey(&pc.dst).map(|b| b.spk_pub) } else { None };
+            if pc.private && spk_pub.is_none() {
+                still.push(pc); // no prekey yet → keep waiting (it gossips, §25)
+                continue;
+            }
+            match self.session_payload(&pc.dst, pc.content_type.clone(), pc.body.clone()) {
+                Ok(Some(payload)) if pc.private => {
+                    let _ = self.dispatch_private(
+                        pc.dst, spk_pub.unwrap(), payload, pc.request_ack, Some(pc.display_id),
+                    );
+                }
+                Ok(Some(payload)) => {
+                    let _ = self.dispatch_content(pc.dst, payload, pc.request_ack, Some(pc.display_id));
+                }
+                _ => still.push(pc), // still no prekey → keep waiting (it gossips, §25)
+            }
+        }
+        self.pending_content = still;
+        self.persist_pending_content(); // some flushed → update the durable copy
+    }
+
+    /// Resolve a bundle id to the UI-facing id its status should land on: a carrier chunk maps
+    /// to its original message, and a deferred message's real id maps to its handle (§20, §25).
+    fn display_id(&self, id: &BundleId) -> BundleId {
+        let owned = self.carrier_owner.get(id).copied().unwrap_or(*id);
+        self.tx_alias.get(&owned).copied().unwrap_or(owned)
+    }
+
+    /// Choose a forward-secret payload for a peer message: an established session, or a freshly
+    /// opened one from the peer's published prekey. `None` when neither is available yet (no
+    /// prekey) — the caller defers rather than static-sealing (DESIGN.md §25).
+    fn session_payload(
+        &mut self,
+        dst: &PubKeyBytes,
+        content_type: String,
+        body: Vec<u8>,
+    ) -> Result<Option<Payload>> {
+        // Established session: ratchet-encrypt. Re-send as SessionInit until the peer
+        // has replied (init_material present) so any copy can bootstrap them.
+        if let Some(ps) = self.sessions.get_mut(dst) {
+            let inner = postcard::to_allocvec(&SessionInner { content_type, body })?;
+            let msg = ps.session.encrypt(&inner)?;
+            let out = match ps.init_material {
+                Some((ek_pub, spk_pub)) => Payload::SessionInit { ek_pub, spk_pub, msg },
+                None => Payload::SessionMessage { msg },
+            };
+            self.persist_session(dst); // ratchet advanced — save it (survives restart)
+            return Ok(Some(out));
+        }
+        // No session yet: open one if the peer has published a prekey we've seen.
+        if let Some(bundle) = self.directory.prekey(dst) {
+            let inner = postcard::to_allocvec(&SessionInner { content_type, body })?;
+            let (ek_pub, root) = crypto::x3dh_initiate(&self.identity, &bundle)?;
+            let mut session = Session::init_initiator(root, bundle.spk_pub);
+            let msg = session.encrypt(&inner)?;
+            self.sessions.insert(
+                *dst,
+                PeerSession {
+                    session,
+                    init_material: Some((ek_pub, bundle.spk_pub)),
+                    established_by: Some(ek_pub),
+                },
+            );
+            self.persist_session(dst);
+            return Ok(Some(Payload::SessionInit { ek_pub, spk_pub: bundle.spk_pub, msg }));
+        }
+        // No prekey yet → defer (never static-seal content).
+        Ok(None)
+    }
+
+    /// Durable KV key for a peer's forward-secret session (DESIGN.md §25).
+    fn session_kv_key(peer: &PubKeyBytes) -> String {
+        format!("session/{}", bs58::encode(peer).into_string())
+    }
+
+    /// Persist (or, if absent, clear) a peer's ratchet session to the store so it survives a
+    /// restart / beacon-mode background-kill. Best-effort: a serialization slip mustn't break
+    /// sending.
+    fn persist_session(&mut self, peer: &PubKeyBytes) {
+        let key = Self::session_kv_key(peer);
+        match self.sessions.get(peer) {
+            Some(ps) => {
+                if let Ok(bytes) = postcard::to_allocvec(ps) {
+                    self.store.put_kv(&key, bytes);
+                }
+            }
+            None => self.store.remove_kv(&key),
+        }
+    }
+
+    /// Publish (and gossip) this node's signed prekey so peers can open forward-secret
+    /// sessions to it without a live round-trip (DESIGN.md §25). Re-publish
+    /// periodically to stay within the advert TTL. Returns the advert id.
+    pub fn publish_prekey(&mut self) -> Result<AdvertId> {
+        self.advert_seq += 1;
+        let advert = Advert::publish(
+            &self.identity,
+            AdvertKind::PreKey { spk_pub: self.prekey.public, spk_sig: self.prekey.sig.to_vec() },
+            self.now_ms,
+            PREKEY_TTL_MS,
+            self.advert_seq,
+        )?;
+        let id = advert.id;
+        self.publish(advert);
+        Ok(id)
+    }
+
+    /// §39 P4: publish (and gossip) this node's signed **receiver-beacon** so peers lay a
+    /// gradient toward our mailbox-tag and route private bundles to us instead of blind-flooding.
+    /// Call this when in "route-to-me" mode (a recipient that wants to be reachable deep in the
+    /// mesh / across a relay→BLE bridge); a passive recipient skips it for max privacy and just
+    /// recognizes whatever floods past. Re-published on a short interval from [`Node::tick`] so the
+    /// gradient stays fresh + tracks a mobile recipient. Returns the advert id.
+    pub fn publish_recv_beacon(&mut self) -> Result<AdvertId> {
+        self.advert_seq += 1;
+        let advert = Advert::publish(
+            &self.identity,
+            AdvertKind::RecvBeacon {
+                mailbox: crypto::mailbox_tag(&self.prekey.public),
+                prefix_bits: RECV_BEACON_PREFIX_BITS,
+            },
+            self.now_ms,
+            RECV_BEACON_TTL_MS,
+            self.advert_seq,
+        )?;
+        let id = advert.id;
+        self.publish(advert);
+        Ok(id)
+    }
+
+    /// Whether we hold a forward-secret session with `addr` — i.e. messages to/from
+    /// it are ratchet-encrypted rather than static-sealed (DESIGN.md §25).
+    pub fn has_session(&self, addr: &PubKeyBytes) -> bool {
+        self.sessions.contains_key(addr)
+    }
+
+    /// Decrypt a bundle addressed to this node (e.g. an inbox item), raw payload.
+    pub fn open(&self, bundle: &Bundle) -> Result<Payload> {
+        bundle.open(&self.identity)
+    }
+
+    /// §39: does any prekey we still hold the secret for recognize this private bundle as
+    /// ours? One DH + one hash per prekey — the cost of "is this mine?" as the bundle floods
+    /// past. (We keep retired prekey secrets in `spk_secrets`, so a message in flight when we
+    /// rotated is still recognized.)
+    fn recognizes(&self, bundle: &Bundle) -> bool {
+        self.spk_secrets.values().any(|secret| bundle.recognized_by(secret))
+    }
+
+    /// Handle a private (§39) bundle we've recognized as ours. Opens the seal to route on the
+    /// inner payload: a delivery ACK flips our send to "Delivered"; user content is delivered
+    /// to the inbox (once) and, if asked, ACKed back to the sender we just learned from inside
+    /// the seal. Recognition runs on every flooded copy, so we deliver/handle only on the
+    /// first sighting but may re-ACK a duplicate (throttled) to cover a lost first ACK.
+    fn deliver_private(&mut self, bundle: &Bundle, id: &BundleId) {
+        let first = !self.store.seen(id);
+        let (sender, inner) = match bundle.open(&self.identity) {
+            Ok(Payload::Private { sender, inner }) => (sender, inner),
+            _ => return, // recognized but not a well-formed private payload — ignore
+        };
+        match *inner {
+            // A private delivery ACK for one of OUR sends: stop carrying/tracking it and mark
+            // it Delivered. (No relay vaccine — the acked id can't ride in cleartext without
+            // linking, so other relays drop their copy by TTL; the §39 storage cost.)
+            Payload::Ack { for_bundle_id, delivery_hops, delivery_ms, .. } if first => {
+                self.pending.remove(&for_bundle_id);
+                self.store.remove(&for_bundle_id);
+                let display = self.display_id(&for_bundle_id);
+                if let Some(info) = self.tx.get_mut(&display) {
+                    info.delivered = true;
+                    info.delivered_hops = delivery_hops;
+                    info.delivered_ms = delivery_ms;
+                }
+            }
+            Payload::Ack { .. } => {} // a duplicate ACK — already handled
+            // User content addressed to us: deliver once (read_message re-opens + ratchets,
+            // keyed off the in-seal sender), then ACK back if requested.
+            _ => {
+                if first {
+                    self.inbox.push(bundle.clone());
+                }
+                if bundle.inner.flags.request_ack {
+                    let due = match self.last_ack.get(id) {
+                        Some(&t) => self.now_ms.saturating_sub(t) >= REACK_MIN_INTERVAL_MS,
+                        None => true,
+                    };
+                    if due {
+                        // Report the forward-path (A→B) latency we observed, not a round trip.
+                        let fwd = forward_ms(self.now_ms, bundle.inner.created_at);
+                        self.emit_private_ack(sender, *id, bundle.env.hops, fwd);
+                    }
+                }
+            }
+        }
+    }
+
+    /// §39: seal a delivery ACK back to `to` (whom we learned from inside the message's seal)
+    /// for `for_bundle_id`, reporting the forward path length + the A→B latency we observed. It
+    /// floods and is recognized only by `to`. Needs `to`'s prekey; without it we can't ACK
+    /// privately and the sender stays "Sent" (a documented §39 limitation — both ends normally
+    /// publish prekeys).
+    fn emit_private_ack(&mut self, to: PubKeyBytes, for_bundle_id: BundleId, delivery_hops: u8, delivery_ms: u32) {
+        let spk_pub = match self.directory.prekey(&to) {
+            Some(b) => b.spk_pub,
+            None => return,
+        };
+        let ack = Payload::Ack { for_bundle_id, status: 0, delivery_hops, delivery_ms };
+        let wrapped = Payload::Private { sender: self.identity.address(), inner: Box::new(ack) };
+        if let Ok(b) = Bundle::create_private(
+            &to,
+            &spk_pub,
+            &wrapped,
+            Some(crypto::mailbox_tag(&spk_pub)), // §39 P4: ride `to`'s gradient back (not blind flood)
+            None,
+            BundleOpts { created_at: self.now_ms, ..Default::default() },
+        ) {
+            self.last_ack.insert(for_bundle_id, self.now_ms); // throttle re-ACKs by the acked id
+            self.submit(b);
+        }
+    }
+
+    /// Read a user message addressed to this node — uniform across static-sealed
+    /// (`PeerMessage`) and forward-secret session payloads. Establishes the responder
+    /// side of a session on first `SessionInit`. Returns `None` for non-user payloads
+    /// (HTTP/stream/ack). Mutates session state, so it must be called once per bundle.
+    pub fn read_message(&mut self, bundle: &Bundle) -> Result<Option<ReadMessage>> {
+        match bundle.open(&self.identity)? {
+            // §39 untraceable: the *real* sender rode inside the seal (the envelope src is
+            // zeroed). Use it — the inner ratchet authenticates that it's genuinely them.
+            Payload::Private { sender, inner } => self.read_inner_message(sender, *inner),
+            other => self.read_inner_message(bundle.inner.src, other),
+        }
+    }
+
+    /// Decrypt a user-message payload attributed to `from` — shared by the normal path (where
+    /// `from` is the cleartext envelope src) and the §39 private path (where it came from
+    /// inside the seal). Establishes the responder side of a session on first `SessionInit`.
+    fn read_inner_message(&mut self, from: PubKeyBytes, payload: Payload) -> Result<Option<ReadMessage>> {
+        match payload {
+            Payload::PeerMessage { content_type, body } => {
+                Ok(Some(ReadMessage { from, content_type, body }))
+            }
+            Payload::SessionInit { ek_pub, spk_pub, msg } => {
+                // Build (or rebuild) the responder session when this is a *fresh* handshake:
+                // no session yet, or one established by a different ephemeral — i.e. the peer
+                // reinstalled / lost its ratchet and is re-initiating. Rebuilding lets us
+                // re-sync instead of failing forever against stale state (DESIGN.md §25).
+                let fresh = match self.sessions.get(&from) {
+                    None => true,
+                    Some(ps) => ps.established_by != Some(ek_pub),
+                };
+                if fresh {
+                    let secret =
+                        *self.spk_secrets.get(&spk_pub).ok_or(Error::Crypto("unknown prekey"))?;
+                    let root = crypto::x3dh_respond(&self.identity, &secret, &from, &ek_pub)?;
+                    let session = Session::init_responder(root, secret, spk_pub);
+                    self.sessions.insert(
+                        from,
+                        PeerSession { session, init_material: None, established_by: Some(ek_pub) },
+                    );
+                }
+                let decrypted = {
+                    let ps = self.sessions.get_mut(&from).expect("just inserted");
+                    ps.init_material = None; // we've received from them → session confirmed
+                    ps.session.decrypt(&msg)
+                };
+                match decrypted {
+                    Ok(inner) => {
+                        self.persist_session(&from); // ratchet advanced — save it
+                        // A peer initiating to us establishes a session both ways — so content we'd
+                        // deferred to them (no prekey yet → "Securing…") can ratchet now. Flush it
+                        // here too, not just on the prekey-advert/tick paths.
+                        self.flush_pending_content();
+                        self.surface_session_inner(from, &inner)
+                    }
+                    Err(e) => {
+                        self.request_session_reset(from); // ask them to re-establish
+                        Err(e)
+                    }
+                }
+            }
+            Payload::SessionMessage { msg } => {
+                let decrypted = match self.sessions.get_mut(&from) {
+                    Some(ps) => {
+                        ps.init_material = None;
+                        ps.session.decrypt(&msg)
+                    }
+                    // We lost our session (uninstall / lost p2p data) but they kept theirs:
+                    // ask them to reset so a fresh handshake re-syncs the ratchet.
+                    None => {
+                        self.request_session_reset(from);
+                        return Err(Error::Crypto("no session for peer"));
+                    }
+                };
+                match decrypted {
+                    Ok(inner) => {
+                        self.persist_session(&from);
+                        self.surface_session_inner(from, &inner)
+                    }
+                    Err(e) => {
+                        self.request_session_reset(from);
+                        Err(e)
+                    }
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Decode a decrypted session inner into a user message — unless it's a re-establishment
+    /// ping (a content-less handshake we send to heal a desynced ratchet), which has done its
+    /// job by rebuilding the session and isn't surfaced (DESIGN.md §25).
+    fn surface_session_inner(&self, from: PubKeyBytes, inner: &[u8]) -> Result<Option<ReadMessage>> {
+        let si: SessionInner = postcard::from_bytes(inner)?;
+        if si.content_type == SESSION_ESTABLISH_CT {
+            return Ok(None);
+        }
+        Ok(Some(ReadMessage { from, content_type: si.content_type, body: si.body }))
+    }
+
+    /// Tell `peer` our ratchet with them is broken so it drops its session and re-initiates
+    /// (DESIGN.md §25). A control message (statically sealed, no content). Throttled so a
+    /// burst of undecryptable messages can't cause a reset storm.
+    fn request_session_reset(&mut self, peer: PubKeyBytes) {
+        let due = match self.last_reset_req.get(&peer) {
+            Some(&t) => self.now_ms.saturating_sub(t) >= REACK_MIN_INTERVAL_MS,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last_reset_req.insert(peer, self.now_ms);
+        if let Ok(b) = Bundle::create(
+            &self.identity,
+            Destination::Device(peer),
+            &peer,
+            &Payload::SessionReset,
+            BundleOpts { created_at: self.now_ms, ..Default::default() },
+        ) {
+            self.submit(b);
+        }
+    }
+
+    /// Handle an inbound [`Payload::SessionReset`]: drop our (stale) session with `peer` and
+    /// proactively re-establish so the ratchet heals immediately — even before the next user
+    /// message. The next `SessionInit` rebuilds the peer's side too (DESIGN.md §25).
+    fn handle_session_reset(&mut self, peer: PubKeyBytes) {
+        self.sessions.remove(&peer);
+        self.persist_session(&peer); // None → clears the persisted entry
+        // Re-establish now if we know their prekey; otherwise the next content send re-inits.
+        // A directed control ping to heal the ratchet with a peer who already knows us — the
+        // traced path (not the §39 default), so it's a unicast, not a flood.
+        if self.directory.prekey(&peer).is_some() {
+            let _ = self.send_message_traced(peer, SESSION_ESTABLISH_CT.to_string(), Vec::new(), false);
+        }
+    }
+
+    /// Send a `hops://` request to a specific endpoint (DESIGN.md §30): a normal HTTP
+    /// request sealed and addressed to the endpoint's Hop address (not the open-web
+    /// InternetEgress). The endpoint executes it against its own backend and the reply
+    /// arrives as an [`HttpRespItem`] via [`Node::take_http_responses`]. Returns the
+    /// request id (the response correlates by it).
+    pub fn send_hops_request(
+        &mut self,
+        endpoint: PubKeyBytes,
+        host: String,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        max_resp: u32,
+    ) -> Result<BundleId> {
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Device(endpoint),
+            &endpoint,
+            &Payload::HttpRequest { host, method, url, headers, body, max_resp_bytes: max_resp },
+            BundleOpts { created_at: self.now_ms, ..Default::default() },
+        )?;
+        let id = bundle.id();
+        self.tx.entry(id).or_default();
+        self.forwarded.insert(id, (self.identity.address(), endpoint, self.now_ms));
+        self.deliver(bundle);
+        Ok(id)
+    }
+
+    // ---- HNS: the Hop Name System (DESIGN.md §30) ----------------------------------------
+    //
+    // HNS maps a domain to its hops endpoint address via a `_hopaddress.<domain>` TXT record,
+    // resolved against ordinary public DNS. Resolution is built into core and performed by
+    // ANY internet-connected peer — no relay round-trip is required (a relay may answer too,
+    // but need not). Records carry the DNS TTL and are cached + propagated like DNS.
+
+    /// Declare whether this node can reach the public internet (and thus public DNS). When
+    /// on, the node resolves HNS itself (surfacing real-DNS lookups via
+    /// [`Node::take_dns_lookups`]) and can answer other peers' [`Payload::HnsQuery`].
+    pub fn set_internet(&mut self, on: bool) {
+        let gained = on && !self.internet;
+        self.internet = on;
+        // Just got internet → resolve anything that was waiting on it, ourselves.
+        if gained {
+            for key in self.pending_resolves.iter().cloned().collect::<Vec<_>>() {
+                self.queue_dns_lookup(&key);
+            }
+        }
+    }
+
+    /// Whether this node is internet-connected (see [`Node::set_internet`]).
+    pub fn is_internet(&self) -> bool {
+        self.internet
+    }
+
+    /// A fresh cached HNS record for `domain`, if any: `Some(Some(addr))` resolved,
+    /// `Some(None)` a cached negative, `None` not cached (or expired).
+    pub fn cached_hns(&self, domain: &str) -> Option<Option<PubKeyBytes>> {
+        let key = normalize_domain(domain);
+        self.hns_cache
+            .get(&key)
+            .filter(|e| e.expires_at_ms > self.now_ms)
+            .map(|e| e.address)
+    }
+
+    /// Resolve `domain` to its hops endpoint address (DESIGN.md §30). Serves from cache when
+    /// fresh; otherwise, if this node is internet-connected, kicks off a real-DNS lookup
+    /// (drained via [`Node::take_dns_lookups`]); otherwise returns [`HnsLookup::NeedsResolver`]
+    /// so the caller can ask a known internet peer via [`Node::resolve_hns_via`]. Results
+    /// arrive on [`Node::take_hns_results`].
+    pub fn resolve_hns(&mut self, domain: &str) -> HnsLookup {
+        let key = normalize_domain(domain);
+        if let Some(addr) = self.cached_hns(&key) {
+            return HnsLookup::Cached(addr);
+        }
+        // Delay-tolerant: remember we want this and attempt now. If nothing can answer yet
+        // (no internet, no peers) it stays pending and is retried as peers connect, when we
+        // gain internet, and periodically — like any other store-and-forward request (§30).
+        self.pending_resolves.insert(key.clone());
+        self.attempt_resolve(&key);
+        HnsLookup::Pending
+    }
+
+    /// Try to resolve `key` right now: our own DNS if we're internet-connected, else broadcast
+    /// the query to every connected peer (whichever has internet answers). A no-op if neither
+    /// is available — the domain stays in `pending_resolves` for a later retry.
+    fn attempt_resolve(&mut self, key: &str) {
+        if self.internet {
+            self.queue_dns_lookup(key);
+        } else {
+            for p in self.peers() {
+                self.send_hns_query(p, key);
+            }
+        }
+    }
+
+    /// Resolve `domain` by asking a specific internet-connected peer (e.g. a relay) over the
+    /// mesh: seals an [`Payload::HnsQuery`] to `resolver`. The answer is cached and surfaced
+    /// via [`Node::take_hns_results`]. Use when this node has no internet of its own.
+    pub fn resolve_hns_via(&mut self, resolver: PubKeyBytes, domain: &str) -> Result<BundleId> {
+        let key = normalize_domain(domain);
+        self.send_hns_query(resolver, &key)
+            .ok_or_else(|| Error::Other("could not seal HNS query".into()))
+    }
+
+    /// Seal + send an [`Payload::HnsQuery`] for `key` to `resolver`. Returns the query id, or
+    /// `None` if it couldn't be created. Used both for an explicit resolver and the no-internet
+    /// broadcast to all connected peers.
+    fn send_hns_query(&mut self, resolver: PubKeyBytes, key: &str) -> Option<BundleId> {
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Device(resolver),
+            &resolver,
+            &Payload::HnsQuery { domain: key.to_string() },
+            BundleOpts { created_at: self.now_ms, ..Default::default() },
+        )
+        .ok()?;
+        let id = bundle.id();
+        self.tx.entry(id).or_default();
+        self.forwarded.insert(id, (self.identity.address(), resolver, self.now_ms));
+        self.deliver(bundle);
+        Some(id)
+    }
+
+    /// Domains the host must look up in real DNS (the `_hopaddress.<domain>` TXT record),
+    /// clearing the queue. The host feeds each result back via [`Node::provide_dns_answer`].
+    pub fn take_dns_lookups(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.dns_lookups)
+    }
+
+    /// §39 P5: mailbox-tags that just received a want-beacon (a recipient's [`AdvertKind::RecvBeacon`]
+    /// newly accepted here), clearing the queue. The host reloads each mailbox's durable blind spool
+    /// and re-ingests the held private bundles, which P4's freshly-laid gradient then steers to the
+    /// recipient. The node does no durable I/O itself — it only surfaces the tags (cf. DNS lookups).
+    pub fn take_wanted_mailboxes(&mut self) -> Vec<Tag> {
+        std::mem::take(&mut self.wanted_mailboxes)
+    }
+
+    /// Feed back the raw DoH response bodies for a domain's full DNSSEC chain (DESIGN.md §30):
+    /// the `_hopaddress` TXT plus the DNSKEY/DS records for every zone up to the root. Core
+    /// validates the chain to the baked-in root anchors and only then caches the resolved
+    /// address — so the host (or a relaying node) is never trusted, just the cryptography. Any
+    /// validation failure caches a short negative. Answers any parked mesh queries.
+    pub fn provide_dns_proof(&mut self, domain: &str, bodies: Vec<String>) {
+        let key = normalize_domain(domain);
+        self.dns_inflight.remove(&key);
+        self.pending_resolves.remove(&key);
+        let now_secs = (self.now_ms / 1000) as u32;
+        let dohs: Vec<dnssec::DohAnswer> =
+            bodies.iter().filter_map(|b| dnssec::parse_doh(b).ok()).collect();
+        let (address, ttl_secs) = match dnssec::validate_and_extract_to_root(&key, &dohs, now_secs)
+        {
+            Ok((addr, ttl)) => (Some(addr), ttl),
+            Err(_) => (None, 60), // unvalidatable → short negative cache
+        };
+        let ttl_ms =
+            (ttl_secs as u64).clamp(MIN_HNS_TTL_MS / 1000, MAX_HNS_TTL_MS / 1000) * 1000;
+        self.hns_cache.insert(
+            key.clone(),
+            HnsEntry { address, expires_at_ms: self.now_ms.saturating_add(ttl_ms) },
+        );
+        self.hns_results.push(HnsResult { domain: key.clone(), address });
+        // Answer parked mesh queries by handing back the raw proof — the asker re-validates it
+        // itself (trustless), rather than trusting our address.
+        if let Some(waiters) = self.dns_waiters.remove(&key) {
+            for (asker, query_id) in waiters {
+                self.seal_hns_answer(asker, &key, bodies.clone(), query_id);
+            }
+        }
+    }
+
+    /// Test-only: inject a pre-trusted resolution result, bypassing DNSSEC, to drive the
+    /// resolution state machine (cache/waiters/pending) in unit tests. Production always goes
+    /// through [`Node::provide_dns_proof`].
+    #[cfg(test)]
+    pub fn provide_dns_answer(&mut self, domain: &str, address: Option<PubKeyBytes>, ttl_secs: u32) {
+        let key = normalize_domain(domain);
+        self.dns_inflight.remove(&key);
+        self.pending_resolves.remove(&key); // resolved (positive or negative) — stop retrying
+        let ttl_ms = (ttl_secs as u64).clamp(MIN_HNS_TTL_MS / 1000, MAX_HNS_TTL_MS / 1000) * 1000;
+        self.hns_cache.insert(
+            key.clone(),
+            HnsEntry { address, expires_at_ms: self.now_ms.saturating_add(ttl_ms) },
+        );
+        self.hns_results.push(HnsResult { domain: key.clone(), address });
+        // (Test path doesn't answer mesh waiters — that requires a real DNSSEC proof, which
+        // only provide_dns_proof produces.)
+        self.dns_waiters.remove(&key);
+    }
+
+    /// Finished HNS resolutions (positive or negative), clearing the queue.
+    pub fn take_hns_results(&mut self) -> Vec<HnsResult> {
+        std::mem::take(&mut self.hns_results)
+    }
+
+    // ---- hps:// pub/sub: services & channels (DESIGN.md §32) -----------------------------
+
+    /// Register a `hps://` topic at `path` that this node hosts, minting its keys. `access`
+    /// governs key handoff (Open/RequestToJoin/Invite) and `visibility` whether it's advertised
+    /// for discovery (DESIGN.md §32). Returns the service public key for a `Service` (`None` for
+    /// a `Channel`). Re-registering replaces it.
+    pub fn register_service(
+        &mut self,
+        path: &str,
+        kind: hps::ServiceKind,
+        access: hps::AccessMode,
+        visibility: hps::Visibility,
+    ) -> Option<[u8; 32]> {
+        let cfg = hps::ServiceConfig::new_with(kind, access, visibility);
+        let pk = cfg.service_pubkey();
+        if visibility == hps::Visibility::Discoverable {
+            self.publish_topic_advert(path, &cfg);
+        }
+        self.persist_service(path, &cfg);
+        self.services.insert(path.to_string(), cfg);
+        pk
+    }
+
+    /// Current join-proof time bucket (DESIGN.md §32 app isolation).
+    fn join_bucket(&self) -> u64 {
+        self.now_ms / crate::app::JOIN_EPOCH_MS
+    }
+
+    /// Proof that we hold the app secret, bound to `path` + `who` for the current bucket.
+    fn hps_proof(&self, path: &str, who: &PubKeyBytes) -> [u8; 32] {
+        self.app.join_proof(path, who, self.join_bucket())
+    }
+
+    /// Verify an inbound hps proof from `sender`, and that the bundle is on our app.
+    fn hps_authorized(&self, bundle: &Bundle, path: &str, proof: &[u8; 32]) -> bool {
+        bundle.inner.app == self.app.id
+            && self.app.verify_join_proof(proof, path, &bundle.inner.src, self.join_bucket())
+    }
+
+    /// Subscribe to `hps://{host}/{path}`: send a sealed, proof-carrying join request to `host`.
+    /// For an Open topic the keys come straight back; RequestToJoin queues for host approval;
+    /// Invite topics can't be self-joined (wait for an invite).
+    pub fn hps_subscribe(&mut self, host: PubKeyBytes, path: &str) -> Result<BundleId> {
+        let proof = self.hps_proof(path, &self.identity.address());
+        self.send_to_host(host, Payload::HpsJoinRequest { path: path.to_string(), proof })
+    }
+
+    /// Host → destination: invite an address to a topic we host (Invite mode). The destination
+    /// accepts to receive keys.
+    pub fn hps_invite(&mut self, path: &str, dest: PubKeyBytes) -> Result<BundleId> {
+        let cfg = self
+            .services
+            .get(path)
+            .ok_or_else(|| Error::Other("not a topic we host".into()))?;
+        let kind = cfg.kind;
+        let proof = self.hps_proof(path, &self.identity.address());
+        self.hps_invites_out.insert((path.to_string(), dest), self.now_ms);
+        self.persist_invites();
+        self.send_to_host(dest, Payload::HpsInvite { path: path.to_string(), kind, proof })
+    }
+
+    /// Member → host: accept an invite we received, which prompts the host to seal us the keys.
+    pub fn hps_accept_invite(&mut self, host: PubKeyBytes, path: &str) -> Result<BundleId> {
+        self.hps_invites_in.retain(|i| !(i.path == path && i.host == host));
+        self.persist_invites();
+        let proof = self.hps_proof(path, &self.identity.address());
+        self.send_to_host(host, Payload::HpsInviteAccept { path: path.to_string(), proof })
+    }
+
+    /// Member → host: leave a topic (drop from the retained set so we're not re-keyed).
+    pub fn hps_leave(&mut self, path: &str) -> Result<Option<BundleId>> {
+        let Some(sub) = self.subscriptions.remove(path) else { return Ok(None) };
+        self.directory.unsubscribe(path);
+        self.store.remove_kv(&Self::hps_sub_key(path));
+        let proof = self.hps_proof(path, &self.identity.address());
+        Ok(Some(self.send_to_host(sub.host, Payload::HpsLeave { path: path.to_string(), proof })?))
+    }
+
+    /// Host: pending join requests for a RequestToJoin topic.
+    pub fn hps_pending(&self, path: &str) -> Vec<PubKeyBytes> {
+        self.hps_pending.get(path).cloned().unwrap_or_default()
+    }
+
+    /// Host: approve a pending requester, sealing them the topic keys.
+    pub fn hps_approve(&mut self, path: &str, requester: PubKeyBytes) -> Result<BundleId> {
+        if let Some(q) = self.hps_pending.get_mut(path) {
+            q.retain(|a| *a != requester);
+        }
+        self.persist_pending(path);
+        self.record_member(path, requester);
+        self.send_keys(path, requester)
+    }
+
+    /// Host: deny/drop a pending requester (no keys).
+    pub fn hps_deny(&mut self, path: &str, requester: PubKeyBytes) {
+        if let Some(q) = self.hps_pending.get_mut(path) {
+            q.retain(|a| *a != requester);
+        }
+        self.persist_pending(path);
+    }
+
+    /// Host: unique acking addresses for a topic (its reach / sense of delivery, DESIGN.md §32).
+    pub fn hps_reach(&self, path: &str) -> usize {
+        self.hps_reach.get(path).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Host: the retained-member set (joined/approved/accepted/acked), used for rekey.
+    pub fn hps_members(&self, path: &str) -> Vec<PubKeyBytes> {
+        self.hps_members.get(path).map(|s| s.iter().copied().collect()).unwrap_or_default()
+    }
+
+    /// Member: invites we've received and not yet accepted (DESIGN.md §32 Invite mode).
+    pub fn take_hps_invites(&mut self) -> Vec<HpsInviteItem> {
+        // Drain the in-memory display queue but DON'T touch the durable copy — an unaccepted
+        // invite must survive a restart (persistence updates only on arrival / accept / decline).
+        std::mem::take(&mut self.hps_invites_in)
+    }
+
+    /// Decline an invite (member side) — drop it from the durable set so it doesn't reappear.
+    pub fn hps_decline_invite(&mut self, host: PubKeyBytes, path: &str) {
+        self.hps_invites_in.retain(|i| !(i.path == path && i.host == host));
+        self.persist_invites();
+    }
+
+    /// Host: selective forward rotation (revocation, DESIGN.md §32). Mint a fresh key (and,
+    /// optionally, move the topic to `new_path`), re-key every retained member except those in
+    /// `remove`, tombstone the old discovery advert, and re-advertise. Removed members keep the
+    /// dead key (forward-only). Returns the rekey bundle ids.
+    pub fn hps_rekey(
+        &mut self,
+        path: &str,
+        new_path: Option<&str>,
+        remove: &[PubKeyBytes],
+    ) -> Result<Vec<BundleId>> {
+        let mut cfg = self.services.get(path).cloned().ok_or_else(|| Error::Other("not a topic we host".into()))?;
+        cfg.rotate();
+        let new_path = new_path.unwrap_or(path).to_string();
+        let svc_pk = cfg.service_pubkey();
+        let epoch = cfg.epoch;
+
+        // Retained = current members + reach acks, minus the removed set.
+        let removed: std::collections::HashSet<PubKeyBytes> = remove.iter().copied().collect();
+        let mut retained: std::collections::HashSet<PubKeyBytes> =
+            self.hps_members.get(path).cloned().unwrap_or_default();
+        if let Some(r) = self.hps_reach.get(path) {
+            retained.extend(r.iter().copied());
+        }
+        retained.retain(|a| !removed.contains(a) && *a != self.identity.address());
+
+        // Tombstone old discovery advert and clear reach for the fresh epoch.
+        if let Some(old_id) = self.hps_adverts.remove(path) {
+            self.tombstone_advert(old_id);
+        }
+        self.hps_reach.remove(path);
+
+        // Move state to the new path.
+        self.services.remove(path);
+        self.store.remove_kv(&Self::hps_svc_key(path));
+        self.hps_members.insert(new_path.clone(), retained.clone());
+        if path != new_path {
+            self.hps_members.remove(path);
+            self.hps_pending.remove(path);
+        }
+        if cfg.visibility == hps::Visibility::Discoverable {
+            self.publish_topic_advert(&new_path, &cfg);
+        }
+        self.persist_service(&new_path, &cfg);
+        let content_key = cfg.content_key;
+        self.services.insert(new_path.clone(), cfg);
+
+        // Re-key each retained member.
+        let mut ids = Vec::new();
+        let me = self.identity.address();
+        for m in retained {
+            let proof = self.hps_proof(path, &me);
+            let payload = Payload::HpsRekey {
+                old_path: path.to_string(),
+                new_path: new_path.clone(),
+                epoch,
+                content_key,
+                service_pubkey: svc_pk,
+                proof,
+            };
+            if let Ok(id) = self.send_to_host(m, payload) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Publish a message to a topic we can write to — a `Service` we host (signed by the
+    /// service key) or a `Channel` we belong to (signed by our own identity). Floods to all
+    /// subscribers via [`Destination::Broadcast`].
+    pub fn hps_publish(&mut self, path: &str, plaintext: &[u8]) -> Result<BundleId> {
+        let (content_key, epoch) = if let Some(cfg) = self.services.get(path) {
+            let content_key = cfg.content_key;
+            let epoch = cfg.epoch;
+            let (nonce, ct) = hps::seal_content(&content_key, plaintext);
+            let sig = match cfg.signing_seed {
+                Some(seed) => hps::sign_publish(&seed, path, &nonce, &ct).to_vec(),
+                None => self.identity.sign(&hps::publish_signing_bytes(path, &nonce, &ct)).to_vec(),
+            };
+            return self.broadcast_publish(path, epoch, nonce, ct, sig);
+        } else if let Some(sub) = self.subscriptions.get(path) {
+            if sub.service_pubkey.is_some() {
+                return Err(Error::Other("cannot publish to a service you don't host".into()));
+            }
+            (sub.content_key, sub.epoch)
+        } else {
+            return Err(Error::Other("not a registered or subscribed topic".into()));
+        };
+        // Channel member path: sign with our own identity.
+        let (nonce, ct) = hps::seal_content(&content_key, plaintext);
+        let signature = self.identity.sign(&hps::publish_signing_bytes(path, &nonce, &ct)).to_vec();
+        self.broadcast_publish(path, epoch, nonce, ct, signature)
+    }
+
+    /// Seal an [`Payload::HpsPublish`] to the shared broadcast key and flood it. The wire form
+    /// carries the opaque `topic_tag` (not the path) so a foreign app can't tell which topic.
+    fn broadcast_publish(
+        &mut self,
+        path: &str,
+        epoch: u32,
+        nonce: [u8; 12],
+        ciphertext: Vec<u8>,
+        sig: Vec<u8>,
+    ) -> Result<BundleId> {
+        let topic_tag = self.app.topic_tag(path);
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Broadcast,
+            &hps::broadcast_identity().address(),
+            &Payload::HpsPublish { topic_tag, epoch, nonce: nonce.to_vec(), ciphertext, sig },
+            BundleOpts { app: self.app.id, created_at: self.now_ms, ..Default::default() },
+        )?;
+        let id = bundle.id();
+        self.submit(bundle);
+        Ok(id)
+    }
+
+    /// Drain received pub/sub messages (decrypted + sender-verified).
+    pub fn take_hps_messages(&mut self) -> Vec<HpsMessage> {
+        std::mem::take(&mut self.hps_inbox)
+    }
+
+    /// Process a broadcast `HpsPublish`: match its `topic_tag` to a subscription, verify the
+    /// sender's signature against the known path, decrypt, surface it, and reach-ack the host.
+    /// Drops stale-epoch messages (post-rekey) and anything we can't verify/decrypt.
+    fn process_broadcast(&mut self, bundle: &Bundle) {
+        let Ok(Payload::HpsPublish { topic_tag, epoch, nonce, ciphertext, sig }) =
+            bundle.open(&hps::broadcast_identity())
+        else {
+            return;
+        };
+        let (Ok(nonce12), Ok(sig64)) =
+            (<[u8; 12]>::try_from(nonce.as_slice()), <[u8; 64]>::try_from(sig.as_slice()))
+        else {
+            return;
+        };
+        // Match the tag to a topic we follow (subscription) OR a channel we host. The host must
+        // receive members' posts too — a channel is group chat, and the host keeps it in
+        // `services`, not `subscriptions`. A *service* we host never receives others' posts
+        // (only the owner writes).
+        let sub = self
+            .subscriptions
+            .iter()
+            .find(|(_, s)| s.topic_tag == topic_tag)
+            .map(|(p, s)| (p.clone(), s.clone()));
+        let (path, content_key, service_pubkey, my_epoch, host) = if let Some((p, s)) = sub {
+            (p, s.content_key, s.service_pubkey, s.epoch, Some(s.host))
+        } else if let Some((p, cfg)) = self
+            .services
+            .iter()
+            .find(|(p, c)| c.kind == hps::ServiceKind::Channel && self.app.topic_tag(p) == topic_tag)
+            .map(|(p, c)| (p.clone(), c.clone()))
+        {
+            (p, cfg.content_key, None, cfg.epoch, None) // None host = we are the host
+        } else {
+            return; // not a topic we follow or host (or another app's broadcast)
+        };
+        if epoch < my_epoch {
+            return; // stale generation (we've been re-keyed past it)
+        }
+        // Service → verify against the service key; channel → against the sender's address.
+        let signer = service_pubkey.unwrap_or(bundle.inner.src);
+        if !hps::verify_publish(&signer, &path, &nonce12, &ciphertext, &sig64) {
+            return;
+        }
+        let Some(body) = hps::open_content(&content_key, &nonce12, &ciphertext) else {
+            return;
+        };
+        self.hps_inbox.push(HpsMessage { path: path.clone(), sender: bundle.inner.src, body });
+        match host {
+            Some(h) => {
+                // We're a member: reach-ack the host once per (topic, epoch) so it tallies us.
+                if self.hps_acked.insert((topic_tag, epoch)) {
+                    let _ = self.send_to_host(h, Payload::HpsReachAck { topic_tag, epoch });
+                }
+            }
+            None => {
+                // We're the host: a member posting is direct evidence of membership.
+                self.record_member(&path, bundle.inner.src);
+                self.hps_reach.entry(path).or_default().insert(bundle.inner.src);
+            }
+        }
+    }
+
+    // --- hps internal helpers --------------------------------------------------------------
+
+    /// Seal a directed hps control payload to `to` (sealed + app-stamped) and deliver it.
+    fn send_to_host(&mut self, to: PubKeyBytes, payload: Payload) -> Result<BundleId> {
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Device(to),
+            &to,
+            &payload,
+            BundleOpts { app: self.app.id, created_at: self.now_ms, ..Default::default() },
+        )?;
+        let id = bundle.id();
+        self.tx.entry(id).or_default();
+        self.forwarded.insert(id, (self.identity.address(), to, self.now_ms));
+        self.deliver(bundle);
+        Ok(id)
+    }
+
+    /// Host: seal the current keys for `path` to a member.
+    fn send_keys(&mut self, path: &str, to: PubKeyBytes) -> Result<BundleId> {
+        let cfg = self.services.get(path).ok_or_else(|| Error::Other("no such topic".into()))?;
+        let payload = Payload::HpsKeys {
+            path: path.to_string(),
+            content_key: cfg.content_key,
+            service_pubkey: cfg.service_pubkey(),
+            epoch: cfg.epoch,
+        };
+        self.send_to_host(to, payload)
+    }
+
+    /// Host: remember a member for reach/rekey.
+    fn record_member(&mut self, path: &str, who: PubKeyBytes) {
+        let added = self.hps_members.entry(path.to_string()).or_default().insert(who);
+        if added {
+            self.persist_members(path);
+        }
+    }
+
+    /// Store a subscription we've been handed (Open keys, invite/approve keys, or a rekey).
+    fn install_subscription(&mut self, path: &str, host: PubKeyBytes, content_key: [u8; 32], service_pubkey: Option<[u8; 32]>, epoch: u32) {
+        let sub = HpsSubscription {
+            content_key,
+            service_pubkey,
+            host,
+            epoch,
+            topic_tag: self.app.topic_tag(path),
+        };
+        self.directory.subscribe(path.to_string());
+        self.persist_subscription(path, &sub);
+        self.subscriptions.insert(path.to_string(), sub);
+    }
+
+    /// Build + gossip a Discoverable topic's advert (descriptor encrypted under the app key).
+    fn publish_topic_advert(&mut self, path: &str, cfg: &hps::ServiceConfig) {
+        let Some(disc_key) = self.app.disc_key else { return }; // fabric: no discovery isolation
+        let (nonce, ct) = hps::seal_meta(&disc_key, &cfg.meta(path));
+        self.advert_seq += 1;
+        if let Ok(advert) = crate::discover::Advert::publish_in(
+            self.app.id,
+            &self.identity,
+            crate::discover::AdvertKind::HpsTopic { nonce, ct },
+            self.now_ms,
+            HPS_TOPIC_TTL_MS,
+            self.advert_seq,
+        ) {
+            self.hps_adverts.insert(path.to_string(), advert.id);
+            self.publish(advert);
+        }
+    }
+
+    /// Tombstone a previously published advert id (revocation / rekey).
+    fn tombstone_advert(&mut self, revokes: crate::discover::AdvertId) {
+        self.advert_seq += 1;
+        if let Ok(tomb) = crate::discover::Advert::publish_in(
+            self.app.id,
+            &self.identity,
+            crate::discover::AdvertKind::Tombstone { revokes },
+            self.now_ms,
+            HPS_TOPIC_TTL_MS,
+            self.advert_seq,
+        ) {
+            self.publish(tomb);
+        }
+    }
+
+    /// The topics this node hosts or follows, so the app can rebuild its channel list after a
+    /// restart (topics persist in the store; the app's in-memory list doesn't, DESIGN.md §32).
+    pub fn hps_my_topics(&self) -> Vec<HpsTopicState> {
+        let me = self.identity.address();
+        let mut out = Vec::new();
+        for (path, cfg) in &self.services {
+            out.push(HpsTopicState {
+                host: me,
+                path: path.clone(),
+                kind: cfg.kind,
+                hosting: true,
+                access: cfg.access,
+            });
+        }
+        for (path, sub) in &self.subscriptions {
+            out.push(HpsTopicState {
+                host: sub.host,
+                path: path.clone(),
+                kind: if sub.service_pubkey.is_some() { hps::ServiceKind::Service } else { hps::ServiceKind::Channel },
+                hosting: false,
+                access: hps::AccessMode::Open,
+            });
+        }
+        out
+    }
+
+    /// Same-app discoverable topics we can see (decrypted descriptors + host address).
+    pub fn browse_discoverable(&self, tag: Option<&str>) -> Vec<(PubKeyBytes, hps::TopicMeta)> {
+        let Some(disc_key) = self.app.disc_key else { return Vec::new() };
+        let mut out = Vec::new();
+        for advert in self.directory.hps_topics() {
+            if let crate::discover::AdvertKind::HpsTopic { nonce, ct } = &advert.body.kind {
+                if let Some(meta) = hps::open_meta(&disc_key, nonce, ct) {
+                    if tag.is_none_or(|t| meta.tags.iter().any(|x| x == t)) {
+                        out.push((advert.body.publisher, meta));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn hps_svc_key(path: &str) -> String {
+        format!("hps/svc/{path}")
+    }
+    fn hps_sub_key(path: &str) -> String {
+        format!("hps/sub/{path}")
+    }
+
+    fn hps_pending_key(path: &str) -> String {
+        format!("hps/pending/{path}")
+    }
+    fn hps_members_key(path: &str) -> String {
+        format!("hps/members/{path}")
+    }
+
+    fn persist_service(&mut self, path: &str, cfg: &hps::ServiceConfig) {
+        if let Ok(bytes) = postcard::to_allocvec(cfg) {
+            self.store.put_kv(&Self::hps_svc_key(path), bytes);
+        }
+    }
+    fn persist_subscription(&mut self, path: &str, sub: &HpsSubscription) {
+        if let Ok(bytes) = postcard::to_allocvec(sub) {
+            self.store.put_kv(&Self::hps_sub_key(path), bytes);
+        }
+    }
+    fn persist_pending(&mut self, path: &str) {
+        let q: Vec<PubKeyBytes> = self.hps_pending.get(path).cloned().unwrap_or_default();
+        if let Ok(bytes) = postcard::to_allocvec(&q) {
+            self.store.put_kv(&Self::hps_pending_key(path), bytes);
+        }
+    }
+    fn persist_members(&mut self, path: &str) {
+        let m: Vec<PubKeyBytes> =
+            self.hps_members.get(path).map(|s| s.iter().copied().collect()).unwrap_or_default();
+        if let Ok(bytes) = postcard::to_allocvec(&m) {
+            self.store.put_kv(&Self::hps_members_key(path), bytes);
+        }
+    }
+
+    /// Persist the deferred-content queue (messages the user sent that are waiting on a prekey)
+    /// so a restart before the prekey arrives doesn't silently drop them (DESIGN.md §25).
+    fn persist_pending_content(&mut self) {
+        if let Ok(bytes) = postcard::to_allocvec(&self.pending_content) {
+            self.store.put_kv("pending_content", bytes);
+        }
+    }
+
+    /// Persist received + outstanding `hps://` invites so they survive a restart (§32).
+    fn persist_invites(&mut self) {
+        let inc: Vec<(String, PubKeyBytes, bool)> = self
+            .hps_invites_in
+            .iter()
+            .map(|i| (i.path.clone(), i.host, i.kind == hps::ServiceKind::Channel))
+            .collect();
+        if let Ok(b) = postcard::to_allocvec(&inc) {
+            self.store.put_kv("hps/invites_in", b);
+        }
+        let out: Vec<(String, PubKeyBytes)> = self.hps_invites_out.keys().cloned().collect();
+        if let Ok(b) = postcard::to_allocvec(&out) {
+            self.store.put_kv("hps/invites_out", b);
+        }
+    }
+
+    /// A diagnostic snapshot of the live HNS cache: `(domain, address?, remaining_ttl_ms)`
+    /// for each fresh entry (DESIGN.md §30). `None` address is a cached negative. The
+    /// remaining TTL ticks down as the node's clock advances and the entry is pruned at zero.
+    pub fn hns_cache_snapshot(&self) -> Vec<(String, Option<PubKeyBytes>, u64)> {
+        let mut out: Vec<_> = self
+            .hns_cache
+            .iter()
+            .filter(|(_, e)| e.expires_at_ms > self.now_ms)
+            .map(|(d, e)| (d.clone(), e.address, e.expires_at_ms - self.now_ms))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Queue a real-DNS lookup for the host, deduped while one is in flight.
+    fn queue_dns_lookup(&mut self, key: &str) {
+        if self.dns_inflight.insert(key.to_string()) {
+            self.dns_lookups.push(key.to_string());
+        }
+    }
+
+    /// Seal an [`Payload::HnsAnswer`] (the DNSSEC `proof`) back to a querier.
+    fn seal_hns_answer(&mut self, to: PubKeyBytes, domain: &str, proof: Vec<String>, for_query: BundleId) {
+        if let Ok(bundle) = Bundle::create(
+            &self.identity,
+            Destination::Device(to),
+            &to,
+            &Payload::HnsAnswer { domain: domain.to_string(), proof, for_query },
+            BundleOpts { created_at: self.now_ms, ..Default::default() },
+        ) {
+            self.deliver(bundle);
+        }
+    }
+
+    /// Seal an HTTP response back to a requester (gateway side).
+    pub fn send_http_response(
+        &mut self,
+        to: PubKeyBytes,
+        for_id: BundleId,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Result<BundleId> {
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Device(to),
+            &to,
+            &Payload::HttpResponse { status, headers, body, for_bundle_id: for_id },
+            BundleOpts { created_at: self.now_ms, ..Default::default() },
+        )?;
+        let id = bundle.id();
+        self.deliver(bundle);
+        Ok(id)
+    }
+
+    /// Drain egress HTTP requests we (as a gateway) should fulfill.
+    pub fn take_http_requests(&mut self) -> Vec<HttpReqItem> {
+        std::mem::take(&mut self.http_requests)
+    }
+
+    /// Drain HTTP responses sealed back to us (as a requester).
+    pub fn take_http_responses(&mut self) -> Vec<HttpRespItem> {
+        std::mem::take(&mut self.http_responses)
+    }
+
+    // --- service calls (DESIGN.md §29) ----------------------------------------
+
+    /// Set this node's display name (returned by `hop.identify`). `None` clears it.
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+    }
+
+    /// This node's display name, if set.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Set what kind of node this is (returned by `hop.identify`).
+    pub fn set_kind(&mut self, kind: NodeKind) {
+        self.kind = kind;
+    }
+
+    /// This node's identity record, as the built-in `hop.identify` service reports it.
+    pub fn identity_record(&self) -> IdentityRecord {
+        IdentityRecord { name: self.name.clone(), kind: self.kind, address: self.address() }
+    }
+
+    /// Call a service/command on `dst` (DESIGN.md §29). `service` is namespaced
+    /// (`hop.identify` and other `hop.` names are answered by the destination node
+    /// itself; anything else is dispatched to its app). The reply arrives as a
+    /// [`ServiceRespItem`] via [`Node::take_service_responses`]. Returns the request id.
+    pub fn send_service_request(
+        &mut self,
+        dst: PubKeyBytes,
+        service: String,
+        method: String,
+        args: Vec<u8>,
+    ) -> Result<BundleId> {
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Device(dst),
+            &dst,
+            &Payload::ServiceRequest { service, method, args },
+            BundleOpts { created_at: self.now_ms, ..Default::default() },
+        )?;
+        let id = bundle.id();
+        self.tx.entry(id).or_default();
+        // Remember the send so a returning delivery learns the route (§27).
+        self.forwarded.insert(id, (self.identity.address(), dst, self.now_ms));
+        self.deliver(bundle);
+        Ok(id)
+    }
+
+    /// Seal a service response back to a caller (app side, for a custom service). Reply
+    /// to a [`ServiceReqItem`] using its `from` (as `to`) and `id` (as `for_id`).
+    pub fn send_service_response(
+        &mut self,
+        to: PubKeyBytes,
+        for_id: BundleId,
+        status: u16,
+        body: Vec<u8>,
+    ) -> Result<BundleId> {
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Device(to),
+            &to,
+            &Payload::ServiceResponse { for_bundle_id: for_id, status, body },
+            BundleOpts { created_at: self.now_ms, ..Default::default() },
+        )?;
+        let id = bundle.id();
+        self.deliver(bundle);
+        Ok(id)
+    }
+
+    /// Drain custom service requests addressed to us (built-in `hop.` services are
+    /// answered by the node and never appear here).
+    pub fn take_service_requests(&mut self) -> Vec<ServiceReqItem> {
+        std::mem::take(&mut self.service_requests)
+    }
+
+    /// Drain service responses sealed back to us (as a caller).
+    pub fn take_service_responses(&mut self) -> Vec<ServiceRespItem> {
+        std::mem::take(&mut self.service_responses)
+    }
+
+    // --- transparent carrier streaming (DESIGN.md §20) ------------------------
+
+    /// A fresh stream id, unique per this node.
+    fn next_stream_id(&mut self) -> StreamId {
+        self.stream_seq += 1;
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&self.stream_seq.to_be_bytes());
+        id[8..].copy_from_slice(&short_addr(&self.identity.address()));
+        id
+    }
+
+    /// Submit a locally-originated bundle, **auto-streaming if it's too large**. Small
+    /// bundles go as one (the common case). A large one (e.g. an image message, or a big
+    /// service request/response) is split into ordered `StreamData` chunks carrying its
+    /// raw bytes, each sealed to the destination and ACK-tracked for reliable transport;
+    /// the receiver reassembles and processes the original bundle as if it arrived whole —
+    /// so id, request_ack, delivery status and dedup are all preserved. Transparent: every
+    /// `send_*` path funnels through here, so any payload type streams when needed.
+    fn deliver(&mut self, bundle: Bundle) {
+        let encoded = match bundle.to_bytes() {
+            Ok(b) if b.len() > STREAM_CHUNK => b,
+            _ => return self.submit(bundle), // small, or un-encodable: send as one
+        };
+        let dst = match bundle.inner.dst {
+            Destination::Device(d) | Destination::AckTo(d, _) => d,
+            Destination::InternetEgress | Destination::Broadcast => return self.submit(bundle), // no single dst
+        };
+        let sid = self.next_stream_id();
+        let opts = BundleOpts {
+            created_at: self.now_ms,
+            flags: BundleFlags { request_ack: true, ..Default::default() },
+            ..Default::default()
+        };
+        let orig = bundle.id(); // the message id the UI tracks; carriers map back to it
+        let chunks: Vec<&[u8]> = encoded.chunks(STREAM_CHUNK).collect();
+        let n = chunks.len();
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            if let Ok(carrier) = Bundle::create(
+                &self.identity,
+                Destination::Device(dst),
+                &dst,
+                &Payload::Carrier { stream_id: sid, seq: i as u64, bytes: chunk.to_vec(), fin: i + 1 == n },
+                opts,
+            ) {
+                self.carrier_owner.insert(carrier.id(), orig); // attribute relay/ownership
+                self.submit(carrier); // request_ack → tracked in `pending` for retransmit
+            }
+        }
+    }
+
+    /// Feed one inbound carrier chunk into reassembly; returns the reconstructed original
+    /// bundle bytes once the stream is complete (else `None`).
+    fn accept_stream_chunk(
+        &mut self,
+        from: PubKeyBytes,
+        stream_id: StreamId,
+        seq: u64,
+        bytes: Vec<u8>,
+        fin: bool,
+    ) -> Option<Vec<u8>> {
+        let now = self.now_ms;
+        // Persist the raw chunk first, so a partial transfer survives a background
+        // suspend/relaunch (beacon mode): we ACK each carrier (the relay then drops its
+        // copy), so without this a half-assembled image whose in-memory state is lost on
+        // wake could never complete. Re-fed on rehydrate (DESIGN.md §20, §22).
+        let mut val = Vec::with_capacity(bytes.len() + 1);
+        val.push(fin as u8);
+        val.extend_from_slice(&bytes);
+        self.store.put_kv(&stream_chunk_key(&from, &stream_id, seq), val);
+
+        let entry = self.incoming_streams.entry((from, stream_id)).or_insert_with(|| {
+            IncomingStream { reassembler: StreamReassembler::new(), data: Vec::new(), at: now }
+        });
+        entry.at = now;
+        for chunk in entry.reassembler.accept(seq, bytes, fin) {
+            entry.data.extend_from_slice(&chunk);
+        }
+        if entry.reassembler.is_finished() {
+            let data = self.incoming_streams.remove(&(from, stream_id)).map(|s| s.data);
+            self.clear_persisted_stream(&from, &stream_id); // whole message assembled
+            data
+        } else {
+            None
+        }
+    }
+
+    /// Remove all persisted chunks of a completed or abandoned carrier stream (DESIGN.md §20).
+    fn clear_persisted_stream(&mut self, from: &PubKeyBytes, stream_id: &StreamId) {
+        let prefix = stream_prefix(from, stream_id);
+        for (k, _) in self.store.list_kv(&prefix) {
+            self.store.remove_kv(&k);
+        }
+    }
+
+    /// Publish (and gossip) a signed service advert so others discover it across the
+    /// mesh — even multiple hops away via relays (§15–§16). Returns the advert id so
+    /// the caller can later revoke it with a tombstone. The advert carries this node's
+    /// address as `publisher`, so a discoverer can seal a message straight back.
+    ///
+    /// Apps build presence and contacts on top of this: a chat app publishes a
+    /// "presence" service whose `title` is the user's chosen display name, browses for
+    /// it, and ties name↔address locally (DESIGN.md §4, §23).
+    pub fn publish_service(
+        &mut self,
+        service: String,
+        title: String,
+        summary: String,
+        tags: Vec<String>,
+        ttl_ms: u32,
+    ) -> Result<AdvertId> {
+        self.advert_seq += 1;
+        let advert = Advert::publish(
+            &self.identity,
+            AdvertKind::Service { service, title, summary, tags },
+            self.now_ms,
+            ttl_ms,
+            self.advert_seq,
+        )?;
+        let id = advert.id;
+        self.publish(advert);
+        Ok(id)
+    }
+
+    /// Browse a service namespace (optionally filtered by tag) for adverts discovered
+    /// across the mesh. Returns the live [`Advert`]s; `publisher` is the address to
+    /// message, `hops` the closest known distance.
+    pub fn browse(&self, service: &str, tag: Option<&str>) -> Vec<Advert> {
+        self.directory.browse(service, tag)
+    }
+
+    /// Delivery status of a message we sent: `(peers_relayed_to, delivered,
+    /// delivery_hops)`. Maps to Sending (0, false, _) / Sent N (N, false, _) /
+    /// Delivered (_, true, hops). `delivery_hops` is the forward path length the
+    /// destination observed (0 until delivered).
+    pub fn message_status(&self, id: &BundleId) -> Option<(u32, bool, u8, u32)> {
+        self.tx
+            .get(id)
+            .map(|i| (i.relayed.len() as u32, i.delivered, i.delivered_hops, i.delivered_ms))
+    }
+
+    /// The relay queue for display: our messages awaiting send (pinned) and peer
+    /// messages awaiting relay (subject to decay). Newest first.
+    pub fn queue(&self) -> Vec<QueuedMessage> {
+        let mut items: Vec<QueuedMessage> = self
+            .store
+            .have()
+            .ids
+            .iter()
+            .filter_map(|id| self.store.get(id))
+            .map(|b| QueuedMessage {
+                id: b.id(),
+                own: self.tx.contains_key(&b.id()) || self.carrier_owner.contains_key(&b.id()),
+                to: match b.inner.dst {
+                    Destination::Device(a) | Destination::AckTo(a, _) => Some(a),
+                    Destination::InternetEgress | Destination::Broadcast => None,
+                },
+                priority: b.inner.priority,
+                hops: b.env.hops,
+            })
+            .collect();
+        // Own (pinned) first, then by priority desc.
+        items.sort_by(|a, b| b.own.cmp(&a.own).then(b.priority.cmp(&a.priority)));
+        items
+    }
+
+    /// For the cloud backbone's cross-partition handoff (DESIGN.md §28): the
+    /// device-addressed bundles we're holding whose destination is **not** currently
+    /// connected to us, as `(id, dst, sealed bytes, expires_at_ms)`. The relay hands
+    /// these into the destination region's Firestore mailbox so an offline device
+    /// collects them when it next checks in (or that region cold-starts). Returns the
+    /// sealed wire bytes untouched — the relay never opens what it forwards.
+    pub fn undeliverable_device_bundles(&self) -> Vec<(BundleId, PubKeyBytes, Vec<u8>, u64)> {
+        let connected: HashSet<PubKeyBytes> = self.peers().into_iter().collect();
+        let mut out = Vec::new();
+        for id in self.store.have().ids {
+            let Some(b) = self.store.get(&id) else { continue };
+            // Both user messages (Device) and delivery-ACKs (AckTo) are addressed to a
+            // specific node, so both ride the handoff — otherwise an ACK back to an
+            // offline cross-region sender would never arrive (no live peering, §28).
+            let dst = match b.inner.dst {
+                Destination::Device(d) | Destination::AckTo(d, _) => d,
+                Destination::InternetEgress | Destination::Broadcast => continue,
+            };
+            if connected.contains(&dst) {
+                continue; // deliverable directly on this node — no handoff needed
+            }
+            if let Ok(bytes) = b.to_bytes() {
+                let expires = b.inner.created_at.saturating_add(b.inner.lifetime_ms as u64);
+                out.push((id, dst, bytes, expires));
+            }
+        }
+        out
+    }
+
+    /// §39 P5: private bundles we should DURABLY spool by mailbox-tag — the offline / cross-partition
+    /// case P4's live gradient can't cover. A bundle qualifies iff it's private, carries a mailbox-tag,
+    /// and we hold NO live (usable) gradient for that tag right now — so a bundle is spooled XOR
+    /// live-routed, never both (no double-send). When the recipient later beacons, the host reloads
+    /// the spool and P4 steers the reloaded copy down the freshly-laid gradient. The relay never opens
+    /// the envelope — sealed bytes verbatim. Returns (id, mailbox-tag, sealed bytes, expires_at).
+    pub fn spoolable_private_bundles(&self) -> Vec<(BundleId, Tag, Vec<u8>, u64)> {
+        let now = self.now_ms;
+        let mut out = Vec::new();
+        for id in self.store.have().ids {
+            let Some(b) = self.store.get(&id) else { continue };
+            if !b.is_private() {
+                continue;
+            }
+            let Some(tag) = b.inner.private.as_ref().and_then(|p| p.mailbox) else { continue };
+            // A live, usable gradient means P4 already steers this bundle — don't also spool it.
+            // (Same liveness predicate as the forward gate in offer_bundles_to_link.)
+            let live = self.recv_gradient.get(&tag).is_some_and(|e| {
+                e.expires_at > now && matches!(self.links.get(&e.inbound), Some(LinkState::Up(_)))
+            });
+            if live {
+                continue;
+            }
+            if let Ok(bytes) = b.to_bytes() {
+                let expires = b.inner.created_at.saturating_add(b.inner.lifetime_ms as u64);
+                out.push((id, tag, bytes, expires));
+            }
+        }
+        out
+    }
+
+    /// Ingest a foreign (relayed) bundle pulled from durable storage — e.g. a
+    /// cross-partition handoff written into our Firestore partition while we were
+    /// already warm (DESIGN.md §28). Stores it for onward relay and offers it to live
+    /// links, exactly as if a peer had handed it over. A cold-started node gets the same
+    /// bundles for free via [`Node::with_store`]'s rehydrate.
+    pub fn ingest(&mut self, bundle: Bundle) {
+        // A phantom link id that matches no real connection, so the bundle is offered to
+        // every live link (the offer step skips only the link it arrived on).
+        self.on_bundle(LinkId::MAX, bundle);
+    }
+
+    /// Drop everything we're currently holding: our own undelivered messages (stop
+    /// retransmitting them) and any bundles we're relaying for peers. Clears the relay
+    /// queue shown in the UI. Delivery-status history (`tx`) is kept so already-sent
+    /// messages still render their last state; sessions/directory are untouched.
+    pub fn clear_queue(&mut self) {
+        for id in self.store.have().ids {
+            self.store.remove(&id);
+        }
+        self.relay_order.clear();
+        self.relay_fwd.clear();
+        self.ack_replicate.clear();
+        self.pending.clear();
+    }
+
+    /// Addresses of currently-connected, authenticated peers (handshake complete).
+    pub fn peers(&self) -> Vec<PubKeyBytes> {
+        self.links
+            .values()
+            .filter_map(|s| match s {
+                LinkState::Up(e) => Some(e.peer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(peer address, link id)` for every live link — lets the host map a direct
+    /// neighbour to the transport(s) carrying it (the bearer owns the link-id → medium
+    /// mapping). A peer may appear more than once if reachable over multiple bearers.
+    pub fn peer_links(&self) -> Vec<(PubKeyBytes, LinkId)> {
+        self.links
+            .iter()
+            .filter_map(|(id, s)| match s {
+                LinkState::Up(e) => Some((e.peer, *id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Send a message to a directly-connected peer. Returns the bundle id, or `None`
+    /// if not connected to that address. (Any address can be reached with
+    /// [`Node::send_message`]; this just gates on a live link.)
+    pub fn send_to(
+        &mut self,
+        address: &PubKeyBytes,
+        content_type: String,
+        body: Vec<u8>,
+        request_ack: bool,
+    ) -> Result<Option<BundleId>> {
+        let connected = self
+            .links
+            .values()
+            .any(|s| matches!(s, LinkState::Up(e) if e.peer == *address));
+        if !connected {
+            return Ok(None);
+        }
+        // Directly-connected fast path: the peer already knows our identity (the link
+        // authenticated it), so untraceability vs them is moot — send a directed unicast
+        // rather than flooding. Reach any *non*-adjacent address untraceably via send_message.
+        Ok(Some(self.send_message_traced(*address, content_type, body, request_ack)?))
+    }
+
+    /// Advance time: expire stale adverts and retransmit unacked bundles whose
+    /// retry timer is due, giving up on any past their lifetime (§7, §8).
+    pub fn tick(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.directory.expire(now_ms);
+        // §39 P4: drop stale routing-gradient entries — a recipient that stopped beaconing (moved
+        // or went passive) stops attracting bundles within one TTL (no permanent black-hole).
+        self.recv_gradient.retain(|_, e| e.expires_at > now_ms);
+        // Re-advertise hosted Discoverable topics we don't currently have a live advert for —
+        // e.g. after a restart, where the topic persists but the in-memory directory/advert do
+        // not. Runs with the real clock set (above), so created_at is valid; once published the
+        // path is in hps_adverts and this skips it. This is what makes a hosted channel
+        // discoverable again after the host relaunches (DESIGN.md §32).
+        if self.app.disc_key.is_some() {
+            let stale: Vec<String> = self
+                .services
+                .iter()
+                .filter(|(p, c)| c.visibility == hps::Visibility::Discoverable && !self.hps_adverts.contains_key(*p))
+                .map(|(p, _)| p.clone())
+                .collect();
+            for path in stale {
+                if let Some(cfg) = self.services.get(&path).cloned() {
+                    self.publish_topic_advert(&path, &cfg);
+                }
+            }
+        }
+        self.store.prune(now_ms);
+        // Drop relay-queue entries whose bundles have been delivered or expired.
+        self.relay_order.retain(|id| self.store.contains(id));
+        self.relay_fwd.retain(|id, _| self.store.contains(id));
+        // Expire vaccine immunity after a bundle could no longer be live (1h).
+        self.immune.retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
+        // Forget forwarded-route memory for bundles that can no longer ACK back (§27).
+        self.forwarded.retain(|_, (_, _, t)| now_ms.saturating_sub(*t) < 3_600_000);
+        // Drop abandoned half-received carrier streams (sender vanished mid-transfer), and
+        // clear their persisted chunks so they don't linger in the store.
+        let dropped: Vec<(PubKeyBytes, StreamId)> = self
+            .incoming_streams
+            .iter()
+            .filter(|(_, s)| now_ms.saturating_sub(s.at) >= 3_600_000)
+            .map(|(k, _)| *k)
+            .collect();
+        for (from, sid) in dropped {
+            self.incoming_streams.remove(&(from, sid));
+            self.clear_persisted_stream(&from, &sid);
+        }
+        // Forget carrier→original links once the carrier is no longer held (delivered/expired).
+        self.carrier_owner.retain(|cid, _| self.store.contains(cid));
+        // Forget deferred-content aliases once their real bundle is gone (delivered/expired).
+        self.tx_alias.retain(|real, _| self.store.contains(real) || self.pending.contains_key(real));
+        // Periodically RE-gossip adverts to every live link. Adverts (presence, and crucially
+        // prekeys, §25) are otherwise offered only once per link — at link-up — so a node that
+        // didn't have a peer's prekey at connect time could never open a forward-secret session to
+        // it until a RECONNECT forced a fresh gossip. That's the "you have to move out of range and
+        // back to send a message" bug — and it's transport-agnostic (BLE, Wi-Fi, relay alike). This
+        // re-offers over stable links so the prekey arrives without churning the connection; the
+        // receiver dedups unchanged adverts, so it's cheap. (DESIGN.md §16/§25.)
+        if now_ms.saturating_sub(self.last_regossip_ms) >= REGOSSIP_INTERVAL_MS {
+            self.last_regossip_ms = now_ms;
+            // Re-gossip ONLY our OWN prekey/presence to every live link (NOT the whole directory).
+            // Re-flooding the whole directory was O(directory × links) every interval — the multi-peer
+            // resource-exhaustion bug (tx >> rx, real messages starve). But re-offering just our own
+            // securing adverts is cheap (~2-3 adverts × links) and lets a peer that silently lost state
+            // on a STABLE link (no flap to trigger the link-up re-offer) re-secure within the interval.
+            // The foreign bulk stays per-peer-deduped; newly published/ingested adverts still propagate
+            // immediately via on_advert/publish → offer_adverts_to_all.
+            let own = self.directory.advert_ids_by_publisher(&self.identity.address());
+            if !own.is_empty() {
+                for state in self.links.values_mut() {
+                    if let LinkState::Up(est) = state {
+                        for id in &own {
+                            est.sent_adverts.remove(id);
+                        }
+                    }
+                }
+                self.offer_adverts_to_all();
+            }
+        }
+        // §39 P4: keep our receiver-beacon fresh (short interval ≪ its TTL) so the gradient toward
+        // us stays alive and re-points if we move. Passive (max-privacy) recipients skip this.
+        if self.route_to_me && now_ms.saturating_sub(self.last_recv_beacon_ms) >= RECV_BEACON_REFRESH_MS {
+            self.last_recv_beacon_ms = now_ms;
+            let _ = self.publish_recv_beacon();
+        }
+        // Retry any content still waiting on a prekey (it gossips, §25).
+        self.flush_pending_content();
+        // ACK bookkeeping: forget replication tracking for ACKs no longer held, and age
+        // out the re-ACK throttle map.
+        self.ack_replicate.retain(|id, _| self.store.contains(id));
+        self.last_ack.retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
+        // Expired HNS records leave the device entirely (DESIGN.md §30): once a cached
+        // endpoint's DNS-derived TTL lapses it's dropped, so the next request re-resolves
+        // all the way back to DNS rather than reusing a stale address.
+        self.hns_cache.retain(|_, e| e.expires_at_ms > now_ms);
+        // Delay-tolerant resolution: periodically re-attempt anything still unresolved, so a
+        // query placed while offline eventually completes once internet/a peer appears (§30).
+        if !self.pending_resolves.is_empty()
+            && now_ms.saturating_sub(self.last_resolve_retry_ms) >= HNS_RETRY_INTERVAL_MS
+        {
+            self.last_resolve_retry_ms = now_ms;
+            for key in self.pending_resolves.iter().cloned().collect::<Vec<_>>() {
+                self.attempt_resolve(&key);
+            }
+        }
+
+        let mut retransmit = false;
+        for id in self.pending.keys().copied().collect::<Vec<_>>() {
+            let p = self.pending[&id];
+            if now_ms >= p.created_at.saturating_add(p.lifetime_ms as u64) {
+                self.pending.remove(&id); // lifetime exhausted — give up
+                self.store.remove(&id);
+                continue;
+            }
+            if now_ms >= p.next_retx_at {
+                // Refresh the copy budget and re-offer along every link.
+                if !self.store.contains(&id) {
+                    self.pending.remove(&id);
+                    continue;
+                }
+                self.store.set_copies(&id, p.copies);
+                for state in self.links.values_mut() {
+                    if let LinkState::Up(est) = state {
+                        est.sent_bundles.remove(&id);
+                    }
+                }
+                if let Some(p) = self.pending.get_mut(&id) {
+                    // Exponential backoff so a long-lived bundle retries a handful of
+                    // times over its lifetime, not every 30s for days.
+                    p.retx_interval = p.retx_interval.saturating_mul(2).min(MAX_RETX_INTERVAL_MS);
+                    p.next_retx_at = now_ms.saturating_add(p.retx_interval);
+                }
+                retransmit = true;
+            }
+        }
+        if retransmit {
+            self.offer_bundles_to_all();
+        }
+    }
+
+    /// Publish a locally-originated advert; gossips it to live links.
+    pub fn publish(&mut self, advert: Advert) {
+        if self.directory.ingest(advert, self.now_ms).unwrap_or(false) {
+            self.offer_adverts_to_all();
+        }
+    }
+
+    /// Bundles addressed to this node that have arrived since the last call.
+    pub fn take_inbox(&mut self) -> Vec<Bundle> {
+        std::mem::take(&mut self.inbox)
+    }
+
+    /// Opaque bytes to ship over the bearer, paired with their connection.
+    pub fn drain_outgoing(&mut self) -> Vec<(LinkId, Vec<u8>)> {
+        std::mem::take(&mut self.outgoing)
+    }
+
+    /// Feed one bearer event into the loop.
+    pub fn handle(&mut self, event: BearerEvent) {
+        match event {
+            BearerEvent::Connected(link, role) => self.on_connected(link, role),
+            BearerEvent::Disconnected(link) => {
+                // Snapshot what we've already gossiped to this PEER so a reconnect doesn't re-flood
+                // the whole directory (the flapping-link resource-exhaustion bug). Keyed by peer, not
+                // by link instance — the link id changes on every reconnect, the peer address doesn't.
+                if let Some(LinkState::Up(est)) = self.links.remove(&link) {
+                    self.peer_sent
+                        .insert(est.peer, PeerSent { adverts: est.sent_adverts, bundles: est.sent_bundles });
+                }
+            }
+            BearerEvent::Data(link, bytes) => self.on_data(link, bytes),
+        }
+    }
+
+    // --- connection lifecycle -------------------------------------------------
+
+    fn auth_payload(&self) -> Vec<u8> {
+        let auth = LinkAuth { address: self.identity.address() };
+        postcard::to_allocvec(&auth).expect("auth encode")
+    }
+
+    fn on_connected(&mut self, link: LinkId, role: Role) {
+        // Idempotent: a spurious Connected for a link we already hold must not tear down its live
+        // Noise session (a re-handshake would reset dedup + re-flood). Real reconnects are preceded
+        // by Disconnected (bearer contract), which removes the entry and snapshots its dedup per-peer.
+        if self.links.contains_key(&link) {
+            return;
+        }
+        let Ok(mut hs) = (match role {
+            Role::Initiator => LinkHandshake::initiator(&self.identity),
+            Role::Responder => LinkHandshake::responder(&self.identity),
+        }) else {
+            return;
+        };
+
+        // The initiator sends the first handshake message immediately.
+        if role == Role::Initiator {
+            if let Ok(msg) = hs.write(&self.auth_payload()) {
+                self.send_packet(link, LinkPacket::Handshake(msg));
+            }
+        }
+        self.links
+            .insert(link, LinkState::Handshaking(Box::new(Handshaking { hs, verified: None })));
+    }
+
+    fn on_data(&mut self, link: LinkId, bytes: Vec<u8>) {
+        let Ok(packet) = postcard::from_bytes::<LinkPacket>(&bytes) else {
+            return;
+        };
+        match packet {
+            LinkPacket::Handshake(msg) => self.on_handshake_msg(link, &msg),
+            LinkPacket::Data(ct) => self.on_record(link, &ct),
+            LinkPacket::DataFrag { idx, cnt, ct } => self.on_record_frag(link, idx, cnt, &ct),
+        }
+    }
+
+    fn on_handshake_msg(&mut self, link: LinkId, msg: &[u8]) {
+        // Take the handshake out so we can both write and (later) consume it.
+        let Some(LinkState::Handshaking(boxed)) = self.links.remove(&link) else {
+            return; // unknown link or already established
+        };
+        let mut state = *boxed;
+
+        let Ok(payload) = state.hs.read(msg) else {
+            return; // drop link on bad handshake
+        };
+
+        // Bind the peer's claimed address to the Noise-authenticated static key:
+        // they match iff the address's derived X25519 key equals `remote_static`.
+        if let Some(remote_static) = state.hs.remote_static() {
+            match postcard::from_bytes::<LinkAuth>(&payload) {
+                Ok(auth) if crypto::address_to_x(&auth.address) == Some(remote_static) => {
+                    state.verified = Some(auth.address);
+                }
+                Ok(_) => return, // address doesn't match the link key → drop
+                Err(_) => {}     // no claim in this message (e.g. m1) → keep going
+            }
+        }
+
+        if !state.hs.is_finished() {
+            if let Ok(out) = state.hs.write(&self.auth_payload()) {
+                self.send_packet(link, LinkPacket::Handshake(out));
+            }
+        }
+
+        if state.hs.is_finished() {
+            let (Some(peer), Ok(session)) = (state.verified, state.hs.into_session()) else {
+                return; // finished without an authenticated peer → drop
+            };
+            // Restore the per-peer dedup so a reconnect to a peer we've already synced doesn't
+            // re-flood the directory; a brand-new peer has no entry → empty sets → full first sync
+            // (prekey + presence + bundle handoff) still happens exactly once (DESIGN.md §16/§25/§27).
+            let prior = self.peer_sent.remove(&peer).unwrap_or_default();
+            self.links.insert(
+                link,
+                LinkState::Up(Box::new(Established {
+                    session,
+                    peer,
+                    sent_bundles: prior.bundles,
+                    sent_adverts: prior.adverts,
+                    frag_buf: Vec::new(),
+                    frag_next: 0,
+                })),
+            );
+            // ALWAYS re-offer our OWN adverts (prekey/presence) on link-up: clear them from the
+            // restored per-peer dedup so they go out again. A peer that lost state (restart / data-
+            // wipe / cache-evict) must be able to re-secure to us — it needs our prekey. The FOREIGN
+            // directory bulk stays deduped (no reflood), so this re-offers only ~2-3 small adverts.
+            let own = self.directory.advert_ids_by_publisher(&self.identity.address());
+            // Our own UNDELIVERED messages (awaiting an ACK): re-offer them on link-up too, so a
+            // reconnect re-sends them IMMEDIATELY instead of waiting out the exponential-backoff
+            // retransmit timer (30s → 15min). A bundle "sent" on a link that then dropped sits in the
+            // restored per-peer dedup marked already-sent — which is what made delivery take minutes
+            // on a flaky BLE link even after securing succeeded.
+            let pending_ids: Vec<BundleId> = self.pending.keys().copied().collect();
+            if let Some(LinkState::Up(est)) = self.links.get_mut(&link) {
+                for id in &own {
+                    est.sent_adverts.remove(id);
+                }
+                for id in &pending_ids {
+                    est.sent_bundles.remove(id);
+                }
+            }
+            // Adverts (prekeys + presence) FIRST, then bulk bundles: a peer needs our prekey to
+            // open a forward-secret session to us, so it must not sit behind a burst of relay-bundle
+            // offers on a rate-limited BLE link (that head-of-line blocking delayed "Securing").
+            self.offer_adverts_to_link(link);
+            self.offer_bundles_to_link(link);
+            // A new peer might be able to resolve names we're still waiting on — ask it
+            // (delay-tolerant HNS, §30). Skip if we have internet (we resolve ourselves).
+            if !self.internet && !self.pending_resolves.is_empty() {
+                for key in self.pending_resolves.iter().cloned().collect::<Vec<_>>() {
+                    self.send_hns_query(peer, &key);
+                }
+            }
+        } else {
+            self.links.insert(link, LinkState::Handshaking(Box::new(state)));
+        }
+    }
+
+    // --- inbound records ------------------------------------------------------
+
+    fn on_record(&mut self, link: LinkId, ct: &[u8]) {
+        let Some(LinkState::Up(est)) = self.links.get_mut(&link) else {
+            return;
+        };
+        let Ok(plaintext) = est.session.decrypt(ct) else {
+            return;
+        };
+        let peer = est.peer;
+        match postcard::from_bytes::<Wire>(&plaintext) {
+            Ok(Wire::Bundle(b)) => self.on_bundle(link, b),
+            Ok(Wire::Advert(a)) => self.on_advert(link, peer, a),
+            Err(_) => {}
+        }
+    }
+
+    /// Receive one fragment of an oversized record (DESIGN.md §20). Each fragment is its own
+    /// Noise message, so decrypt in arrival order (the bearer is ordered) and concatenate the
+    /// plaintext; on the final fragment, decode and dispatch the whole [`Wire`]. An
+    /// out-of-order fragment means loss/corruption — drop the partial record and resync.
+    fn on_record_frag(&mut self, link: LinkId, idx: u16, cnt: u16, ct: &[u8]) {
+        let ready = {
+            let Some(LinkState::Up(est)) = self.links.get_mut(&link) else {
+                return;
+            };
+            // Decrypt now: the Noise ratchet must advance in lockstep with arrivals.
+            let Ok(piece) = est.session.decrypt(ct) else {
+                return;
+            };
+            if cnt == 0 || idx >= cnt || idx != est.frag_next {
+                // Stray or reordered fragment: reset. Only a fresh idx 0 starts a new record.
+                est.frag_buf.clear();
+                est.frag_next = 0;
+                if idx != 0 {
+                    return;
+                }
+            }
+            est.frag_buf.extend_from_slice(&piece);
+            est.frag_next += 1;
+            if est.frag_next == cnt {
+                let plaintext = std::mem::take(&mut est.frag_buf);
+                est.frag_next = 0;
+                Some((plaintext, est.peer))
+            } else {
+                None
+            }
+        };
+        if let Some((plaintext, peer)) = ready {
+            match postcard::from_bytes::<Wire>(&plaintext) {
+                Ok(Wire::Bundle(b)) => self.on_bundle(link, b),
+                Ok(Wire::Advert(a)) => self.on_advert(link, peer, a),
+                Err(_) => {}
+            }
+        }
+    }
+
+    fn on_bundle(&mut self, from_link: LinkId, bundle: Bundle) {
+        if bundle.verify().is_err() {
+            return; // never store/relay unverifiable bundles
+        }
+        let id = bundle.id();
+
+        // A broadcast is processed by everyone and relayed by everyone, then falls through to
+        // the store+offer flood below — we never short-circuit, since halting the flood at the
+        // recipient would out it.
+        if matches!(bundle.inner.dst, Destination::Broadcast) {
+            if bundle.is_private() {
+                // §39 "is this mine?": trial-match against our prekeys on EVERY arrival (a
+                // cheap DH+hash) — so a flooded duplicate can re-ACK if our first ACK was
+                // lost. deliver_private delivers/handles the inner payload only once.
+                if self.recognizes(&bundle) {
+                    self.deliver_private(&bundle, &id);
+                }
+            } else if !self.store.seen(&id) {
+                self.process_broadcast(&bundle); // an hps:// publish (§32)
+            }
+        }
+
+        if is_for(&bundle, &self.address()) {
+            if self.store.seen(&id) {
+                // A duplicate of something we already delivered. If it wanted an ACK, our
+                // ACK may have been lost — re-emit it (throttled) so the sender can stop
+                // retransmitting. Never re-deliver to the inbox.
+                if !bundle.inner.flags.is_ack && bundle.inner.flags.request_ack {
+                    let due = match self.last_ack.get(&id) {
+                        Some(&t) => self.now_ms.saturating_sub(t) >= REACK_MIN_INTERVAL_MS,
+                        None => true,
+                    };
+                    if due {
+                        self.emit_ack(&bundle);
+                    }
+                }
+                return;
+            }
+            if bundle.inner.flags.is_ack {
+                // An ACK for one of our sent bundles: stop tracking & carrying it,
+                // and mark it Delivered for the UI.
+                if let Ok(Payload::Ack { for_bundle_id, delivery_hops, delivery_ms, .. }) =
+                    bundle.open(&self.identity)
+                {
+                    self.pending.remove(&for_bundle_id);
+                    self.store.remove(&for_bundle_id);
+                    // Mark the UI-facing message delivered (resolve carrier/deferral aliases).
+                    let display = self.display_id(&for_bundle_id);
+                    if let Some(info) = self.tx.get_mut(&display) {
+                        info.delivered = true;
+                        info.delivered_hops = delivery_hops;
+                        info.delivered_ms = delivery_ms;
+                    }
+                    // Our message reached its destination: learn the route (§27).
+                    if let Some((s, d, _)) = self.forwarded.remove(&for_bundle_id) {
+                        self.routes.learn(&s, &d, self.now_ms);
+                    }
+                }
+            } else {
+                // Route by payload: HTTP req/resp go to their own queues; peer/session
+                // messages stay raw for read_message (sessions need stateful decrypt).
+                match bundle.open(&self.identity) {
+                    Ok(Payload::HttpResponse { status, headers, body, for_bundle_id }) => {
+                        // The response answers our request → drop the request bundle so it
+                        // stops being held/re-offered, and vaccinate any in-flight copies.
+                        self.pending.remove(&for_bundle_id);
+                        self.store.remove(&for_bundle_id);
+                        self.relay_order.retain(|x| *x != for_bundle_id);
+                        self.immune.insert(for_bundle_id, self.now_ms);
+                        self.tx.remove(&for_bundle_id);
+                        self.http_responses.push(HttpRespItem {
+                            from: bundle.inner.src,
+                            for_id: for_bundle_id,
+                            status,
+                            headers,
+                            body,
+                        });
+                    }
+                    // A hops:// request sealed to us (we're a hop-endpoint, §30): surface
+                    // it for the operator's translator to execute against its backend.
+                    Ok(Payload::HttpRequest { host, method, url, headers, body, max_resp_bytes }) => {
+                        self.http_requests.push(HttpReqItem {
+                            from: bundle.inner.src,
+                            id,
+                            host,
+                            method,
+                            url,
+                            headers,
+                            body,
+                            max_resp: max_resp_bytes,
+                        });
+                    }
+                    Ok(Payload::ServiceResponse { for_bundle_id, status, body }) => {
+                        // A response is the return-path "delete" for our request: service
+                        // calls carry no ACK-vaccine of their own, so without this the
+                        // request bundle would sit pinned in our store forever. Drop it
+                        // everywhere and vaccinate so any in-flight copy is dropped too.
+                        self.pending.remove(&for_bundle_id);
+                        self.store.remove(&for_bundle_id);
+                        self.relay_order.retain(|x| *x != for_bundle_id);
+                        self.immune.insert(for_bundle_id, self.now_ms);
+                        self.tx.remove(&for_bundle_id);
+                        self.service_responses.push(ServiceRespItem {
+                            from: bundle.inner.src,
+                            for_id: for_bundle_id,
+                            status,
+                            body,
+                        });
+                    }
+                    Ok(Payload::ServiceRequest { service, method, args }) => {
+                        let from = bundle.inner.src;
+                        if service == SERVICE_IDENTIFY {
+                            // Built-in: the node answers with its own identity record.
+                            let body = postcard::to_allocvec(&self.identity_record())
+                                .unwrap_or_default();
+                            let _ = self.send_service_response(from, id, 0, body);
+                        } else {
+                            // Custom service: hand to the embedding app to fulfill.
+                            self.service_requests.push(ServiceReqItem {
+                                from,
+                                id,
+                                service,
+                                method,
+                                args,
+                            });
+                        }
+                    }
+                    // An HNS query sealed to us (a peer is asking us — an internet-connected
+                    // node — to resolve a domain, §30). Answer from cache if fresh; else, if
+                    // we have internet, park the asker and kick off a real-DNS lookup; if we
+                    // can't help (no internet, not cached), stay silent and let it time out.
+                    Ok(Payload::HnsQuery { domain }) => {
+                        // A peer asks us to resolve. Only an internet-connected node can fetch
+                        // the chain; park the asker and re-fetch so we answer with a *fresh
+                        // proof* the asker can validate (we don't serve a bare cached address —
+                        // there'd be nothing for them to verify). If we have no internet, stay
+                        // silent and let it reach someone who does.
+                        let key = normalize_domain(&domain);
+                        let from = bundle.inner.src;
+                        if self.internet {
+                            self.dns_waiters.entry(key.clone()).or_default().push((from, id));
+                            self.queue_dns_lookup(&key);
+                        }
+                    }
+                    // An HNS answer (a DNSSEC proof) to a query we sent (§30): validate it
+                    // ourselves and cache on success, then purge the query bundle. We never
+                    // trust the answering node — only the proof.
+                    Ok(Payload::HnsAnswer { domain, proof, for_query }) => {
+                        self.provide_dns_proof(&domain, proof);
+                        self.pending.remove(&for_query);
+                        self.store.remove(&for_query);
+                        self.relay_order.retain(|x| *x != for_query);
+                        self.immune.insert(for_query, self.now_ms);
+                        self.tx.remove(&for_query);
+                    }
+                    // A join request for a topic we host (§32). Verify app+proof, then branch on
+                    // access: Open → seal keys now; RequestToJoin → queue for approval; Invite →
+                    // ignore (members can't self-join, they must be invited).
+                    Ok(Payload::HpsJoinRequest { path, proof }) => {
+                        if self.hps_authorized(&bundle, &path, &proof) {
+                            let who = bundle.inner.src;
+                            match self.services.get(&path).map(|c| c.access) {
+                                Some(hps::AccessMode::Open) => {
+                                    self.record_member(&path, who);
+                                    let _ = self.send_keys(&path, who);
+                                }
+                                Some(hps::AccessMode::RequestToJoin) => {
+                                    let q = self.hps_pending.entry(path.clone()).or_default();
+                                    if !q.contains(&who) {
+                                        q.push(who);
+                                        self.persist_pending(&path);
+                                    }
+                                }
+                                _ => {} // Invite-only or unregistered → ignore
+                            }
+                        }
+                    }
+                    // Host → us: an invite. Verify it's a same-app invite, then surface it for
+                    // the user to accept.
+                    Ok(Payload::HpsInvite { path, kind, proof }) => {
+                        if self.hps_authorized(&bundle, &path, &proof) {
+                            let host = bundle.inner.src;
+                            if !self.hps_invites_in.iter().any(|i| i.path == path && i.host == host) {
+                                self.hps_invites_in.push(HpsInviteItem { path, host, kind });
+                                self.persist_invites();
+                            }
+                        }
+                    }
+                    // Destination → host: an invite was accepted; seal them the keys.
+                    Ok(Payload::HpsInviteAccept { path, proof }) => {
+                        let who = bundle.inner.src;
+                        if self.hps_authorized(&bundle, &path, &proof)
+                            && self.hps_invites_out.remove(&(path.clone(), who)).is_some()
+                        {
+                            self.persist_invites();
+                            self.record_member(&path, who);
+                            let _ = self.send_keys(&path, who);
+                        }
+                    }
+                    // Member → host: leaving; drop them from retained set + reach tally.
+                    Ok(Payload::HpsLeave { path, proof }) => {
+                        if self.hps_authorized(&bundle, &path, &proof) {
+                            let who = bundle.inner.src;
+                            if let Some(m) = self.hps_members.get_mut(&path) { m.remove(&who); }
+                            if let Some(r) = self.hps_reach.get_mut(&path) { r.remove(&who); }
+                        }
+                    }
+                    // Member → host: reach ack — tally unique acking addresses (§32).
+                    Ok(Payload::HpsReachAck { topic_tag, epoch: _ }) => {
+                        // Map the opaque tag back to a path we host.
+                        let who = bundle.inner.src;
+                        let path = self
+                            .services
+                            .keys()
+                            .find(|p| self.app.topic_tag(p) == topic_tag)
+                            .cloned();
+                        if let Some(path) = path {
+                            self.hps_reach.entry(path.clone()).or_default().insert(who);
+                            self.record_member(&path, who);
+                        }
+                    }
+                    // Host → us: rotate to a new key generation (revocation, §32).
+                    Ok(Payload::HpsRekey { old_path, new_path, epoch, content_key, service_pubkey, proof }) => {
+                        if self.hps_authorized(&bundle, &old_path, &proof) {
+                            if let Some(old) = self.subscriptions.get(&old_path) {
+                                if epoch > old.epoch {
+                                    let host = old.host;
+                                    if old_path != new_path {
+                                        self.subscriptions.remove(&old_path);
+                                        self.directory.unsubscribe(&old_path);
+                                        self.store.remove_kv(&Self::hps_sub_key(&old_path));
+                                    }
+                                    self.install_subscription(&new_path, host, content_key, service_pubkey, epoch);
+                                }
+                            }
+                        }
+                    }
+                    // The keys for a topic we subscribed to (§32): remember them so we can
+                    // decrypt + verify its broadcasts.
+                    Ok(Payload::HpsKeys { path, content_key, service_pubkey, epoch }) => {
+                        let host = bundle.inner.src;
+                        self.install_subscription(&path, host, content_key, service_pubkey, epoch);
+                    }
+                    // A transport carrier chunk: reassemble (§20); once complete, reconstruct
+                    // the original bundle and process it as if it had arrived whole.
+                    // (Application streams use StreamData and are delivered progressively.)
+                    Ok(Payload::Carrier { stream_id, seq, bytes, fin }) => {
+                        let from = bundle.inner.src;
+                        if let Some(inner_bytes) =
+                            self.accept_stream_chunk(from, stream_id, seq, bytes, fin)
+                        {
+                            if let Ok(inner) = Bundle::from_bytes(&inner_bytes) {
+                                self.on_bundle(from_link, inner);
+                            }
+                        }
+                    }
+                    // A peer says our ratchet desynced: drop our session and re-establish so
+                    // a fresh handshake re-syncs it (DESIGN.md §25). Not surfaced to the app.
+                    Ok(Payload::SessionReset) => self.handle_session_reset(bundle.inner.src),
+                    _ => self.inbox.push(bundle.clone()),
+                }
+                if bundle.inner.flags.request_ack {
+                    self.emit_ack(&bundle);
+                }
+            }
+            // Mark seen (dedup) but don't hold — we never relay what's addressed to us.
+            self.store.put(bundle, self.now_ms);
+            self.store.remove(&id);
+            return;
+        }
+
+        // Internet-egress request sealed to us (we're a gateway that can open it):
+        // surface it for fulfillment. Still relayed below so other gateways can serve
+        // it too; gateway-side dedup prevents double fulfillment (§9).
+        if matches!(bundle.inner.dst, Destination::InternetEgress) && !self.store.seen(&id) {
+            if let Ok(Payload::HttpRequest { host, method, url, headers, body, max_resp_bytes }) =
+                bundle.open(&self.identity)
+            {
+                self.http_requests.push(HttpReqItem {
+                    from: bundle.inner.src,
+                    id,
+                    host,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    max_resp: max_resp_bytes,
+                });
+            }
+        }
+
+        // A passing ACK vaccinates us: the bundle it acknowledges is delivered, so
+        // drop our copy and remember to drop any future copy (epidemic recovery). The
+        // acked id rides in the *unsealed* AckTo destination, so relays can read it.
+        if bundle.inner.flags.is_ack {
+            if let Destination::AckTo(_, delivered) = bundle.inner.dst {
+                self.store.remove(&delivered);
+                self.relay_order.retain(|x| *x != delivered);
+                self.immune.insert(delivered, self.now_ms);
+                // The ACK for a bundle we forwarded is passing back through us — we're
+                // on a working path between its endpoints, in both directions (§27).
+                if let Some((s, d, _)) = self.forwarded.remove(&delivered) {
+                    self.routes.learn(&s, &d, self.now_ms);
+                }
+            }
+        } else if self.immune.contains_key(&id) {
+            return; // already delivered elsewhere — don't re-store or re-flood it
+        }
+
+        // Not ours: store for onward relay, then offer to every other live link.
+        let relay_src = bundle.inner.src;
+        let relay_dst = match bundle.inner.dst {
+            Destination::Device(d) => Some(d),
+            _ => None,
+        };
+        if self.store.put(bundle, self.now_ms) {
+            self.relay_order.push(id);
+            // Remember we're carrying this toward `dst` so a returning ACK teaches the
+            // route (§27). `or_insert` keeps our own-send record if we have one.
+            if let Some(d) = relay_dst {
+                self.forwarded.entry(id).or_insert((relay_src, d, self.now_ms));
+                self.prune_forwarded_if_needed();
+            }
+            self.evict_relayed_if_needed();
+            let links: Vec<LinkId> =
+                self.links.keys().copied().filter(|l| *l != from_link).collect();
+            for l in links {
+                self.offer_bundles_to_link(l);
+            }
+        }
+    }
+
+    /// Keep relayed (not-ours) bundles within `max_relayed`. Custody policy (DESIGN.md §6):
+    /// **never drop a bundle we haven't relayed at least once if we can avoid it** — so a
+    /// flood of big transfers can't evict legitimate, not-yet-forwarded messages, and so
+    /// the cap acts as a *sliding window* (chunks flow through: relayed, then evicted after
+    /// a grace window) rather than a hard limit on transfer size. Eviction therefore
+    /// prefers already-relayed, past-grace bundles, and only falls back to dropping a
+    /// not-yet-relayed (or in-grace) bundle when nothing else can be freed (to bound
+    /// memory). Within a tier the victim is the lowest-utility (priority, then route,
+    /// then oldest). Our own messages are never here.
+    fn evict_relayed_if_needed(&mut self) {
+        let now = self.now_ms;
+        while self.relay_order.len() > self.max_relayed {
+            let victim =
+                self.pick_evict_victim(now, true).or_else(|| self.pick_evict_victim(now, false));
+            let Some((idx, id)) = victim else { break };
+            self.relay_order.remove(idx);
+            self.store.remove(&id);
+            self.relay_fwd.remove(&id);
+        }
+    }
+
+    /// Choose an eviction victim by lowest utility (priority, route, oldest). When
+    /// `settled_only`, consider only bundles we've already relayed once and held past
+    /// [`EVICT_GRACE_MS`] — the preferred, safe-to-drop set.
+    fn pick_evict_victim(&self, now: u64, settled_only: bool) -> Option<(usize, BundleId)> {
+        self.relay_order
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| {
+                !settled_only
+                    || self
+                        .relay_fwd
+                        .get(*id)
+                        .is_some_and(|t| now.saturating_sub(*t) >= EVICT_GRACE_MS)
+            })
+            .min_by(|(ia, a), (ib, b)| {
+                self.bundle_utility(a, now)
+                    .partial_cmp(&self.bundle_utility(b, now))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(ia.cmp(ib))
+            })
+            .map(|(idx, id)| (idx, *id))
+    }
+
+    /// Bound the forwarded-route memory (§27): drop the oldest entries past the cap.
+    fn prune_forwarded_if_needed(&mut self) {
+        if self.forwarded.len() <= DEFAULT_MAX_FORWARDED {
+            return;
+        }
+        let drop_n = self.forwarded.len() - DEFAULT_MAX_FORWARDED;
+        let mut by_age: Vec<(BundleId, u64)> =
+            self.forwarded.iter().map(|(k, v)| (*k, v.2)).collect();
+        by_age.sort_by_key(|(_, t)| *t);
+        for (k, _) in by_age.into_iter().take(drop_n) {
+            self.forwarded.remove(&k);
+        }
+    }
+
+    /// Emit an ACK bundle back to the origin of `orig`, sealed to its address.
+    fn emit_ack(&mut self, orig: &Bundle) {
+        // The ACK should survive as long as the message it confirms (so the sender keeps
+        // hearing it while it's still retransmitting over a long hop), capped, and ride a
+        // notch above bulk traffic so confirmations aren't stuck behind big transfers.
+        let lifetime = orig.inner.lifetime_ms.min(MAX_ACK_LIFETIME_MS);
+        let ack = Bundle::create(
+            &self.identity,
+            Destination::AckTo(orig.inner.src, orig.id()),
+            &orig.inner.src,
+            &Payload::Ack {
+                for_bundle_id: orig.id(),
+                status: 0,
+                delivery_hops: orig.env.hops,
+                delivery_ms: forward_ms(self.now_ms, orig.inner.created_at),
+            },
+            BundleOpts {
+                created_at: self.now_ms,
+                lifetime_ms: lifetime,
+                priority: orig.inner.priority.saturating_add(1),
+                flags: BundleFlags { is_ack: true, ..Default::default() },
+                ..Default::default()
+            },
+        );
+        if let Ok(ack) = ack {
+            // Track this ACK for replication (ride to N peers, then stop) and remember we
+            // just acked this message (re-ACK throttle on duplicates).
+            self.ack_replicate.entry(ack.id()).or_default();
+            self.last_ack.insert(orig.id(), self.now_ms);
+            self.submit(ack);
+        }
+    }
+
+    fn on_advert(&mut self, from_link: LinkId, peer: PubKeyBytes, advert: Advert) {
+        let _ = peer; // reserved for finer-grained relay scoring (DESIGN.md §18)
+        // Service adverts flood the directory (subscribed → full retention, else the
+        // bounded relay cache). Re-gossip only when newly accepted.
+        let is_prekey = matches!(advert.body.kind, AdvertKind::PreKey { .. });
+        // §39 P4: a signed receiver-beacon lays/refreshes a gradient toward its mailbox via the
+        // link we heard it on. Read its fields before `ingest` consumes the advert.
+        let beacon = match advert.body.kind {
+            AdvertKind::RecvBeacon { mailbox, .. } => {
+                Some((mailbox, advert.hops, advert.body.created_at, advert.body.ttl_ms, advert.body.seq))
+            }
+            _ => None,
+        };
+        if self.directory.ingest(advert, self.now_ms).unwrap_or(false) {
+            self.offer_adverts_to_all();
+            // A newly-learned prekey may unblock content we were holding to ratchet (§25).
+            if is_prekey {
+                self.flush_pending_content();
+            }
+            if let Some((mailbox, hops, created_at, ttl_ms, seq)) = beacon {
+                self.record_gradient(mailbox, from_link, hops, created_at, ttl_ms, seq);
+            }
+        }
+    }
+
+    /// §39 P4: record/refresh a routing-gradient entry from a verified receiver-beacon — the
+    /// recipient behind `mailbox` is reachable via `from_link`. A strictly-fresher beacon (higher
+    /// `seq`) supersedes even from a new direction (a moved recipient re-points the route); among
+    /// equal seq, the closer (fewer-hop) copy wins. After recording, immediately re-offer any
+    /// already-HELD private bundles down the new link — without this, a bundle parked before the
+    /// gradient existed waits forever (the relay already deduped it on the bridge link at link-up).
+    fn record_gradient(&mut self, mailbox: Tag, from_link: LinkId, hops: u8, created_at: u64, ttl_ms: u32, seq: u64) {
+        let expires_at = created_at.saturating_add(ttl_ms as u64);
+        if expires_at <= self.now_ms {
+            return; // already stale on arrival
+        }
+        let entry = GradientEntry { inbound: from_link, hops, expires_at, seq };
+        let install = match self.recv_gradient.get(&mailbox) {
+            // Fresher beacon, or same generation but a closer/equal path → take it.
+            Some(e) => seq > e.seq || (seq == e.seq && hops <= e.hops),
+            None => true,
+        };
+        if !install {
+            return;
+        }
+        if self.recv_gradient.len() >= MAX_RECV_GRADIENT && !self.recv_gradient.contains_key(&mailbox) {
+            // Bound the table (Sybil): evict the nearest-to-expiry entry.
+            if let Some(&victim) = self
+                .recv_gradient
+                .iter()
+                .min_by_key(|(_, e)| e.expires_at)
+                .map(|(k, _)| k)
+            {
+                self.recv_gradient.remove(&victim);
+            }
+        }
+        self.recv_gradient.insert(mailbox, entry);
+        // §39 P5: a newly-accepted beacon IS a want-beacon — surface the mailbox so the host reloads
+        // its durable blind spool (an offline-deposited bundle is pulled the moment we hear from the
+        // recipient). Bounded so a beacon storm can't grow this unboundedly; a dropped tag just waits
+        // for the next periodic re-beacon. (Deduped against the tail to avoid a refresh re-queuing it.)
+        if self.wanted_mailboxes.last() != Some(&mailbox) {
+            if self.wanted_mailboxes.len() >= MAX_RECV_GRADIENT {
+                self.wanted_mailboxes.remove(0);
+            }
+            self.wanted_mailboxes.push(mailbox);
+        }
+        // The fix for the live "held=95 never drains" bug: a freshly-laid gradient is a NEW
+        // trigger to push parked private bundles toward the recipient, not just at link-up.
+        self.offer_bundles_to_link(from_link);
+    }
+
+    // --- outbound offers ------------------------------------------------------
+
+    fn offer_bundles_to_all(&mut self) {
+        let links: Vec<LinkId> = self.links.keys().copied().collect();
+        for l in links {
+            self.offer_bundles_to_link(l);
+        }
+    }
+
+    fn offer_adverts_to_all(&mut self) {
+        let links: Vec<LinkId> = self.links.keys().copied().collect();
+        for l in links {
+            self.offer_adverts_to_link(l);
+        }
+    }
+
+    /// Utility of a stored bundle for transmit-ordering and eviction (DESIGN.md §27):
+    /// service priority dominates (×100 keeps priority bands separate), and learned
+    /// reachability toward the destination orders bundles *within* a band — so a bundle
+    /// toward a destination we have a route to beats one toward an unknown destination.
+    fn bundle_utility(&self, id: &BundleId, now: u64) -> f64 {
+        let Some(b) = self.store.get(id) else { return 0.0 };
+        self.bundle_utility_of(&b, now)
+    }
+
+    /// Utility from an ALREADY-loaded bundle — avoids a `store.get` per call. `offer_bundles_to_link`
+    /// uses this so its transmit-order sort does O(N) reads (load once), not O(N log N) (one read per
+    /// sort comparison), which under the held node Mutex was starving link handshakes.
+    fn bundle_utility_of(&self, b: &Bundle, now: u64) -> f64 {
+        let route = match b.inner.dst {
+            Destination::Device(d) => self.routes.utility(&d, now),
+            _ => 0.0,
+        };
+        b.inner.priority as f64 * 100.0 + route
+    }
+
+    /// Offer stored bundles to one link, applying binary spray-and-wait.
+    fn offer_bundles_to_link(&mut self, link: LinkId) {
+        // Provenance privacy (§27): a DEVICE relay leaves its address OUT of the trace (stamps a
+        // zeroed short-addr) so the recipient learns only the hop count + carrier type ("device"),
+        // never WHICH devices carried it. Infra relays self-identify (their address is public) so a
+        // recipient can still see "via Hop Relay". A device's own address is in the bundle `src`
+        // anyway, so hiding it in the trace loses nothing — it only protects intermediate relays.
+        let me_short = if self.trace_app == FABRIC_APP { ShortAddr::default() } else { short_addr(&self.identity.address()) };
+        let me_app = short_app(&self.trace_app);
+        let now = self.now_ms;
+        // Snapshot ids, ordered by utility so the most-likely-to-deliver bundles go
+        // first during a short contact (DESIGN.md §27).
+        // Load each bundle ONCE, compute its utility, then sort by the precomputed value — O(N)
+        // store reads, not the O(N log N) the per-comparison bundle_utility(id) used to do. Under
+        // the held node Mutex that read storm (×fsync from synchronous=FULL) starved link Noise
+        // handshakes and prekey gossip, which is what made messages hang "Securing" under load.
+        let mut loaded: Vec<(BundleId, Bundle, f64)> = self
+            .store
+            .have()
+            .ids
+            .into_iter()
+            .filter_map(|id| {
+                let b = self.store.get(&id)?;
+                let u = self.bundle_utility_of(&b, now);
+                Some((id, b, u))
+            })
+            .collect();
+        loaded.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
+        for (id, b, _) in loaded {
+            let Some(LinkState::Up(est)) = self.links.get(&link) else {
+                return;
+            };
+            if est.sent_bundles.contains(&id) {
+                continue;
+            }
+            let peer = est.peer;
+            // §39 P4: route a private bundle DOWN its gradient (toward the recipient) instead of
+            // blind-flooding. If we hold a live gradient for its mailbox and the next-hop link is
+            // up, send ONLY on that link — skip every other. No gradient (cold start / passive
+            // recipient) or a flapping next-hop → fall through to the epidemic flood fallback.
+            if b.is_private() {
+                if let Some(mailbox) = b.inner.private.as_ref().and_then(|p| p.mailbox) {
+                    if let Some(&entry) = self.recv_gradient.get(&mailbox) {
+                        // Only a LIVE gradient whose next hop is actually up steers the bundle; an
+                        // expired/flapping entry falls through to the flood fallback (never parks).
+                        let usable = entry.expires_at > now
+                            && matches!(self.links.get(&entry.inbound), Some(LinkState::Up(_)));
+                        if usable && link != entry.inbound {
+                            continue; // the directed copy rides only the gradient's link
+                        }
+                    }
+                }
+            }
+            let meta = BundleMeta::from(&b);
+            let direct = is_for(&b, &peer);
+            // If we can reach the destination directly right now, don't spray copies
+            // to relays — direct delivery on the destination's own link completes it.
+            let dest_here = self.dest_is_connected(&b);
+
+            // Our own originated messages: keep until the delivery ACK arrives (or
+            // they expire), so we can re-flood if undelivered — don't release on a
+            // mere handoff (DESIGN.md §6, §7).
+            let own = self.tx.contains_key(&id);
+
+            let to_send: Option<Bundle> = match self.router.should_forward(&meta, &peer) {
+                ForwardDecision::Drop => {
+                    self.store.remove(&id);
+                    None
+                }
+                ForwardDecision::Hold => None,
+                ForwardDecision::Forward if direct => {
+                    let mut copy = b.clone();
+                    if copy.forwarded() {
+                        copy.add_hop(me_short, me_app); // provenance (§27)
+                        // Release custody only for fire-and-forget bundles. For request_ack
+                        // ones (carrier chunks, messages), keep custody until the delivery
+                        // ACK confirms receipt — handing to the destination is optimistic, and
+                        // a chunk it misses in a brief background window must be re-offerable
+                        // on its next wake, not deleted here (the ACK vaccine removes it for
+                        // real). Without this, a large transfer to a backgrounded device can
+                        // lose chunks the relay already dropped, and dedup blocks re-injection.
+                        if !own && !b.inner.flags.request_ack {
+                            self.store.remove(&id);
+                        }
+                        Some(copy)
+                    } else {
+                        None
+                    }
+                }
+                // Destination is directly reachable on its own link — deliver there,
+                // don't also flood it to relays (the dest would just dedup the copies).
+                ForwardDecision::Forward if dest_here => None,
+                ForwardDecision::Forward => {
+                    // Epidemic flood: hand a full copy to this neighbour and keep ours
+                    // so we keep flooding to other/future neighbours. Copies are bounded
+                    // by the hop limit and reclaimed by the delivery-ACK vaccine.
+                    let mut copy = b.clone();
+                    if copy.forwarded() {
+                        copy.add_hop(me_short, me_app); // provenance (§27)
+                        Some(copy)
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if let Some(copy) = to_send {
+                self.send_record(link, &Wire::Bundle(copy));
+                if let Some(LinkState::Up(est)) = self.links.get_mut(&link) {
+                    est.sent_bundles.insert(id);
+                }
+                // Record the first handoff of a not-ours bundle so eviction can prefer
+                // already-relayed, settled bundles over ones we haven't relayed yet (§6).
+                if !own {
+                    self.relay_fwd.entry(id).or_insert(now);
+                }
+                // A delivery-ACK we originated: count distinct peers it's reached; once it
+                // has spread to ACK_REPLICATION_TARGET, it's done — drop it so it stops
+                // riding to every contact (DESIGN.md §7).
+                if let Some(peers) = self.ack_replicate.get_mut(&id) {
+                    peers.insert(peer);
+                    if peers.len() >= ACK_REPLICATION_TARGET {
+                        self.ack_replicate.remove(&id);
+                        self.store.remove(&id);
+                    }
+                }
+                // "Sent N peers" counts relay handoffs only — not direct delivery to
+                // the destination itself (that shows as Delivered once the ACK is back).
+                if !direct {
+                    // Attribute to the UI-facing message (carrier chunk → original; deferred
+                    // content → its handle) so "Sent N" lands on the right row.
+                    let owner = self.display_id(&id);
+                    if let Some(info) = self.tx.get_mut(&owner) {
+                        info.relayed.insert(peer);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gossip directory adverts to one link, ranked by relay utility isn't wired
+    /// here yet (needs a scorer); plain offer for now (DESIGN.md §16, §18).
+    fn offer_adverts_to_link(&mut self, link: LinkId) {
+        let already: HashSet<crate::discover::AdvertId> = match self.links.get(&link) {
+            Some(LinkState::Up(est)) => est.sent_adverts.clone(),
+            _ => return,
+        };
+        let offer = self.directory.gossip_offer(&already);
+        for advert in offer {
+            let aid = advert.id;
+            // Increment hop distance so receivers can show "N hops away".
+            let mut fwd = advert;
+            fwd.hops = fwd.hops.saturating_add(1);
+            self.send_record(link, &Wire::Advert(fwd));
+            if let Some(LinkState::Up(est)) = self.links.get_mut(&link) {
+                est.sent_adverts.insert(aid);
+            }
+        }
+    }
+
+    // --- wire helpers ---------------------------------------------------------
+
+    fn send_packet(&mut self, link: LinkId, packet: LinkPacket) {
+        if let Ok(bytes) = postcard::to_allocvec(&packet) {
+            self.outgoing.push((link, bytes));
+        }
+    }
+
+    fn send_record(&mut self, link: LinkId, record: &Wire) {
+        let Some(LinkState::Up(est)) = self.links.get_mut(&link) else {
+            return;
+        };
+        let Ok(plaintext) = postcard::to_allocvec(record) else {
+            return;
+        };
+        // Fits one Noise message: send as a single Data record (the common case).
+        if plaintext.len() <= MAX_RECORD_PLAINTEXT {
+            let Ok(ct) = est.session.encrypt(&plaintext) else {
+                return;
+            };
+            if let Ok(bytes) = postcard::to_allocvec(&LinkPacket::Data(ct)) {
+                self.outgoing.push((link, bytes));
+            }
+            return;
+        }
+        // Too large for one Noise message — fragment across several so it isn't silently
+        // dropped. Each piece is independently encrypted; the peer reassembles (§20).
+        let pieces: Vec<&[u8]> = plaintext.chunks(MAX_RECORD_PLAINTEXT).collect();
+        let cnt = pieces.len() as u16;
+        for (i, piece) in pieces.into_iter().enumerate() {
+            let Ok(ct) = est.session.encrypt(piece) else {
+                return; // ratchet would desync; abandon the rest of this record
+            };
+            if let Ok(bytes) =
+                postcard::to_allocvec(&LinkPacket::DataFrag { idx: i as u16, cnt, ct })
+            {
+                self.outgoing.push((link, bytes));
+            }
+        }
+    }
+}
+
+impl<S: Store> Node<S> {
+    /// Is the bundle's destination one of our currently-connected, authenticated
+    /// peers? If so we can deliver directly and need not spray copies to relays.
+    fn dest_is_connected(&self, bundle: &Bundle) -> bool {
+        let dst = match bundle.inner.dst {
+            Destination::Device(a) | Destination::AckTo(a, _) => a,
+            Destination::InternetEgress | Destination::Broadcast => return false,
+        };
+        self.links
+            .values()
+            .any(|s| matches!(s, LinkState::Up(e) if e.peer == dst))
+    }
+}
+
+/// Durable KV key for one persisted carrier chunk (DESIGN.md §20). Zero-padded seq keeps
+/// keys lexically ordered; both addresses base58-encode without a `/`, so the key splits
+/// cleanly back apart.
+fn stream_chunk_key(from: &PubKeyBytes, sid: &StreamId, seq: u64) -> String {
+    format!(
+        "strm/{}/{}/{:020}",
+        bs58::encode(from).into_string(),
+        bs58::encode(sid).into_string(),
+        seq
+    )
+}
+
+/// KV prefix for all of one carrier stream's persisted chunks.
+fn stream_prefix(from: &PubKeyBytes, sid: &StreamId) -> String {
+    format!("strm/{}/{}/", bs58::encode(from).into_string(), bs58::encode(sid).into_string())
+}
+
+/// Parse a persisted-chunk key back into `(from, stream_id, seq)`.
+fn parse_stream_key(key: &str) -> Option<(PubKeyBytes, StreamId, u64)> {
+    let rest = key.strip_prefix("strm/")?;
+    let mut parts = rest.split('/');
+    let from = parts.next()?;
+    let sid = parts.next()?;
+    let seq = parts.next()?;
+    let from = <PubKeyBytes>::try_from(bs58::decode(from).into_vec().ok()?.as_slice()).ok()?;
+    let sid = <StreamId>::try_from(bs58::decode(sid).into_vec().ok()?.as_slice()).ok()?;
+    Some((from, sid, seq.parse().ok()?))
+}
+
+/// Canonicalize a domain for HNS cache keys/lookups: lowercase, no trailing dot, no
+/// surrounding whitespace. (DNS is case-insensitive; the root dot is implicit.)
+fn normalize_domain(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Is this bundle destined for `addr` (direct delivery)?
+fn is_for(bundle: &Bundle, addr: &PubKeyBytes) -> bool {
+    use crate::bundle::Destination::*;
+    match &bundle.inner.dst {
+        Device(d) => d == addr,
+        AckTo(d, _) => d == addr,
+        InternetEgress => false,
+        Broadcast => false,
+    }
+}
+
+/// Forward-path latency (ms) a receiver reports in its ACK: its receive time `now` minus the
+/// message's `created_at` (the sender's send time). Saturating + clamped to `u32` — a negative
+/// value (clock skew where the receiver's clock trails the sender's) reads as 0, and anything
+/// beyond ~49 days clamps rather than wrapping.
+fn forward_ms(now: u64, created_at: u64) -> u32 {
+    now.saturating_sub(created_at).min(u32::MAX as u64) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bundle::{BundleOpts, Destination, Payload};
+    use crate::discover::AdvertKind;
+
+    /// In-memory test fabric: pump nodes until quiescent, routing each node's
+    /// outgoing bytes to the peer on the matching link id.
+    struct Wire2 {
+        // For a connection between node A and node B: A uses link `ab`, B uses `ba`.
+        // map: (node_index, link_id) -> (other_node_index, other_link_id)
+        routes: HashMap<(usize, LinkId), (usize, LinkId)>,
+    }
+
+    impl Wire2 {
+        fn new() -> Self {
+            Self { routes: HashMap::new() }
+        }
+
+        /// Connect nodes `a` and `b` with the given link ids and run the handshake.
+        fn connect(&mut self, nodes: &mut [Node], a: usize, la: LinkId, b: usize, lb: LinkId) {
+            self.routes.insert((a, la), (b, lb));
+            self.routes.insert((b, lb), (a, la));
+            nodes[a].handle(BearerEvent::Connected(la, Role::Initiator));
+            nodes[b].handle(BearerEvent::Connected(lb, Role::Responder));
+            self.pump(nodes);
+        }
+
+        /// Deliver all queued bytes until the network is quiescent.
+        fn pump(&mut self, nodes: &mut [Node]) {
+            for _ in 0..1000 {
+                let mut any = false;
+                for i in 0..nodes.len() {
+                    for (link, bytes) in nodes[i].drain_outgoing() {
+                        any = true;
+                        if let Some(&(j, jl)) = self.routes.get(&(i, link)) {
+                            nodes[j].handle(BearerEvent::Data(jl, bytes));
+                        }
+                    }
+                }
+                if !any {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn msg(from: &Node, to: &Node, body: &[u8]) -> Bundle {
+        Bundle::create(
+            &from.identity,
+            Destination::Device(to.address()),
+            &to.identity.address(),
+            &Payload::PeerMessage { content_type: "t".into(), body: body.to_vec() },
+            BundleOpts::default(),
+        )
+        .unwrap()
+    }
+
+    /// Publish + gossip prekeys so `send_message` can open forward-secret sessions — content is
+    /// never static-sealed now, so a test that sends via `send_message` must do this first (§25).
+    fn exchange_prekeys(net: &mut Wire2, nodes: &mut [Node]) {
+        for n in nodes.iter_mut() {
+            n.publish_prekey().unwrap();
+        }
+        net.pump(nodes);
+    }
+
+    #[test]
+    fn ingest_holds_offline_device_bundle_for_handoff() {
+        // A relay ingests a foreign alice→bob bundle from durable storage. With neither
+        // endpoint connected it reports the bundle as undeliverable (so the backbone can
+        // hand it into bob's region's mailbox, §28), preserving the sealed bytes verbatim.
+        let mut relay = Node::new(Identity::generate());
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let b = Bundle::create(
+            &alice,
+            Destination::Device(bob.address()),
+            &bob.address(),
+            &Payload::PeerMessage { content_type: "t".into(), body: b"hi".to_vec() },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let id = b.id();
+
+        relay.ingest(b.clone());
+        let u = relay.undeliverable_device_bundles();
+        assert_eq!(u.len(), 1, "the held device bundle is undeliverable while bob is offline");
+        assert_eq!(u[0].0, id);
+        assert_eq!(u[0].1, bob.address());
+        let round = Bundle::from_bytes(&u[0].2).expect("sealed bytes round-trip");
+        assert_eq!(round.id(), id);
+
+        // Re-ingesting the same bundle is a no-op (dedup), not a duplicate.
+        relay.ingest(b);
+        assert_eq!(relay.undeliverable_device_bundles().len(), 1);
+    }
+
+    #[test]
+    fn identify_service_round_trips() {
+        // Calling the built-in hop.identify on a peer returns its name/kind/address,
+        // answered by the node itself — nothing surfaces to the responder's app (§29).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[1].set_name(Some("Bob's Phone".into()));
+
+        nodes[0]
+            .send_service_request(nodes[1].address(), SERVICE_IDENTIFY.into(), String::new(), vec![])
+            .unwrap();
+        net.pump(&mut nodes);
+
+        assert!(nodes[1].take_service_requests().is_empty(), "built-in is auto-answered");
+        let resps = nodes[0].take_service_responses();
+        assert_eq!(resps.len(), 1);
+        assert_eq!(resps[0].status, 0);
+        let rec: IdentityRecord = postcard::from_bytes(&resps[0].body).unwrap();
+        assert_eq!(rec.name.as_deref(), Some("Bob's Phone"));
+        assert_eq!(rec.kind, NodeKind::Device);
+        assert_eq!(rec.address, nodes[1].address());
+    }
+
+    #[test]
+    fn unnamed_node_identifies_with_no_name() {
+        // A device with no name set returns None — the caller falls back to its short
+        // address. The full address still comes back so the caller can resolve it.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        nodes[0]
+            .send_service_request(nodes[1].address(), SERVICE_IDENTIFY.into(), String::new(), vec![])
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let resps = nodes[0].take_service_responses();
+        let rec: IdentityRecord = postcard::from_bytes(&resps[0].body).unwrap();
+        assert_eq!(rec.name, None);
+        assert_eq!(rec.address, nodes[1].address());
+    }
+
+    #[test]
+    fn custom_service_dispatches_to_app_and_replies() {
+        // A non-hop. service surfaces to the responder's app, which replies; the caller
+        // gets the response correlated by the request id.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        let req_id = nodes[0]
+            .send_service_request(nodes[1].address(), "app.echo".into(), "say".into(), b"hi".to_vec())
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let reqs = nodes[1].take_service_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].service, "app.echo");
+        assert_eq!(reqs[0].method, "say");
+        assert_eq!(reqs[0].args, b"hi");
+        assert_eq!(reqs[0].id, req_id);
+        let (from, for_id) = (reqs[0].from, reqs[0].id);
+        nodes[1].send_service_response(from, for_id, 0, b"hi back".to_vec()).unwrap();
+        net.pump(&mut nodes);
+
+        let resps = nodes[0].take_service_responses();
+        assert_eq!(resps.len(), 1);
+        assert_eq!(resps[0].for_id, req_id);
+        assert_eq!(resps[0].body, b"hi back");
+        // The response is the return-path delete: the request no longer lingers in our
+        // store (service calls carry no ACK-vaccine, so without this it would pin forever).
+        assert!(!nodes[0].store.contains(&req_id), "request purged once its response arrives");
+    }
+
+    #[test]
+    fn lost_session_data_recovers_via_reset() {
+        // One side loses its ratchet (uninstall / wiped p2p data: identity survives, store
+        // doesn't) while the peer keeps theirs. The peer's next message can't be decrypted →
+        // a SessionReset asks it to re-establish → a fresh handshake re-syncs the ratchet and
+        // subsequent messages decrypt again (DESIGN.md §25).
+        let id1_secret = Identity::generate().to_secret_bytes();
+        let mut nodes =
+            [Node::new(Identity::generate()), Node::from_identity_secret(&id1_secret)];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].publish_prekey().unwrap();
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[1].take_inbox() {
+            nodes[1].read_message(&b).unwrap();
+        }
+        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[0].take_inbox() {
+            nodes[0].read_message(&b).unwrap();
+        }
+        assert!(nodes[0].has_session(&nodes[1].address()), "n0 has a session");
+
+        // n1 uninstalls: same identity, but a fresh store (no persisted session).
+        nodes[1] = Node::from_identity_secret(&id1_secret);
+        assert!(!nodes[1].has_session(&nodes[0].address()), "n1 lost its session");
+        nodes[0].handle(BearerEvent::Disconnected(1));
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 2, 1, 2);
+        nodes[1].publish_prekey().unwrap(); // re-gossip n1's (deterministic) prekey
+        net.pump(&mut nodes);
+
+        // n0 still thinks it has a session → sends a SessionMessage n1 can't read.
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"during desync".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        // Reading the undecryptable message makes n1 ask n0 to reset.
+        for b in nodes[1].take_inbox() {
+            let _ = nodes[1].read_message(&b);
+        }
+        net.pump(&mut nodes); // reset → n0 drops + re-establishes → ping reaches n1
+        for b in nodes[1].take_inbox() {
+            let _ = nodes[1].read_message(&b); // process the re-establishment ping (rebuilds)
+        }
+
+        // The ratchet is healed: a fresh message now decrypts.
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"healed".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for b in nodes[1].take_inbox() {
+            if let Ok(Some(m)) = nodes[1].read_message(&b) {
+                got.push(m.body);
+            }
+        }
+        assert!(got.contains(&b"healed".to_vec()), "ratchet recovered after the reset");
+    }
+
+    #[test]
+    fn deferred_content_flushes_when_peer_initiates_session() {
+        // A message sent before we know the recipient's prekey is deferred ("Securing…"). If the
+        // recipient then messages US first, that establishes a session — and the deferred message
+        // must ratchet + send right then, WITHOUT waiting for a tick. (The stuck-"Securing" bug:
+        // flush only ran on tick/prekey-advert, so a message queued just before the app
+        // backgrounded never left even though a session later formed via the inbound path.)
+        let alice = Identity::generate().to_secret_bytes();
+        let mut nodes = [Node::from_identity_secret(&alice), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        // Alice publishes her prekey so Bob can initiate; Bob does NOT, so Alice must defer.
+        nodes[0].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        // Alice messages Bob with no prekey for him → deferred; nothing reaches Bob yet.
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"deferred".to_vec(), false).unwrap();
+        net.pump(&mut nodes);
+        assert!(nodes[1].take_inbox().is_empty(), "no prekey for Bob → message defers, not sent");
+
+        // Bob messages Alice first; his SessionInit establishes a session on Alice's side.
+        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"hi".to_vec(), false).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[0].take_inbox() {
+            let _ = nodes[0].read_message(&b); // establishing the session here must flush the deferral
+        }
+        net.pump(&mut nodes); // shuttle the now-flushed deferred message — NO tick() anywhere
+
+        let mut bob_got: Vec<Vec<u8>> = Vec::new();
+        for b in nodes[1].take_inbox() {
+            if let Ok(Some(m)) = nodes[1].read_message(&b) {
+                bob_got.push(m.body);
+            }
+        }
+        assert!(
+            bob_got.contains(&b"deferred".to_vec()),
+            "deferred message flushed + arrived once the inbound session formed (no tick)"
+        );
+    }
+
+    #[test]
+    fn out_of_order_session_messages_decrypt_at_the_node_layer() {
+        // Over a multi-copy DTN, two SessionMessages can be reassembled/processed out of
+        // order. read_message must recover the earlier one from the ratchet's skipped-key
+        // store — not just at the Session unit level, but through the node accessor (§25).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].publish_prekey().unwrap();
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+        // Establish both directions.
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[1].take_inbox() {
+            nodes[1].read_message(&b).unwrap();
+        }
+        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[0].take_inbox() {
+            nodes[0].read_message(&b).unwrap();
+        }
+
+        // Two messages from 0; deliver, then process them in reverse order.
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"first".to_vec(), true).unwrap();
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"second".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        let mut inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 2, "both arrived");
+        inbox.reverse(); // process out of order
+
+        let mut bodies: Vec<Vec<u8>> = Vec::new();
+        for b in &inbox {
+            bodies.push(nodes[1].read_message(b).unwrap().expect("decrypts out of order").body);
+        }
+        assert!(bodies.contains(&b"first".to_vec()), "earlier message recovered from skipped keys");
+        assert!(bodies.contains(&b"second".to_vec()));
+    }
+
+    #[test]
+    fn partial_carrier_stream_resumes_after_restart() {
+        // The image-in-background bug: a receiver gets some chunks, ACKs them (relay drops
+        // its copies), then iOS suspends/relaunches the app — wiping in-memory reassembly.
+        // Persisted chunks let it resume on the next wake instead of stalling forever (§20).
+        let secret = Identity::generate().to_secret_bytes();
+        let from = Identity::generate().address();
+        let sid = [7u8; 16];
+        let chunks: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 100]).collect();
+        let full: Vec<u8> = chunks.iter().flatten().copied().collect();
+
+        let mut r = Node::from_identity_secret(&secret);
+        // First three chunks arrive in one wake (not the final one).
+        for (i, c) in chunks.iter().take(3).enumerate() {
+            assert!(r.accept_stream_chunk(from, sid, i as u64, c.clone(), false).is_none());
+        }
+
+        // Beacon-mode kill + relaunch: rebuild from the persisted store. In-memory reassembly
+        // is gone, but rehydrate re-feeds the persisted chunks.
+        let store = r.clone_store();
+        let mut r = Node::with_store(Identity::from_secret_bytes(&secret), store);
+
+        // Remaining chunks arrive on a later wake; the final one completes the message.
+        assert!(r.accept_stream_chunk(from, sid, 3, chunks[3].clone(), false).is_none());
+        let done = r.accept_stream_chunk(from, sid, 4, chunks[4].clone(), true);
+        assert_eq!(done.as_deref(), Some(full.as_slice()), "resumed and completed across restart");
+
+        // Completion clears the persisted chunks.
+        assert!(r.clone_store().list_kv("strm/").is_empty(), "persisted chunks cleared");
+    }
+
+    #[test]
+    fn session_survives_a_restart_via_persisted_store() {
+        // The beacon-mode / reinstall bug: a backgrounded app is killed mid-conversation,
+        // losing its in-memory ratchet while the peer keeps theirs → every later message
+        // fails to decrypt. With the session persisted to the store, a restart rehydrates it
+        // and decryption resumes (DESIGN.md §25).
+        let id1_secret = Identity::generate().to_secret_bytes();
+        let mut nodes =
+            [Node::new(Identity::generate()), Node::from_identity_secret(&id1_secret)];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        nodes[0].publish_prekey().unwrap();
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[1].take_inbox() {
+            nodes[1].read_message(&b).unwrap();
+        }
+        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[0].take_inbox() {
+            nodes[0].read_message(&b).unwrap();
+        }
+        assert!(nodes[1].has_session(&nodes[0].address()), "n1 has a session before restart");
+
+        // Beacon-mode kill + relaunch of n1: rebuild it from its persisted store.
+        let store = nodes[1].clone_store();
+        nodes[1] = Node::with_store(Identity::from_secret_bytes(&id1_secret), store);
+        assert!(
+            nodes[1].has_session(&nodes[0].address()),
+            "session restored from the persisted store"
+        );
+
+        // The relaunch re-establishes the bearer on a fresh link; n0 drops the stale one.
+        nodes[0].handle(BearerEvent::Disconnected(1));
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 2, 1, 2);
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "image/jpeg".into(), b"after restart".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 1, "message after restart delivered");
+        let m =
+            nodes[1].read_message(&inbox[0]).unwrap().expect("decrypts with the restored ratchet");
+        assert_eq!(m.body, b"after restart");
+    }
+
+    #[test]
+    fn large_message_over_established_session_arrives() {
+        // The on-device scenario: a large image sent over an established forward-secret
+        // session (the 🔒). session_payload ratchet-encrypts the whole body into ONE
+        // SessionMessage, which deliver() then carrier-chunks. Reassembly + ratchet-decrypt
+        // must yield the exact bytes. (Earlier large-message tests had no session → static
+        // seal, so they never exercised the ratchet + carrier interaction.)
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        // Both publish prekeys and gossip them so either side can open a session.
+        nodes[0].publish_prekey().unwrap();
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        // Establish the session both ways, reading each received bundle exactly as the app
+        // does (take_inbox → read_message), so the ratchet actually advances on both sides.
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[1].take_inbox() {
+            nodes[1].read_message(&b).unwrap();
+        }
+        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[0].take_inbox() {
+            nodes[0].read_message(&b).unwrap();
+        }
+        assert!(nodes[0].has_session(&nodes[1].address()), "session established");
+
+        // Now the large image over the established session.
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "image/jpeg".into(), body.clone(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 1, "large image over a session reassembled");
+        let m = nodes[1].read_message(&inbox[0]).unwrap().expect("a user message");
+        assert_eq!(m.content_type, "image/jpeg");
+        assert_eq!(m.body, body, "ratchet-decrypted bytes match exactly");
+    }
+
+    #[test]
+    fn relay_keeps_request_ack_bundle_until_acked() {
+        // A relay must keep custody of a request_ack bundle until the delivery ACK confirms
+        // receipt — not release it on the optimistic handoff. Otherwise a chunk the
+        // destination misses in a brief background window is lost and dedup blocks
+        // re-injection, so a large transfer can never complete (DESIGN.md §6, §20).
+        let mut relay = Node::new(Identity::generate());
+        relay.set_kind(NodeKind::Relay);
+        let alice = Identity::generate();
+        let bob = Node::new(Identity::generate());
+
+        let b = Bundle::create(
+            &alice,
+            Destination::Device(bob.address()),
+            &bob.address(),
+            &Payload::PeerMessage { content_type: "t".into(), body: b"hi".to_vec() },
+            BundleOpts {
+                flags: BundleFlags { request_ack: true, ..Default::default() },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let id = b.id();
+        relay.ingest(b);
+        assert!(relay.store.contains(&id));
+
+        // Hand-drive the link so we can deliver to bob but DROP his ACK.
+        let mut relay = relay;
+        let mut bob = bob;
+        relay.handle(BearerEvent::Connected(1, Role::Initiator));
+        bob.handle(BearerEvent::Connected(2, Role::Responder));
+        let mut got = false;
+        for _ in 0..12 {
+            for (l, bytes) in relay.drain_outgoing() {
+                if l == 1 {
+                    bob.handle(BearerEvent::Data(2, bytes));
+                }
+            }
+            if !bob.take_inbox().is_empty() {
+                got = true;
+                break; // bob has the message; its pending outgoing is the ACK — withhold it
+            }
+            for (l, bytes) in bob.drain_outgoing() {
+                if l == 2 {
+                    relay.handle(BearerEvent::Data(1, bytes));
+                }
+            }
+        }
+        assert!(got, "bob received the message");
+        assert!(relay.store.contains(&id), "relay keeps custody — ACK not yet seen");
+
+        // Deliver bob's withheld ACK; the vaccine now releases the relay's copy.
+        for (l, bytes) in bob.drain_outgoing() {
+            if l == 2 {
+                relay.handle(BearerEvent::Data(1, bytes));
+            }
+        }
+        assert!(!relay.store.contains(&id), "ACK vaccine releases custody");
+    }
+
+    #[test]
+    fn large_message_arrives_through_a_relay() {
+        // The real image scenario: sender and recipient never meet directly — a relay in
+        // the middle carries the carrier-chunk bundles and the recipient reassembles (§20).
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 sender
+            Node::new(Identity::generate()), // 1 relay
+            Node::new(Identity::generate()), // 2 recipient
+        ];
+        nodes[1].set_kind(NodeKind::Relay);
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1); // sender <-> relay
+        net.connect(&mut nodes, 1, 2, 2, 2); // relay  <-> recipient
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect(); // ~300KB
+        let dst = nodes[2].address();
+        let orig = nodes[0].send_message_traced(dst, "image/jpeg".into(), body.clone(), true).unwrap();
+        net.pump(&mut nodes);
+
+        // The chunked message reports real relay progress + delivery under its original id
+        // (carriers travel as separate bundles but attribute back — not a stuck "Sending").
+        let (relayed, delivered, _, _) = nodes[0].message_status(&orig).expect("tracked");
+        assert!(relayed >= 1, "shows Sent N (carriers relayed to the relay), not 0");
+        assert!(delivered, "delivery ACK for the reassembled original marks it Delivered");
+
+        let inbox = nodes[2].take_inbox();
+        assert_eq!(inbox.len(), 1, "reassembled into exactly one message through the relay");
+        let m = nodes[2].read_message(&inbox[0]).unwrap().expect("a user message");
+        assert_eq!(m.content_type, "image/jpeg");
+        assert_eq!(m.body, body, "bytes reassembled exactly, in order");
+    }
+
+    // --- §39 untraceable (private) messaging ----------------------------------
+
+    #[test]
+    fn private_message_floods_anonymously_and_only_the_recipient_recognizes_it() {
+        // §39: Alice → Bob with nobody in between able to see who it's for. A relay (Carol)
+        // carries it but can't tell it's Bob's; Bob recognizes it ("is this mine?") and reads
+        // the true sender from inside the seal even though the envelope names no one.
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 Alice (sender)
+            Node::new(Identity::generate()), // 1 Carol (relay, not the recipient)
+            Node::new(Identity::generate()), // 2 Bob   (recipient)
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1); // Alice <-> Carol
+        net.connect(&mut nodes, 1, 2, 2, 2); // Carol <-> Bob
+        exchange_prekeys(&mut net, &mut nodes); // content is forward-secret — need prekeys (§25)
+
+        let alice = nodes[0].address();
+        let bob = nodes[2].address();
+        nodes[0]
+            .send_message(bob, "text/plain".into(), b"meet at dawn".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        // The relay never recognized it as anyone's — it just floods past.
+        assert!(nodes[1].take_inbox().is_empty(), "the relay can't tell the message is Bob's");
+
+        // Bob recognized + holds exactly one; on the wire it named no src and flooded.
+        let inbox = nodes[2].take_inbox();
+        assert_eq!(inbox.len(), 1, "only the intended recipient recognizes the private bundle");
+        assert!(inbox[0].is_private());
+        assert_eq!(inbox[0].inner.src, [0u8; 32], "no cleartext sender on the wire");
+        assert!(matches!(inbox[0].inner.dst, Destination::Broadcast), "floods — no cleartext dst");
+
+        // ...and Bob reads the *real* sender (from inside the seal) plus the content.
+        let m = nodes[2].read_message(&inbox[0]).unwrap().expect("a user message");
+        assert_eq!(m.from, alice, "sender recovered from the seal, not the (zeroed) envelope");
+        assert_eq!(m.content_type, "text/plain");
+        assert_eq!(m.body, b"meet at dawn");
+    }
+
+    #[test]
+    fn private_conversation_round_trips_both_ways() {
+        // A full private exchange: Alice → Bob, then Bob → Alice — both untraceable and both
+        // forward-secret (the reply rides the session Bob established from Alice's first message).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut nodes);
+        let alice = nodes[0].address();
+        let bob = nodes[1].address();
+
+        nodes[0].send_message(bob, "t".into(), b"hi bob".to_vec(), false).unwrap();
+        net.pump(&mut nodes);
+        let inb = nodes[1].take_inbox();
+        let m = nodes[1].read_message(&inb[0]).unwrap().expect("msg");
+        assert_eq!((m.from, m.body.as_slice()), (alice, b"hi bob".as_slice()));
+        assert!(nodes[1].has_session(&alice), "Bob established a session from the private SessionInit");
+
+        nodes[1].send_message(alice, "t".into(), b"hi alice".to_vec(), false).unwrap();
+        net.pump(&mut nodes);
+        let inb = nodes[0].take_inbox();
+        let m = nodes[0].read_message(&inb[0]).unwrap().expect("reply");
+        assert_eq!((m.from, m.body.as_slice()), (bob, b"hi alice".as_slice()));
+    }
+
+    #[test]
+    fn private_send_defers_until_prekey_then_floods() {
+        // require-ratchet (§25) holds for private sends too: with no prekey for Bob yet, the
+        // message is queued ("Sending…"), never static-sealed — then flushes the moment Bob's
+        // prekey advert arrives, and reaches him untraceably.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].publish_prekey().unwrap(); // Alice's prekey out; Bob's NOT yet
+        net.pump(&mut nodes);
+
+        let bob = nodes[1].address();
+        nodes[0].send_message(bob, "t".into(), b"later".to_vec(), false).unwrap();
+        net.pump(&mut nodes);
+        assert!(nodes[1].take_inbox().is_empty(), "no prekey for Bob → deferred, not sent");
+
+        nodes[1].publish_prekey().unwrap(); // Bob's prekey arrives → Alice can ratchet + tag
+        net.pump(&mut nodes);
+        let inb = nodes[1].take_inbox();
+        assert_eq!(inb.len(), 1, "deferred private message flushed once the prekey was known");
+        let m = nodes[1].read_message(&inb[0]).unwrap().expect("msg");
+        assert_eq!(m.body, b"later");
+        assert_eq!(m.from, nodes[0].address());
+    }
+
+    #[test]
+    fn private_message_delivery_is_confirmed_by_a_private_ack() {
+        // request_ack on the default (private) path: the recipient recognizes the message and
+        // seals an Ack back to the sender it learned from inside the seal. The ack floods, the
+        // sender recognizes it, and the message flips to Delivered — all without either end
+        // ever appearing in cleartext on the wire.
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 Alice
+            Node::new(Identity::generate()), // 1 Carol (relay)
+            Node::new(Identity::generate()), // 2 Bob
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        net.connect(&mut nodes, 1, 2, 2, 2);
+        exchange_prekeys(&mut net, &mut nodes);
+
+        let bob = nodes[2].address();
+        let id = nodes[0].send_message(bob, "t".into(), b"ack me".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+
+        assert_eq!(nodes[2].take_inbox().len(), 1, "Bob received the private message");
+        let (_, delivered, _, _) = nodes[0].message_status(&id).expect("tracked");
+        assert!(delivered, "the private ACK flipped Alice's message to Delivered");
+        // The relay is an endpoint for neither leg — both were anonymous broadcasts.
+        assert!(nodes[1].take_inbox().is_empty(), "the relay is not an endpoint for either leg");
+    }
+
+    #[test]
+    fn ack_reports_forward_path_latency_not_round_trip() {
+        // "Delivered" should tell the sender how long A→B took (the forward leg the recipient
+        // observed), not the A→B→A round trip. The recipient stamps `received − created_at`
+        // into the ACK; the sender surfaces it via message_status's 4th field.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut nodes);
+
+        // Sender sends at t=1000; recipient's clock is 1500ms ahead → it observes a 1500ms
+        // forward leg. (set_time sets the clock directly; pump shuttles bytes without ticking.)
+        nodes[0].set_time(1_000);
+        nodes[1].set_time(2_500);
+        let bob = nodes[1].address();
+        let id = nodes[0].send_message(bob, "t".into(), b"time me".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+
+        let (_, delivered, _, fwd_ms) = nodes[0].message_status(&id).expect("tracked");
+        assert!(delivered);
+        assert_eq!(fwd_ms, 1_500, "ACK carries the A→B forward latency the recipient saw");
+    }
+
+    // --- §39 P4 gradient routing -----------------------------------------------
+
+    /// 4-node A—R—B with a decoy D also hanging off R (the relay/bridge has 3 links). Models the
+    /// live bug: a remote sender A reaches a recipient B only through a relay R, with other clients
+    /// (D) also on R.
+    fn gradient_topology() -> ([Node; 4], Wire2) {
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 A (sender)
+            Node::new(Identity::generate()), // 1 R (relay / bridge)
+            Node::new(Identity::generate()), // 2 B (recipient, no direct link to A)
+            Node::new(Identity::generate()), // 3 D (decoy also on R)
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1); // A <-> R   (R link 1)
+        net.connect(&mut nodes, 1, 2, 2, 2); // R <-> B   (R link 2)
+        net.connect(&mut nodes, 1, 3, 3, 3); // R <-> D   (R link 3)
+        exchange_prekeys(&mut net, &mut nodes); // A learns B's prekey (to seal + tag the bundle)
+        (nodes, net)
+    }
+
+    #[test]
+    fn private_bundle_routes_down_the_gradient_not_flooded_to_decoys() {
+        // The fix for the relay-bridged regression: B advertises a receiver-beacon → R lays a
+        // gradient toward B; A's private message then routes DOWN it (R→B only), reaching B
+        // WITHOUT being flooded to the decoy D — directed delivery, not blind flood.
+        let (mut nodes, mut net) = gradient_topology();
+
+        nodes[2].publish_recv_beacon().unwrap(); // B in "route-to-me" mode
+        net.pump(&mut nodes);
+
+        // R laid a gradient toward B's mailbox, pointing at the R—B link (R's link 2).
+        let bmail = crypto::mailbox_tag(&nodes[2].prekey.public);
+        let g = nodes[1].recv_gradient.get(&bmail).expect("R holds a gradient toward B");
+        assert_eq!(g.inbound, 2, "gradient points down the R—B link, not R—A/R—D");
+
+        let bob = nodes[2].address();
+        let id = nodes[0].send_message(bob, "t".into(), b"routed".to_vec(), false).unwrap();
+        net.pump(&mut nodes);
+
+        assert_eq!(nodes[2].take_inbox().len(), 1, "B received it via the gradient (through R)");
+        assert!(!nodes[3].store.contains(&id), "decoy D never got a copy — directed, not flooded");
+    }
+
+    #[test]
+    fn private_bundle_floods_as_fallback_without_a_gradient() {
+        // No beacon ⇒ no gradient ⇒ R falls back to the epidemic flood, so the decoy D DOES
+        // receive (+ stores) a copy it can't open. This is the contrast that proves the gradient
+        // is what makes routing directed — and that delivery still works on the cold-start floor.
+        let (mut nodes, mut net) = gradient_topology();
+
+        let bmail = crypto::mailbox_tag(&nodes[2].prekey.public);
+        assert!(!nodes[1].recv_gradient.contains_key(&bmail), "no beacon → no gradient at R");
+
+        let bob = nodes[2].address();
+        let id = nodes[0].send_message(bob, "t".into(), b"flooded".to_vec(), false).unwrap();
+        net.pump(&mut nodes);
+
+        assert_eq!(nodes[2].take_inbox().len(), 1, "B still gets it on the flood fallback");
+        assert!(nodes[3].store.contains(&id), "decoy D got a copy — flooded (no gradient to steer it)");
+    }
+
+    #[test]
+    fn gradient_expires_and_falls_back_to_flood_no_black_hole() {
+        // Soft state: once B stops beaconing, its gradient entry expires (no permanent black-hole).
+        // A subsequent private send then falls back to flood rather than dead-ending on a stale path.
+        let (mut nodes, mut net) = gradient_topology();
+        nodes[2].publish_recv_beacon().unwrap();
+        net.pump(&mut nodes);
+        let bmail = crypto::mailbox_tag(&nodes[2].prekey.public);
+        assert!(nodes[1].recv_gradient.contains_key(&bmail), "gradient laid");
+
+        // Advance every node past the beacon TTL with no refresh; tick prunes the dead entry.
+        let t = (RECV_BEACON_TTL_MS as u64) + 1;
+        for n in nodes.iter_mut() {
+            n.tick(t);
+        }
+        assert!(!nodes[1].recv_gradient.contains_key(&bmail), "stale gradient pruned at R");
+
+        // Delivery still works (via flood), and the decoy now sees it again (no gradient to steer).
+        let bob = nodes[2].address();
+        let id = nodes[0].send_message(bob, "t".into(), b"after expiry".to_vec(), false).unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[2].take_inbox().len(), 1, "B still reachable after the gradient expired");
+        assert!(nodes[3].store.contains(&id), "fell back to flood (decoy got a copy)");
+    }
+
+    #[test]
+    fn spool_then_want_beacon_reloads() {
+        // §39 P5: a private bundle reaching a relay with NO live gradient toward its recipient is
+        // SPOOLABLE (durably held by mailbox-tag) and NOT on the device-handoff path. When the
+        // recipient later beacons, the relay lays a gradient AND surfaces the mailbox as "wanted"
+        // (the want-beacon → the host reloads the durable spool), and the bundle is no longer
+        // spoolable — P4 now owns it (spool XOR live-route, no double-send).
+        let bob = Identity::generate();
+        let bob_mailbox = crypto::mailbox_tag(&bob.derive_prekey().public);
+
+        // A private bundle sealed to bob + stamped with bob's mailbox-tag (as dispatch_private does).
+        let pb = Bundle::create_private(
+            &bob.address(),
+            &bob.derive_prekey().public,
+            &Payload::PeerMessage { content_type: "t".into(), body: b"offline".to_vec() },
+            Some(bob_mailbox),
+            None,
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let pid = pb.id();
+
+        let mut relay = Node::new(Identity::generate());
+        relay.ingest(pb);
+
+        // No recipient, no beacon → spoolable by mailbox-tag; and NOT on the device handoff path.
+        let s = relay.spoolable_private_bundles();
+        assert_eq!(s.len(), 1, "private bundle with no live gradient is spoolable");
+        assert_eq!((s[0].0, s[0].1), (pid, bob_mailbox), "keyed by bob's mailbox-tag");
+        assert!(relay.undeliverable_device_bundles().is_empty(), "a Broadcast private bundle never rides the device handoff");
+
+        // Bob comes online behind the relay and beacons (the want-beacon).
+        let mut nodes = [relay, Node::from_identity_secret(&bob.to_secret_bytes())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1); // relay <-> bob
+        nodes[1].publish_recv_beacon().unwrap();
+        net.pump(&mut nodes);
+
+        // The relay laid a gradient toward bob AND surfaced his mailbox as a want-beacon (pull trigger).
+        assert!(nodes[0].recv_gradient.contains_key(&bob_mailbox), "gradient laid from the beacon");
+        assert!(nodes[0].take_wanted_mailboxes().contains(&bob_mailbox), "beacon surfaced the wanted mailbox");
+        assert!(nodes[0].take_wanted_mailboxes().is_empty(), "wanted drains once");
+        // Live gradient now → the bundle is no longer spooled (P4 owns it).
+        assert!(nodes[0].spoolable_private_bundles().is_empty(), "live gradient → not spooled (spool XOR route)");
+    }
+
+    #[test]
+    fn large_message_auto_streams_and_arrives_whole() {
+        // A big message (e.g. an image body) exceeds one bundle, so it's transparently
+        // carried as a stream of chunks and reassembled — arriving as a normal inbox
+        // message with the right content type and exact bytes (DESIGN.md §20).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect(); // ~200KB → multi-chunk
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "image/jpeg".into(), body.clone(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 1, "reassembled into exactly one message");
+        let m = nodes[1].read_message(&inbox[0]).unwrap().expect("a user message");
+        assert_eq!(m.content_type, "image/jpeg");
+        assert_eq!(m.body, body, "bytes reassembled exactly, in order");
+    }
+
+    #[test]
+    fn hops_request_response_round_trips() {
+        // A hops:// request sealed to an endpoint surfaces there as an HTTP request; the
+        // endpoint replies and the client gets the response, correlated by request id (§30).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        let endpoint = nodes[1].address();
+
+        let req = nodes[0]
+            .send_hops_request(
+                endpoint,
+                "example.hopme.sh".into(),
+                "GET".into(),
+                "/hello".into(),
+                vec![],
+                vec![],
+                64_000,
+            )
+            .unwrap();
+        net.pump(&mut nodes);
+
+        // Endpoint side: the request is surfaced for the operator's translator.
+        let reqs = nodes[1].take_http_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].host, "example.hopme.sh");
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].url, "/hello");
+        let (from, rid) = (reqs[0].from, reqs[0].id);
+        nodes[1].send_http_response(from, rid, 200, vec![], b"world".to_vec()).unwrap();
+        net.pump(&mut nodes);
+
+        // Client side: the response arrives, correlated to the request.
+        let resps = nodes[0].take_http_responses();
+        assert_eq!(resps.len(), 1);
+        assert_eq!(resps[0].for_id, req);
+        assert_eq!(resps[0].status, 200);
+        assert_eq!(resps[0].body, b"world");
+        assert!(!nodes[0].store.contains(&req), "request purged once answered");
+    }
+
+    #[test]
+    fn internet_peer_resolves_hns_locally_no_relay() {
+        // An internet-connected node resolves HNS itself: resolve_hns surfaces a real-DNS
+        // lookup for the host to perform; provide_dns_answer caches it and yields the result.
+        // No bundle, no relay round-trip (DESIGN.md §30).
+        let mut node = Node::new(Identity::generate());
+        node.set_internet(true);
+
+        assert_eq!(node.resolve_hns("Example.HopMe.sh."), HnsLookup::Pending);
+        let lookups = node.take_dns_lookups();
+        assert_eq!(lookups, vec!["example.hopme.sh".to_string()], "normalized + queued for host");
+
+        let endpoint = Identity::generate().address();
+        node.provide_dns_answer("example.hopme.sh", Some(endpoint), 300);
+
+        let results = node.take_hns_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].domain, "example.hopme.sh");
+        assert_eq!(results[0].address, Some(endpoint));
+
+        // Now cached: a second resolve serves from cache with no new lookup.
+        assert_eq!(node.resolve_hns("example.hopme.sh"), HnsLookup::Cached(Some(endpoint)));
+        assert!(node.take_dns_lookups().is_empty());
+    }
+
+    #[test]
+    fn hns_missing_record_is_a_negative_result() {
+        // hops://thisdoesnotexist.com — no _hopaddress TXT. The host reports None; we cache
+        // the negative and surface a resolution error (address None), so we don't hammer DNS.
+        let mut node = Node::new(Identity::generate());
+        node.set_internet(true);
+        assert_eq!(node.resolve_hns("thisdoesnotexist.com"), HnsLookup::Pending);
+        node.provide_dns_answer("thisdoesnotexist.com", None, 60);
+
+        let results = node.take_hns_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].address, None, "no endpoint → resolution error");
+        assert_eq!(node.resolve_hns("thisdoesnotexist.com"), HnsLookup::Cached(None));
+    }
+
+    #[test]
+    fn offline_node_queries_through_connected_peer() {
+        // A node with no internet, connected only to a peer that DOES have internet, resolves
+        // by broadcasting the query to its peers — no relay needed. Here we verify the query
+        // reaches the internet peer and is surfaced for a DNS lookup; the peer then answers with
+        // a DNSSEC proof the asker re-validates (that round-trip needs real DNSSEC data, so it's
+        // covered by the dnssec module tests + live verification, not here).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[1].set_internet(true); // the nearby peer has internet
+
+        // resolve_hns auto-broadcasts to connected peers (Pending, not NeedsResolver).
+        assert_eq!(nodes[0].resolve_hns("example.hopme.sh"), HnsLookup::Pending);
+        net.pump(&mut nodes);
+
+        // The internet peer received the query and surfaced the domain for a chain fetch.
+        let lookups = nodes[1].take_dns_lookups();
+        assert_eq!(lookups, vec!["example.hopme.sh".to_string()]);
+    }
+
+    #[test]
+    fn isolated_node_keeps_resolution_pending_then_resolves_on_internet() {
+        // Resolution is delay-tolerant: with no internet and no peers, the request doesn't
+        // fail — it stays pending and completes once we gain internet (§30).
+        let mut node = Node::new(Identity::generate());
+        assert_eq!(node.resolve_hns("example.hopme.sh"), HnsLookup::Pending);
+        assert!(node.take_dns_lookups().is_empty(), "nothing to look up while offline");
+
+        // Gain internet → the pending domain is queued for our own DNS lookup.
+        node.set_internet(true);
+        assert_eq!(node.take_dns_lookups(), vec!["example.hopme.sh".to_string()]);
+        let endpoint = Identity::generate().address();
+        node.provide_dns_answer("example.hopme.sh", Some(endpoint), 300);
+        assert_eq!(node.cached_hns("example.hopme.sh"), Some(Some(endpoint)));
+    }
+
+    #[test]
+    fn duplicate_to_destination_re_acks_then_throttles() {
+        // If our delivery-ACK is lost, the sender retransmits; a duplicate reaching the
+        // destination must re-emit the ACK (so the sender can stop) — but throttled, so a
+        // burst of duplicates can't cause an ACK storm (DESIGN.md §7).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        let id = nodes[0]
+            .send_to(&nodes[1].address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap()
+            .unwrap();
+        let msg = nodes[0].store.get(&id).expect("our message is in the store");
+        net.pump(&mut nodes);
+        assert!(nodes[1].take_inbox().len() == 1, "delivered once");
+
+        // A duplicate arrives after the throttle window → re-ACK (something to send).
+        nodes[1].set_time(REACK_MIN_INTERVAL_MS + 1);
+        let _ = nodes[1].drain_outgoing();
+        nodes[1].ingest(msg.clone());
+        assert!(!nodes[1].drain_outgoing().is_empty(), "re-acked the duplicate");
+        assert!(nodes[1].take_inbox().is_empty(), "but did NOT re-deliver to the inbox");
+
+        // Another duplicate immediately → within throttle → no new ACK.
+        nodes[1].ingest(msg);
+        assert!(nodes[1].drain_outgoing().is_empty(), "throttled: no ACK storm");
+    }
+
+    #[test]
+    fn eviction_prefers_already_relayed_over_not_yet_relayed() {
+        // Custody policy (§6): under cap pressure, a bundle we've already relayed (and held
+        // past the grace window) is evicted before one we haven't relayed yet — so a flood
+        // of big transfers can't push out legitimate, not-yet-forwarded messages.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].set_time(0);
+        nodes[0].set_max_relayed(1);
+
+        let third = Identity::generate().address();
+        let mk = |b: &[u8]| {
+            Bundle::create(
+                &Identity::generate(),
+                Destination::Device(third),
+                &third,
+                &Payload::PeerMessage { content_type: "t".into(), body: b.to_vec() },
+                BundleOpts::default(),
+            )
+            .unwrap()
+        };
+
+        // A: relayed onward to node1, so it's "already relayed".
+        let a = mk(b"a");
+        let a_id = a.id();
+        nodes[0].ingest(a);
+        net.pump(&mut nodes);
+        // Lose the peer so the next bundle has nowhere to go (stays not-yet-relayed), and
+        // age A past the grace window.
+        nodes[0].handle(BearerEvent::Disconnected(1));
+        nodes[0].set_time(EVICT_GRACE_MS);
+
+        // B: cannot be forwarded (no peer) → not-yet-relayed. Ingesting it trips the cap.
+        let b = mk(b"b");
+        let b_id = b.id();
+        nodes[0].ingest(b);
+
+        assert!(!nodes[0].store.contains(&a_id), "already-relayed, past-grace bundle is evicted");
+        assert!(nodes[0].store.contains(&b_id), "not-yet-relayed bundle is kept");
+    }
+
+    #[test]
+    fn handshake_then_direct_delivery() {
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        let b = msg(&nodes[0], &nodes[1], b"hello neighbor");
+        nodes[0].submit(b);
+        net.pump(&mut nodes);
+
+        let inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 1);
+        match inbox[0].open(&nodes[1].identity).unwrap() {
+            Payload::PeerMessage { body, .. } => assert_eq!(body, b"hello neighbor"),
+            _ => panic!("wrong payload"),
+        }
+    }
+
+    #[test]
+    fn duplicate_links_to_same_peer_dont_loop() {
+        // Field bug (resource exhaustion): an iOS rotating-MAC dialer can open MORE THAN ONE
+        // L2CAP channel to the same Android peer, so the node ends up with two Up links to the
+        // SAME peer. If it doesn't dedup them, traffic can loop between the two links and exhaust
+        // the (few-KB/s) BLE pipe — which is exactly the megabyte flood seen on-device. This test
+        // reproduces it deterministically: connect two nodes with TWO link pairs, then verify the
+        // network reaches quiescence with BOUNDED traffic (no loop) and the peer is identified once.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1); // link pair #1: node0 link1 <-> node1 link1
+        net.connect(&mut nodes, 0, 2, 1, 2); // link pair #2: node0 link2 <-> node1 link2 (SAME peer)
+
+        // Drive a message and pump with a byte/round budget. A loop manifests as either hitting
+        // the round cap (never quiescent) or an explosive byte count.
+        let b = msg(&nodes[0], &nodes[1], b"hi");
+        nodes[0].submit(b);
+
+        let mut total_bytes = 0usize;
+        let mut rounds = 0usize;
+        let quiesced = loop {
+            if rounds >= 5000 {
+                break false;
+            }
+            rounds += 1;
+            let mut any = false;
+            for i in 0..nodes.len() {
+                let other = 1 - i;
+                for (link, bytes) in nodes[i].drain_outgoing() {
+                    any = true;
+                    total_bytes += bytes.len();
+                    // links are symmetric here (1<->1, 2<->2)
+                    nodes[other].handle(BearerEvent::Data(link, bytes));
+                }
+            }
+            if !any {
+                break true;
+            }
+        };
+
+        assert!(quiesced, "node never reached quiescence — TRAFFIC LOOP (rounds={rounds}, bytes={total_bytes})");
+        assert!(
+            total_bytes < 50_000,
+            "two-link handshake + one tiny message moved {total_bytes} bytes — amplification loop"
+        );
+        // The message must actually be delivered exactly once (not lost in the loop, not duplicated).
+        assert_eq!(nodes[1].take_inbox().len(), 1, "message should deliver exactly once over duplicate links");
+    }
+
+    #[test]
+    fn idle_established_link_does_not_flood() {
+        // Field bug (resource exhaustion): on-device an idle, established BLE link sends ~10+ KB/s
+        // continuously on near-empty stores (tx ~3-4x rx), saturating the few-KB/s pipe so real
+        // messages crawl through over minutes/hours. This reproduces steady-state operation: two
+        // connected nodes, prekeys exchanged, then many "ticks" with the periodic presence/prekey
+        // re-publish the bearer does — and asserts an idle link moves only a TRICKLE, not a flood.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut nodes);
+
+        let mut now = 10_000u64;
+        let tick_pump = |nodes: &mut [Node], now: u64, bytes: &mut usize| {
+            for n in nodes.iter_mut() {
+                n.tick(now);
+            }
+            for _ in 0..2000 {
+                let mut any = false;
+                for i in 0..nodes.len() {
+                    let other = 1 - i;
+                    for (link, b) in nodes[i].drain_outgoing() {
+                        any = true;
+                        *bytes += b.len();
+                        nodes[other].handle(BearerEvent::Data(link, b));
+                    }
+                }
+                if !any {
+                    break;
+                }
+            }
+        };
+
+        // Warm up 60 "seconds" (let any initial gossip settle), re-publishing presence every 20s
+        // and prekeys every 120s exactly like the Android/iOS bearer tick.
+        let mut scratch = 0usize;
+        for s in 0..60u64 {
+            now += 1000;
+            if s % 20 == 0 {
+                for n in nodes.iter_mut() {
+                    let _ = n.publish_service("presence".into(), "x".into(), String::new(), vec![], 120_000);
+                }
+            }
+            if s % 120 == 0 {
+                for n in nodes.iter_mut() {
+                    let _ = n.publish_prekey();
+                }
+            }
+            tick_pump(&mut nodes, now, &mut scratch);
+        }
+
+        // Now MEASURE steady-state for 30 idle seconds.
+        let mut bytes = 0usize;
+        for s in 0..30u64 {
+            now += 1000;
+            if s % 20 == 0 {
+                for n in nodes.iter_mut() {
+                    let _ = n.publish_service("presence".into(), "x".into(), String::new(), vec![], 120_000);
+                }
+            }
+            tick_pump(&mut nodes, now, &mut bytes);
+        }
+
+        // 30 idle seconds on an established link should move only a handful of presence adverts —
+        // KB, not the tens-to-hundreds of KB the device shows. A flood means a gossip re-send loop.
+        assert!(bytes < 20_000, "idle link flooded {bytes} bytes in 30s — steady-state gossip loop");
+    }
+
+    #[test]
+    fn regossip_does_not_reflood_the_directory() {
+        // Field bug (resource exhaustion at scale): the 12s re-gossip cleared sent_adverts on every
+        // link and re-sent the WHOLE directory — O(directory x links) every cycle. In a busy multi-
+        // peer mesh that floods the few-KB/s BLE pipe (tx >> rx, since the peer just dedups) and
+        // starves real messages — minutes-to-hours delivery. New adverts already propagate on their
+        // own (not in sent_adverts), and prekeys/presence are periodically RE-published, so the full
+        // re-flood is redundant. Assert the re-gossip moves only a trickle when nothing changed.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        // Populate node 0 with many adverts from distinct publishers (a busy mesh's directory).
+        for i in 0..40u32 {
+            let pubid = Identity::generate();
+            let a = Advert::publish(
+                &pubid,
+                AdvertKind::Service {
+                    service: "presence".into(),
+                    title: format!("n{i}"),
+                    summary: String::new(),
+                    tags: vec![],
+                },
+                1_000,
+                120_000,
+                1,
+            )
+            .unwrap();
+            nodes[0].publish(a);
+        }
+        net.pump(&mut nodes); // node 1 receives the 40 adverts once (initial sync)
+
+        // Run 5 re-gossip cycles with NO new adverts; measure bytes moved. An unchanged directory
+        // should move almost nothing — the bug re-floods all 40 adverts every 12s cycle.
+        let mut bytes = 0usize;
+        let mut now = 1_000u64;
+        for _ in 0..5 {
+            now += REGOSSIP_INTERVAL_MS + 1_000;
+            for n in nodes.iter_mut() {
+                n.tick(now);
+            }
+            for _ in 0..2000 {
+                let mut any = false;
+                for i in 0..nodes.len() {
+                    let other = 1 - i;
+                    for (link, b) in nodes[i].drain_outgoing() {
+                        any = true;
+                        bytes += b.len();
+                        nodes[other].handle(BearerEvent::Data(link, b));
+                    }
+                }
+                if !any {
+                    break;
+                }
+            }
+        }
+        assert!(bytes < 5_000, "re-gossip re-flooded the directory: {bytes} bytes over 5 idle cycles");
+    }
+
+    #[test]
+    fn reconnect_does_not_reflood_the_directory_3node() {
+        // Field bug (resource exhaustion): the per-link gossip dedup (sent_adverts/sent_bundles) lived
+        // on the `Established` instance and was wiped on every (re)establishment. BLE links flap, so
+        // each reconnect re-offered the WHOLE directory to the peer — the ~116 rec/s, byte-identical-
+        // across-links flood that saturated the pipe and starved real messages. The fix keys the dedup
+        // on the PEER (snapshot on Disconnect, restore on Up), so after the one-time initial sync a
+        // flapping link moves ~nothing.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        // Full triangle, distinct link ids per neighbour.
+        net.connect(&mut nodes, 0, 1, 1, 10);
+        net.connect(&mut nodes, 0, 2, 2, 20);
+        net.connect(&mut nodes, 1, 12, 2, 21);
+
+        // Each node's OWN securing adverts (prekey + presence) — these SHOULD re-offer on every flap.
+        for n in nodes.iter_mut() {
+            n.publish_prekey().unwrap();
+            let _ = n.publish_service("presence".into(), "x".into(), String::new(), vec![], 120_000);
+        }
+        // A LARGE FOREIGN directory (40 other devices' service adverts) — the bulk that must NOT be
+        // re-flooded on a flap. This is what made the field flood catastrophic.
+        for i in 0..40u32 {
+            let pubid = Identity::generate();
+            let a = Advert::publish(
+                &pubid,
+                AdvertKind::Service {
+                    service: "market".into(),
+                    title: format!("item{i}"),
+                    summary: String::new(),
+                    tags: vec![],
+                },
+                1_000,
+                120_000,
+                1,
+            )
+            .unwrap();
+            nodes[0].publish(a);
+        }
+        net.pump(&mut nodes);
+
+        let pairs: [((usize, LinkId), (usize, LinkId)); 3] =
+            [((0, 1), (1, 10)), ((0, 2), (2, 20)), ((1, 12), (2, 21))];
+
+        // Flap every link 10x (BLE drop/reconnect) with NO new adverts. Count only encrypted records
+        // (the flood); handshake packets legitimately re-cross on reconnect and are not the bug.
+        let mut data_bytes = 0usize;
+        for _ in 0..10 {
+            for &((a, la), (b, lb)) in pairs.iter() {
+                nodes[a].handle(BearerEvent::Disconnected(la));
+                nodes[b].handle(BearerEvent::Disconnected(lb));
+                nodes[a].handle(BearerEvent::Connected(la, Role::Initiator));
+                nodes[b].handle(BearerEvent::Connected(lb, Role::Responder));
+            }
+            for _ in 0..2000 {
+                let mut any = false;
+                for i in 0..nodes.len() {
+                    for (link, bts) in nodes[i].drain_outgoing() {
+                        any = true;
+                        if matches!(
+                            postcard::from_bytes::<LinkPacket>(&bts),
+                            Ok(LinkPacket::Data(_)) | Ok(LinkPacket::DataFrag { .. })
+                        ) {
+                            data_bytes += bts.len();
+                        }
+                        if let Some(&(j, jl)) = net.routes.get(&(i, link)) {
+                            nodes[j].handle(BearerEvent::Data(jl, bts));
+                        }
+                    }
+                }
+                if !any {
+                    break;
+                }
+            }
+        }
+        // Post-fix: each flap re-offers each node's ~2 OWN securing adverts (intended, so a state-lost
+        // peer re-secures) but NOT the 40-advert FOREIGN bulk. Pre-fix wiped the per-link dedup on every
+        // (re)establishment → re-flooded the whole directory (40 foreign × every flap → hundreds of KB).
+        assert!(
+            data_bytes < 100_000,
+            "reconnect re-flooded the foreign directory: {data_bytes} bytes over 10 flap cycles"
+        );
+    }
+
+    #[test]
+    fn prekey_published_after_connect_propagates_over_stable_link() {
+        // Removing the re-gossip re-flood must NOT regress prekey propagation: a prekey published
+        // AFTER the link is up must still reach the peer over the STABLE link (no reconnect), so a
+        // deferred forward-secret message flushes. This was the "move out of range and back to send"
+        // case — now served by immediate new-advert propagation, not a directory re-flood.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1); // connect with NO prekeys exchanged
+
+        // node 0 sends to node 1 but has no prekey yet → deferred ("Securing"), nothing delivered.
+        let _ = nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[1].take_inbox().len(), 0, "no prekey yet → nothing delivered");
+
+        // node 1 publishes its prekey AFTER connect — over the stable link it must reach node 0.
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        assert_eq!(
+            nodes[1].take_inbox().len(),
+            1,
+            "deferred message must flush once node 1's prekey propagates over the stable link"
+        );
+    }
+
+    #[test]
+    fn send_to_connected_peer_is_forward_secret() {
+        // Messaging a connected peer is always forward-secret (DESIGN.md §25): once prekeys
+        // are exchanged, send_to opens a ratchet session and the message decrypts via
+        // read_message — content is never static-sealed.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut nodes);
+
+        let peers = nodes[0].peers();
+        assert_eq!(peers, vec![nodes[1].address()]);
+
+        let sent = nodes[0]
+            .send_to(&nodes[1].address(), "text/plain".into(), b"hello peer".to_vec(), false)
+            .unwrap();
+        assert!(sent.is_some());
+        net.pump(&mut nodes);
+
+        let inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 1);
+        let m = nodes[1].read_message(&inbox[0]).unwrap().expect("a user message");
+        assert_eq!(m.body, b"hello peer");
+        assert!(nodes[1].has_session(&nodes[0].address()), "forward-secret session established");
+
+        // Sending to an unconnected address yields None, not an error.
+        assert!(nodes[0]
+            .send_to(&[9u8; 32], "t".into(), vec![], false)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn message_status_progresses_to_delivered() {
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+
+        let id = nodes[0]
+            .send_to(&nodes[1].address(), "text/plain".into(), b"yo".to_vec(), true)
+            .unwrap()
+            .unwrap();
+        // Direct delivery to the destination isn't a relay handoff, so the relay
+        // count stays 0 (it shows as Delivered once the ACK returns, not "Sent N").
+        assert_eq!(nodes[0].message_status(&id), Some((0, false, 0, 0)));
+
+        net.pump(&mut nodes);
+
+        let (relayed, delivered, hops, _) = nodes[0].message_status(&id).unwrap();
+        assert_eq!(relayed, 0, "direct delivery is not counted as a relay peer");
+        assert!(delivered, "ACK came back across the network → Delivered");
+        assert_eq!(hops, 1, "direct delivery → 1 forward hop");
+    }
+
+    #[test]
+    fn direct_destination_is_not_sprayed_to_a_present_relay() {
+        // 0 is directly linked to BOTH the destination (1) and a relay (2). Sending
+        // 0→1 must deliver directly and NOT strand a sprayed copy in 2's relay queue.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 2); // 0 <-> 1 (destination)
+        net.connect(&mut nodes, 0, 3, 2, 4); // 0 <-> 2 (relay)
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+
+        let id = nodes[0]
+            .send_message_traced(nodes[1].address(), "text/plain".into(), b"hi".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        // Destination got it; the relay holds nothing for it.
+        assert_eq!(nodes[1].take_inbox().len(), 1, "destination received directly");
+        assert!(
+            nodes[2].queue().is_empty(),
+            "relay should not be holding a needless sprayed copy"
+        );
+        let (relayed, delivered, hops, _) = nodes[0].message_status(&id).unwrap();
+        assert_eq!(relayed, 0, "no relay handoffs — delivered directly");
+        assert!(delivered);
+        assert_eq!(hops, 1);
+    }
+
+    #[test]
+    fn content_never_static_seals_defers_until_prekey() {
+        // The lock bug, fixed: device-to-device content is never static-sealed (DESIGN.md §25).
+        // Sending before we know the peer's prekey queues the content (no insecure send); once
+        // the prekey gossips in, it flushes forward-secret and a session forms (the 🔒).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        // No prekeys yet → the send is deferred: a handle comes back, but nothing is delivered
+        // and no static-sealed PeerMessage goes on the wire.
+        let id = nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"secret".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+        assert!(nodes[1].take_inbox().is_empty(), "no static-sealed content while deferred");
+        assert!(!nodes[1].has_session(&nodes[0].address()), "no session yet");
+
+        // Prekeys gossip in → the queued content flushes forward-secret and decrypts.
+        nodes[1].publish_prekey().unwrap();
+        nodes[0].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        let inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 1, "deferred content sends once a session can form");
+        assert!(
+            matches!(nodes[1].open(&inbox[0]).unwrap(), Payload::SessionInit { .. }),
+            "ratcheted, never a static PeerMessage"
+        );
+        let m = nodes[1].read_message(&inbox[0]).unwrap().expect("a user message");
+        assert_eq!(m.body, b"secret");
+        assert!(nodes[1].has_session(&nodes[0].address()), "🔒 session established");
+        // Delivery status follows the original handle through the deferral.
+        let (_, delivered, _, _) = nodes[0].message_status(&id).unwrap();
+        assert!(delivered, "the ACK lands on the original handle");
+    }
+
+    #[test]
+    fn forward_secret_session_end_to_end() {
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        net.pump(&mut nodes);
+
+        // Both advertise prekeys; gossip distributes them to each other.
+        nodes[0].publish_prekey().unwrap();
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        // 0 → 1 should open a forward-secret session (prekey known), not a static seal.
+        let id = nodes[0]
+            .send_message_traced(nodes[1].address(), "text/plain".into(), b"secret hi".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 1);
+        assert!(
+            matches!(nodes[1].open(&inbox[0]).unwrap(), Payload::SessionInit { .. }),
+            "should ride a session, not a static PeerMessage"
+        );
+        let msg = nodes[1].read_message(&inbox[0]).unwrap().unwrap();
+        assert_eq!(msg.body, b"secret hi");
+        assert_eq!(msg.from, nodes[0].address());
+
+        // The ACK returned across the network → Delivered.
+        let (_, delivered, _, _) = nodes[0].message_status(&id).unwrap();
+        assert!(delivered, "session message should still ACK back");
+
+        // 1 → 0 reply rides the same session (responder now has a sending chain).
+        nodes[1]
+            .send_message_traced(nodes[0].address(), "text/plain".into(), b"reply".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+        let inbox0 = nodes[0].take_inbox();
+        assert_eq!(inbox0.len(), 1);
+        let reply = nodes[0].read_message(&inbox0[0]).unwrap().unwrap();
+        assert_eq!(reply.body, b"reply");
+    }
+
+    #[test]
+    fn relays_across_an_intermediate_node() {
+        // 0 <-> 1 <-> 2; 0 and 2 never connect directly. Message 0 -> 2.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 10, 1, 11);
+        net.connect(&mut nodes, 1, 12, 2, 13);
+
+        let b = msg(&nodes[0], &nodes[2], b"relay me");
+        nodes[0].submit(b);
+        net.pump(&mut nodes);
+
+        assert!(nodes[1].take_inbox().is_empty(), "relay must not absorb the bundle");
+        let inbox = nodes[2].take_inbox();
+        assert_eq!(inbox.len(), 1);
+        match inbox[0].open(&nodes[2].identity).unwrap() {
+            Payload::PeerMessage { body, .. } => assert_eq!(body, b"relay me"),
+            _ => panic!("wrong payload"),
+        }
+    }
+
+    #[test]
+    fn delivery_ack_vaccinates_relays() {
+        // 0 <-> 1 <-> 2. 0 → 2 (request ack). After delivery, the ACK floods back and
+        // purges the relay's (1) copy and releases the source's (0) copy.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 10, 1, 11);
+        net.connect(&mut nodes, 1, 12, 2, 13);
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+
+        let id = nodes[0]
+            .send_message_traced(nodes[2].address(), "text/plain".into(), b"relay me".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let (_, delivered, _, _) = nodes[0].message_status(&id).unwrap();
+        assert!(delivered, "should be delivered across the relay");
+        assert!(nodes[1].queue().is_empty(), "relay copy purged by the delivery-ACK vaccine");
+        assert!(nodes[0].queue().is_empty(), "source releases its copy on ACK");
+    }
+
+    #[test]
+    fn trace_records_each_relay_hop() {
+        // 0 <-> 1 <-> 2; a message 0 → 2 should arrive carrying the short address of
+        // each node that forwarded it (DESIGN.md §27).
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 10, 1, 11);
+        net.connect(&mut nodes, 1, 12, 2, 13);
+        let s0 = short_addr(&nodes[0].address());
+        let s1 = short_addr(&nodes[1].address());
+
+        let b = msg(&nodes[0], &nodes[2], b"trace me");
+        nodes[0].submit(b);
+        net.pump(&mut nodes);
+
+        let inbox = nodes[2].take_inbox();
+        assert_eq!(inbox.len(), 1);
+        let trace = inbox[0].trace();
+        assert_eq!(trace.len(), 2, "exactly the two forwarders, in order");
+        // Provenance privacy (§27): device hops carry the count + app label but NOT the address —
+        // they're anonymized to a zeroed short-addr, so the recipient can't see WHICH devices relayed.
+        let _ = (s0, s1);
+        assert!(trace.iter().all(|h| h.node == ShortAddr::default()), "device hops anonymized (no address)");
+        // App defaults to the shared fabric here (no set_app), stamped on each hop.
+        assert!(trace.iter().all(|h| h.app == short_app(&crate::FABRIC_APP)), "carrier app stamped");
+    }
+
+    #[test]
+    fn relay_and_source_learn_route_from_returning_ack() {
+        // 0 <-> 1 <-> 2. After 0 → 2 is delivered and the ACK floods back, the relay (1)
+        // has learned it sits on the 0↔2 route — in both directions — and the source (0)
+        // has learned it can reach 2 (DESIGN.md §27).
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 10, 1, 11);
+        net.connect(&mut nodes, 1, 12, 2, 13);
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        let a0 = nodes[0].address();
+        let a2 = nodes[2].address();
+
+        assert!(!nodes[1].knows_route(&a2), "relay starts with no learned route");
+        nodes[0]
+            .send_message_traced(a2, "text/plain".into(), b"learn me".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        assert!(nodes[1].knows_route(&a0), "relay learned the route toward the source");
+        assert!(nodes[1].knows_route(&a2), "relay learned the route toward the destination");
+        assert!(nodes[0].knows_route(&a2), "source learned it can reach the destination");
+    }
+
+    #[test]
+    fn link_is_encrypted_on_the_wire() {
+        // The plaintext must never appear in the bytes crossing the bearer.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let a = 0;
+        nodes[a].handle(BearerEvent::Connected(1, Role::Initiator));
+        nodes[1].handle(BearerEvent::Connected(1, Role::Responder));
+
+        // Shuttle handshake by hand and capture all bytes.
+        let mut captured: Vec<u8> = Vec::new();
+        for _ in 0..8 {
+            let out0 = nodes[0].drain_outgoing();
+            let out1 = nodes[1].drain_outgoing();
+            for (_, b) in &out0 {
+                captured.extend_from_slice(b);
+            }
+            for (_, b) in &out1 {
+                captured.extend_from_slice(b);
+            }
+            for (_, b) in out0 {
+                nodes[1].handle(BearerEvent::Data(1, b));
+            }
+            for (_, b) in out1 {
+                nodes[0].handle(BearerEvent::Data(1, b));
+            }
+        }
+
+        let secret = b"top secret payload bytes";
+        let bundle = msg(&nodes[0], &nodes[1], secret);
+        nodes[0].submit(bundle);
+        for (_, b) in nodes[0].drain_outgoing() {
+            captured.extend_from_slice(&b);
+            nodes[1].handle(BearerEvent::Data(1, b));
+        }
+
+        assert_eq!(nodes[1].take_inbox().len(), 1);
+        assert!(
+            !captured.windows(secret.len()).any(|w| w == secret),
+            "plaintext leaked onto the wire"
+        );
+    }
+
+    fn msg_ack(from: &Node, to: &Node, body: &[u8]) -> Bundle {
+        Bundle::create(
+            &from.identity,
+            Destination::Device(to.address()),
+            &to.identity.address(),
+            &Payload::PeerMessage { content_type: "t".into(), body: body.to_vec() },
+            BundleOpts {
+                flags: BundleFlags { request_ack: true, ..Default::default() },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ack_returns_and_clears_sender_pending() {
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        let b = msg_ack(&nodes[0], &nodes[1], b"please confirm");
+        nodes[0].submit(b);
+        assert_eq!(nodes[0].pending_count(), 1, "sender tracks the unacked bundle");
+        net.pump(&mut nodes);
+
+        assert_eq!(nodes[1].take_inbox().len(), 1, "recipient got the message");
+        assert!(nodes[0].take_inbox().is_empty(), "the ACK is consumed, not inboxed");
+        assert_eq!(nodes[0].pending_count(), 0, "ACK cleared the sender's pending entry");
+        assert_eq!(nodes[1].pending_count(), 0, "ACKs are not themselves tracked");
+    }
+
+    #[test]
+    fn unacked_bundle_expires_after_its_lifetime() {
+        let mut node = Node::new(Identity::generate());
+        let other = Node::new(Identity::generate());
+        // No links: nothing can deliver, so the bundle stays pending until expiry.
+        let b = Bundle::create(
+            &node.identity,
+            Destination::Device(other.address()),
+            &other.identity.address(),
+            &Payload::PeerMessage { content_type: "t".into(), body: b"x".to_vec() },
+            BundleOpts {
+                created_at: 0,
+                lifetime_ms: 1_000,
+                flags: BundleFlags { request_ack: true, ..Default::default() },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        node.submit(b);
+        assert_eq!(node.pending_count(), 1);
+        node.tick(500); // before lifetime — still pending
+        assert_eq!(node.pending_count(), 1);
+        node.tick(2_000); // past lifetime — given up
+        assert_eq!(node.pending_count(), 0);
+    }
+
+    #[test]
+    fn discover_presence_two_hops_away_and_message_it() {
+        // 0 <-> 1 <-> 2. 0 and 2 never connect directly. 0 publishes an app-level
+        // "presence" service carrying its display name; 2 discovers it via 1's gossip,
+        // then messages 0's address — routed through 1. (The name↔address tie is an
+        // app concern; the protocol only knows the service advert — DESIGN.md §4.)
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 10, 1, 11);
+        net.connect(&mut nodes, 1, 12, 2, 13);
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+
+        nodes[0]
+            .publish_service("presence".into(), "Alice".into(), String::new(), vec![], 600_000)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let found = nodes[2].browse("presence", None);
+        let alice = found.iter().find(|a| a.body.publisher == nodes[0].address());
+        let alice = alice.expect("2 should discover Alice's presence via 1");
+        assert!(matches!(&alice.body.kind, AdvertKind::Service { title, .. } if title == "Alice"));
+        assert_eq!(alice.hops, 2, "Alice is two hops away via node 1");
+        let addr = alice.body.publisher;
+
+        nodes[2]
+            .send_message_traced(addr, "text/plain".into(), b"hi Alice".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let inbox = nodes[0].take_inbox();
+        assert_eq!(inbox.len(), 1);
+        let m = nodes[0].read_message(&inbox[0]).unwrap().expect("a user message");
+        assert_eq!(m.body, b"hi Alice");
+    }
+
+    #[test]
+    fn discovery_gossips_over_links() {
+        // 0 publishes a market advert; 2 discovers it transitively through 1.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 10, 1, 11);
+        net.connect(&mut nodes, 1, 12, 2, 13);
+
+        let advert = Advert::publish(
+            &nodes[0].identity,
+            AdvertKind::Service {
+                service: "market".into(),
+                title: "Bike for sale".into(),
+                summary: "blue".into(),
+                tags: vec!["bicycle".into()],
+            },
+            0,
+            600_000,
+            1,
+        )
+        .unwrap();
+        nodes[0].publish(advert);
+        net.pump(&mut nodes);
+
+        let hits = nodes[2].directory.browse("market", Some("bicycle"));
+        assert_eq!(hits.len(), 1, "advert should reach node 2 via node 1");
+        assert_eq!(hits[0].body.publisher, nodes[0].address());
+    }
+
+    #[test]
+    fn hps_service_subscribe_publish_round_trips() {
+        // A node hosts an hps:// service; a subscriber requests its keys (open access) and
+        // then receives the owner's signed broadcasts, verified against the service key. A
+        // subscriber can read but never forge a broadcast (§32).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        // Node 0 hosts a service at "news"; node 1 subscribes and is handed the keys.
+        let svc_pubkey = nodes[0].register_service("news", crate::hps::ServiceKind::Service,
+            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        assert!(svc_pubkey.is_some(), "a service mints a signing key");
+        nodes[1].hps_subscribe(nodes[0].address(), "news").unwrap();
+        net.pump(&mut nodes);
+
+        // A subscriber can't publish to a service it doesn't host — only the owner broadcasts.
+        assert!(nodes[1].hps_publish("news", b"forged").is_err());
+
+        // The owner broadcasts; the subscriber decrypts + verifies against the service key.
+        nodes[0].hps_publish("news", b"breaking").unwrap();
+        net.pump(&mut nodes);
+
+        let msgs = nodes[1].take_hps_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].path, "news");
+        assert_eq!(msgs[0].body, b"breaking");
+        assert_eq!(msgs[0].sender, nodes[0].address());
+    }
+
+    #[test]
+    fn hps_channel_members_read_each_others_posts() {
+        // A channel: anyone holding the content key reads and writes, and every post is
+        // verified against its writer's own address. Node 0 hosts; members 1 and 2 join,
+        // then member 1's post reaches member 2, attributed to member 1 (§32).
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1); // 0 <-> 1
+        net.connect(&mut nodes, 0, 2, 2, 2); // 0 <-> 2
+        net.connect(&mut nodes, 1, 3, 2, 3); // 1 <-> 2
+
+        assert!(
+            nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
+                crate::hps::AccessMode::Open, crate::hps::Visibility::Private).is_none(),
+            "a channel has no service signing key"
+        );
+        nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
+        nodes[2].hps_subscribe(nodes[0].address(), "lobby").unwrap();
+        net.pump(&mut nodes);
+
+        nodes[1].hps_publish("lobby", b"hi all").unwrap();
+        net.pump(&mut nodes);
+
+        let msgs = nodes[2].take_hps_messages();
+        assert_eq!(msgs.len(), 1, "the post floods to the other member");
+        assert_eq!(msgs[0].body, b"hi all");
+        assert_eq!(msgs[0].sender, nodes[1].address(), "verified as member 1's post");
+    }
+
+    #[test]
+    fn large_broadcast_fragments_across_the_link() {
+        // hps:// broadcasts aren't carrier-chunked (no single dst), so a big channel post
+        // exceeds one Noise message (max 65535B) and must fragment at the link layer, or it
+        // is silently dropped at encrypt (DESIGN.md §20).
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
+        net.pump(&mut nodes);
+
+        // ~200KB body → the sealed broadcast bundle far exceeds one Noise message.
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        nodes[0].hps_publish("lobby", &big).unwrap();
+        net.pump(&mut nodes);
+
+        let msgs = nodes[1].take_hps_messages();
+        assert_eq!(msgs.len(), 1, "the large broadcast reassembled and decrypted");
+        assert_eq!(msgs[0].body, big, "bytes intact across link fragmentation");
+    }
+
+    #[test]
+    fn hps_publish_to_unregistered_path_errors() {
+        // Publishing to a path we neither host nor subscribe to is an error (§32).
+        let mut node = Node::new(Identity::generate());
+        assert!(node.hps_publish("nope", b"x").is_err());
+    }
+
+    /// Helper: a node on a real app secret (so hps isolation is active, not the open fabric).
+    fn app_node(secret: u8) -> Node<MemoryStore> {
+        Node::with_store_app(
+            Identity::generate(),
+            MemoryStore::new(),
+            crate::app::AppKeys::from_secret([secret; 32]),
+        )
+    }
+
+    #[test]
+    fn hps_channel_host_receives_member_posts() {
+        // A channel is group chat: the HOST must also receive members' posts, even though it
+        // keeps the topic in `services` (not `subscriptions`). Regression for "host can send but
+        // doesn't get messages from other members."
+        let mut nodes = [app_node(4), app_node(4)];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
+        net.pump(&mut nodes);
+
+        // Member 1 posts; the host (node 0) must receive it.
+        nodes[1].hps_publish("lobby", b"hi host").unwrap();
+        net.pump(&mut nodes);
+        let host_msgs = nodes[0].take_hps_messages();
+        assert_eq!(host_msgs.len(), 1, "host receives the member's post");
+        assert_eq!(host_msgs[0].body, b"hi host");
+        assert_eq!(host_msgs[0].sender, nodes[1].address());
+    }
+
+    #[test]
+    fn hps_request_to_join_needs_approval() {
+        // RequestToJoin: a subscribe request is queued, not auto-keyed. The requester can't read
+        // until the host approves (§32).
+        let mut nodes = [app_node(5), app_node(5)];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::RequestToJoin, crate::hps::Visibility::Private);
+        let requester = nodes[1].address();
+        nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[0].hps_pending("lobby"), vec![requester], "queued, not keyed");
+
+        nodes[0].hps_publish("lobby", b"members only").unwrap();
+        net.pump(&mut nodes);
+        assert!(nodes[1].take_hps_messages().is_empty(), "no keys yet → can't read");
+
+        nodes[0].hps_approve("lobby", requester).unwrap();
+        net.pump(&mut nodes);
+        nodes[0].hps_publish("lobby", b"welcome").unwrap();
+        net.pump(&mut nodes);
+        let msgs = nodes[1].take_hps_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, b"welcome");
+    }
+
+    #[test]
+    fn hps_invite_then_accept() {
+        // Invite: a topic can't be self-joined; only a host-initiated invite, once accepted,
+        // yields keys (§32, consent-based).
+        let mut nodes = [app_node(6), app_node(6)];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].register_service("vip", crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Invite, crate::hps::Visibility::Private);
+        let dest = nodes[1].address();
+
+        // Self-join is ignored for an Invite topic.
+        nodes[1].hps_subscribe(nodes[0].address(), "vip").unwrap();
+        net.pump(&mut nodes);
+        nodes[0].hps_publish("vip", b"x").unwrap();
+        net.pump(&mut nodes);
+        assert!(nodes[1].take_hps_messages().is_empty(), "can't self-join an invite topic");
+
+        // Host invites; destination sees it and accepts.
+        nodes[0].hps_invite("vip", dest).unwrap();
+        net.pump(&mut nodes);
+        let invites = nodes[1].take_hps_invites();
+        assert_eq!(invites.len(), 1);
+        assert_eq!(invites[0].path, "vip");
+        nodes[1].hps_accept_invite(nodes[0].address(), "vip").unwrap();
+        net.pump(&mut nodes);
+
+        nodes[0].hps_publish("vip", b"hi vip").unwrap();
+        net.pump(&mut nodes);
+        let msgs = nodes[1].take_hps_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, b"hi vip");
+    }
+
+    #[test]
+    fn hps_app_secret_isolates_join() {
+        // A node with a DIFFERENT app secret can't join an Open topic — the host rejects the
+        // foreign app id + proof, so no keys are handed off (§32 app isolation).
+        let mut nodes = [app_node(1), app_node(2)];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
+        net.pump(&mut nodes);
+        nodes[0].hps_publish("lobby", b"members only").unwrap();
+        net.pump(&mut nodes);
+        assert!(nodes[1].take_hps_messages().is_empty(), "foreign-app node can't join");
+        assert!(nodes[0].hps_members("lobby").is_empty(), "host recorded no foreign member");
+    }
+
+    #[test]
+    fn hps_rekey_revokes_removed_member() {
+        // Selective forward rotation: after rekey-with-remove, the removed member can no longer
+        // read new posts while the retained member can (§32 revocation).
+        let mut nodes = [app_node(7), app_node(7), app_node(7)];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        net.connect(&mut nodes, 0, 2, 2, 2);
+        net.connect(&mut nodes, 1, 3, 2, 3);
+        nodes[0].register_service("room", crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        let m2 = nodes[2].address();
+        nodes[1].hps_subscribe(nodes[0].address(), "room").unwrap();
+        nodes[2].hps_subscribe(nodes[0].address(), "room").unwrap();
+        net.pump(&mut nodes);
+
+        nodes[0].hps_publish("room", b"v1").unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[1].take_hps_messages().len(), 1, "m1 reads v1");
+        assert_eq!(nodes[2].take_hps_messages().len(), 1, "m2 reads v1");
+
+        // Rotate, removing member 2.
+        nodes[0].hps_rekey("room", None, &[m2]).unwrap();
+        net.pump(&mut nodes);
+        nodes[0].hps_publish("room", b"v2").unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[1].take_hps_messages().len(), 1, "retained m1 reads v2");
+        assert!(nodes[2].take_hps_messages().is_empty(), "removed m2 can't read v2");
+    }
+}

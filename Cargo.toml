@@ -1,0 +1,31 @@
+[package]
+name = "hop-core"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Core protocol for Hop: bundles, crypto, store-and-forward, and routing."
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+blake3.workspace = true
+sha2 = { workspace = true, features = ["oid"] }
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+chacha20poly1305.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+miniz_oxide.workspace = true
+snow.workspace = true
+# DNSSEC validation (DESIGN.md §30): verify RRSIG chains to the root anchor in core so
+# multi-hop HNS resolution is trustless. RSA/SHA-256 (alg 8) covers the .sh/hopme.sh chain;
+# ECDSA P-256/SHA-256 (alg 13) covers most modern zones (Cloudflare etc.).
+rsa = "0.9"
+p256 = { version = "0.13", features = ["ecdsa"] }
+# Decode the baked root trust anchors (base64) and DNSSEC test vectors.
+base64 = "0.22"
+# Parse DoH (DNS-over-HTTPS) JSON responses in core, so the host stays a dumb fetcher.
+serde_json = "1"
+# Decode the base58 hops endpoint address out of a validated _hopaddress TXT record.
+bs58 = "0.5"
