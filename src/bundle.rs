@@ -30,8 +30,6 @@ pub type BundleId = [u8; 32];
 pub enum Destination {
     /// Use Case B: a specific device address.
     Device(PubKeyBytes),
-    /// Use Case A: any gateway with the egress capability.
-    InternetEgress,
     /// An ACK routed back to `origin` for a given bundle id.
     AckTo(PubKeyBytes, BundleId),
     /// Flood to everyone: every node relays it onward AND processes it locally (deduped by id).
@@ -571,7 +569,7 @@ mod tests {
     fn sample(from: &Identity, to_addr: &PubKeyBytes) -> Bundle {
         Bundle::create(
             from,
-            Destination::InternetEgress,
+            Destination::Broadcast,
             to_addr,
             &Payload::PeerMessage {
                 content_type: "text/plain".into(),

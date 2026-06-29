@@ -1447,8 +1447,9 @@ impl<S: Store> Node<S> {
     }
 
     /// Send a `hops://` request to a specific endpoint (DESIGN.md §30): a normal HTTP
-    /// request sealed and addressed to the endpoint's Hop address (not the open-web
-    /// InternetEgress). The endpoint executes it against its own backend and the reply
+    /// request sealed and addressed to the endpoint's Hop address — opaque to the mesh,
+    /// indistinguishable from any other peer message (there is no mesh-visible "internet
+    /// bound" destination). The endpoint executes it against its own backend and the reply
     /// arrives as an [`HttpRespItem`] via [`Node::take_http_responses`]. Returns the
     /// request id (the response correlates by it).
     pub fn send_hops_request(
@@ -2307,7 +2308,7 @@ impl<S: Store> Node<S> {
         };
         let dst = match bundle.inner.dst {
             Destination::Device(d) | Destination::AckTo(d, _) => d,
-            Destination::InternetEgress | Destination::Broadcast => return self.submit(bundle), // no single dst
+            Destination::Broadcast => return self.submit(bundle), // no single dst
         };
         let sid = self.next_stream_id();
         let opts = BundleOpts {
@@ -2436,7 +2437,7 @@ impl<S: Store> Node<S> {
                 own: self.tx.contains_key(&b.id()) || self.carrier_owner.contains_key(&b.id()),
                 to: match b.inner.dst {
                     Destination::Device(a) | Destination::AckTo(a, _) => Some(a),
-                    Destination::InternetEgress | Destination::Broadcast => None,
+                    Destination::Broadcast => None,
                 },
                 priority: b.inner.priority,
                 hops: b.env.hops,
@@ -2463,7 +2464,7 @@ impl<S: Store> Node<S> {
             // offline cross-region sender would never arrive (no live peering, §28).
             let dst = match b.inner.dst {
                 Destination::Device(d) | Destination::AckTo(d, _) => d,
-                Destination::InternetEgress | Destination::Broadcast => continue,
+                Destination::Broadcast => continue,
             };
             if connected.contains(&dst) {
                 continue; // deliverable directly on this node — no handoff needed
@@ -3206,26 +3207,6 @@ impl<S: Store> Node<S> {
             return;
         }
 
-        // Internet-egress request sealed to us (we're a gateway that can open it):
-        // surface it for fulfillment. Still relayed below so other gateways can serve
-        // it too; gateway-side dedup prevents double fulfillment (§9).
-        if matches!(bundle.inner.dst, Destination::InternetEgress) && !self.store.seen(&id) {
-            if let Ok(Payload::HttpRequest { host, method, url, headers, body, max_resp_bytes }) =
-                bundle.open(&self.identity)
-            {
-                self.http_requests.push(HttpReqItem {
-                    from: bundle.inner.src,
-                    id,
-                    host,
-                    method,
-                    url,
-                    headers,
-                    body,
-                    max_resp: max_resp_bytes,
-                });
-            }
-        }
-
         // A passing ACK vaccinates us: the bundle it acknowledges is delivered, so
         // drop our copy and remember to drop any future copy (epidemic recovery). The
         // acked id rides in the *unsealed* AckTo destination, so relays can read it.
@@ -3674,7 +3655,7 @@ impl<S: Store> Node<S> {
     fn dest_is_connected(&self, bundle: &Bundle) -> bool {
         let dst = match bundle.inner.dst {
             Destination::Device(a) | Destination::AckTo(a, _) => a,
-            Destination::InternetEgress | Destination::Broadcast => return false,
+            Destination::Broadcast => return false,
         };
         self.links
             .values()
@@ -3723,7 +3704,6 @@ fn is_for(bundle: &Bundle, addr: &PubKeyBytes) -> bool {
     match &bundle.inner.dst {
         Device(d) => d == addr,
         AckTo(d, _) => d == addr,
-        InternetEgress => false,
         Broadcast => false,
     }
 }

@@ -214,7 +214,7 @@ mod tests {
         let gw = Identity::generate();
         Bundle::create(
             &alice,
-            Destination::InternetEgress,
+            Destination::Broadcast,
             &gw.address(),
             &Payload::PeerMessage { content_type: "t".into(), body: vec![1] },
             BundleOpts { lifetime_ms, ..Default::default() },

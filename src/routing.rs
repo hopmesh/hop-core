@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn drops_at_zero_hop_limit() {
         let r = SprayAndWait::new();
-        let d = r.should_forward(&meta(Destination::InternetEgress, 0, 8), &[0u8; 32]);
+        let d = r.should_forward(&meta(Destination::Broadcast, 0, 8), &[0u8; 32]);
         assert_eq!(d, ForwardDecision::Drop);
     }
 
@@ -137,7 +137,7 @@ mod tests {
         let mut r = SprayAndWait::new();
         r.on_beacon(&GatewayBeacon { gateway: [1u8; 32], hops: 2, expires_at: 999 });
         assert!(r.knows_gateway());
-        let d = r.should_forward(&meta(Destination::InternetEgress, 5, 8), &[0u8; 32]);
+        let d = r.should_forward(&meta(Destination::Broadcast, 5, 8), &[0u8; 32]);
         assert_eq!(d, ForwardDecision::Forward);
     }
 
