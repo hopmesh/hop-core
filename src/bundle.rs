@@ -20,12 +20,21 @@ pub struct TraceHop {
 }
 
 /// Wire format version.
-pub const BUNDLE_VERSION: u8 = 1;
+// v2: §39 mailbox-tag derivation changed to H(address ‖ epoch) (F-06), a semantic wire change on the
+// private path. Bumped so a mixed old/new fleet fails loudly at the version gate rather than silently
+// mis-addressing private bundles. (Struct layouts are unchanged; the break is in tag semantics.)
+pub const BUNDLE_VERSION: u8 = 2;
 
 /// Globally-unique bundle id: `BLAKE3(src || nonce || payload_hash)`.
 pub type BundleId = [u8; 32];
 
 /// Where a bundle is headed. See DESIGN.md §5.
+///
+/// WIRE DISCIPLINE (append-only): postcard encodes an enum by its variant *index*, so
+/// removing or reordering a variant renumbers the ones after it and breaks decode across
+/// every peer and the deployed relay (this is what the `InternetEgress` removal did —
+/// commit 5dd64d3). Only ever *append* new variants at the end, and bump [`BUNDLE_VERSION`]
+/// when the wire layout changes. The discriminant order is locked by `destination_discriminants_are_stable`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Destination {
     /// Use Case B: a specific device address.
@@ -262,8 +271,6 @@ pub struct PrivateHeader {
     pub ephemeral: XPubKeyBytes,
     /// Optional rotatable mailbox pseudonym, so a relay can spool by it for pull (§39).
     pub mailbox: Option<Tag>,
-    /// Optional `k`-bit gradient prefix hint (blinded). Routing detail; opaque here.
-    pub hint: Option<Vec<u8>>,
 }
 
 /// The signed portion of a bundle. For a **traced** bundle the source signature covers
@@ -403,7 +410,6 @@ impl Bundle {
         recipient_spk_pub: &XPubKeyBytes,
         payload: &Payload,
         mailbox: Option<Tag>,
-        hint: Option<Vec<u8>>,
         opts: BundleOpts,
     ) -> Result<Self> {
         let plaintext = postcard::to_allocvec(payload)?;
@@ -417,7 +423,7 @@ impl Bundle {
             id,
             src: [0u8; 32],
             dst: Destination::Broadcast,
-            private: Some(PrivateHeader { tag, ephemeral, mailbox, hint }),
+            private: Some(PrivateHeader { tag, ephemeral, mailbox }),
             created_at: opts.created_at,
             lifetime_ms: opts.lifetime_ms,
             flags: opts.flags,
@@ -458,6 +464,16 @@ impl Bundle {
     /// Verify the source signature and that the id matches the sealed payload.
     /// Relays should call this before forwarding to avoid amplifying garbage.
     pub fn verify(&self) -> Result<()> {
+        // Reject a bundle whose wire version this build doesn't speak. Relays call verify()
+        // before storing/forwarding (node.rs `on_bundle`), so this is the network hot-path
+        // guard that complements the decode-time check in [`Bundle::from_bytes`] — a peer on a
+        // newer wire layout is rejected loudly instead of misinterpreted (F-02).
+        if !is_supported_bundle_version(self.inner.version) {
+            return Err(Error::UnsupportedVersion {
+                got: self.inner.version,
+                supported: BUNDLE_VERSION,
+            });
+        }
         // Private bundle (§39): not identity-signed. The id alone binds the sealed bytes;
         // the recipient is found by the recognition tag, not a signature or a dst.
         if self.inner.private.is_some() {
@@ -537,9 +553,28 @@ impl Bundle {
     }
 
     /// Decode from the wire format.
+    ///
+    /// The first byte is `SignedInner::version` (postcard encodes struct fields in order,
+    /// and `version` leads `SignedInner`, which leads `Bundle`). We reject an unknown
+    /// version *before* decoding so a discriminant shift in a newer build fails loudly with
+    /// [`Error::UnsupportedVersion`] instead of silently misdecoding into the wrong variant.
+    /// See DESIGN.md §13.4 and the append-only enum discipline on [`Destination`]/[`Payload`].
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        match data.first() {
+            None => return Err(Error::Codec(postcard::Error::DeserializeUnexpectedEnd)),
+            Some(&v) if !is_supported_bundle_version(v) => {
+                return Err(Error::UnsupportedVersion { got: v, supported: BUNDLE_VERSION });
+            }
+            _ => {}
+        }
         Ok(postcard::from_bytes(data)?)
     }
+}
+
+/// Which bundle wire versions this build can decode. Add older versions here when a
+/// migration path is needed; today only the current version is accepted.
+fn is_supported_bundle_version(v: u8) -> bool {
+    v == BUNDLE_VERSION
 }
 
 fn compute_id(src: &PubKeyBytes, sealed: &Sealed) -> BundleId {
@@ -637,7 +672,6 @@ mod tests {
             spk_pub,
             &Payload::PeerMessage { content_type: "text/plain".into(), body: b"psst".to_vec() },
             None,
-            None,
             BundleOpts::default(),
         )
         .unwrap()
@@ -683,5 +717,49 @@ mod tests {
         let traced = sample(&Identity::generate(), &bob.address());
         assert!(!traced.is_private());
         assert!(!traced.recognized_by(&spk.secret_bytes()));
+    }
+
+    // --- wire-format versioning (F-02) -----------------------------------------
+
+    #[test]
+    fn version_byte_leads_the_wire_and_current_decodes() {
+        let alice = Identity::generate();
+        let gw = Identity::generate();
+        let b = sample(&alice, &gw.address());
+        let bytes = b.to_bytes().unwrap();
+        // SignedInner::version leads the struct, so it is the first wire byte.
+        assert_eq!(bytes[0], BUNDLE_VERSION);
+        assert!(Bundle::from_bytes(&bytes).is_ok());
+    }
+
+    #[test]
+    fn unknown_version_is_rejected_not_misdecoded() {
+        let alice = Identity::generate();
+        let gw = Identity::generate();
+        let b = sample(&alice, &gw.address());
+        let mut bytes = b.to_bytes().unwrap();
+        bytes[0] = BUNDLE_VERSION + 7; // a future build's layout
+        match Bundle::from_bytes(&bytes) {
+            Err(Error::UnsupportedVersion { got, supported }) => {
+                assert_eq!(got, BUNDLE_VERSION + 7);
+                assert_eq!(supported, BUNDLE_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+        // Empty input is a clean codec error, not a panic.
+        assert!(Bundle::from_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn destination_discriminants_are_stable() {
+        // Locks the append-only wire order: removing/reordering a variant renumbers the
+        // rest and silently misroutes across peers (the InternetEgress-removal outage).
+        // postcard writes an enum discriminant as a leading varint; assert each here.
+        let dev = postcard::to_allocvec(&Destination::Device([9u8; 32])).unwrap();
+        let ack = postcard::to_allocvec(&Destination::AckTo([9u8; 32], [1u8; 32])).unwrap();
+        let bcast = postcard::to_allocvec(&Destination::Broadcast).unwrap();
+        assert_eq!(dev[0], 0, "Device must stay discriminant 0");
+        assert_eq!(ack[0], 1, "AckTo must stay discriminant 1");
+        assert_eq!(bcast, vec![2], "Broadcast must stay discriminant 2 (and carry no data)");
     }
 }

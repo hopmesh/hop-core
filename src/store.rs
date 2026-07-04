@@ -67,6 +67,13 @@ pub trait Store {
     fn list_kv(&self, _prefix: &str) -> Vec<(String, Vec<u8>)> {
         Vec::new()
     }
+    /// Drain any asynchronous/background writes, blocking up to `timeout`; returns whether the queue
+    /// drained (F-21). Default: nothing is buffered (synchronous store) → immediately done. The
+    /// Firestore mirror overrides this to wait for its best-effort background writer to catch up, so
+    /// a shutdown (SIGTERM) doesn't drop a spool/handoff write accepted moments before.
+    fn flush(&self, _timeout: std::time::Duration) -> bool {
+        true
+    }
 }
 
 /// Lets a node pick its store backend at runtime (`Node<Box<dyn Store>>`) — e.g. the

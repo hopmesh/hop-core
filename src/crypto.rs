@@ -176,6 +176,14 @@ pub struct SignedPreKey {
     pub sig: [u8; 64],
 }
 
+impl Drop for SignedPreKey {
+    fn drop(&mut self) {
+        // F-08: wipe the prekey secret from memory on drop rather than leaving it in the heap
+        // until overwritten. The public half and signature are not secret.
+        zeroize::Zeroize::zeroize(&mut self.secret);
+    }
+}
+
 impl SignedPreKey {
     /// The retained secret bytes — persist these so late handshakes still resolve.
     pub fn secret_bytes(&self) -> [u8; 32] {
@@ -335,12 +343,18 @@ pub fn recognition_tag_recipient(
     recognition_tag_from_shared(shared.as_bytes(), bundle_id)
 }
 
-/// §39 **mailbox-tag** — a recipient's rotatable pseudonym: `H(SPK public)`. NOT the
-/// address (you cannot seal to it or message it, only bucket by it); it rotates when the
-/// prekey rotates. A relay buckets a blind spool by it and a recipient names it in a want
-/// beacon. Linkable while it lives — the documented cost of being pull-reachable (§39).
-pub fn mailbox_tag(spk_pub: &XPubKeyBytes) -> Tag {
-    tag16("hop mailbox tag v1", spk_pub)
+/// §39 **mailbox-tag** — a recipient's rotatable pull pseudonym: `H("v2" ‖ address ‖ epoch)`
+/// (F-06). NOT the address itself (you cannot seal to it or message it, only bucket by it), and it
+/// **rotates every epoch**, so a global observer can't correlate a recipient's mailbox across epochs.
+/// A relay buckets a blind spool by it and a recipient names it in a want-beacon. Deriving it from
+/// `(address, epoch)` — not the prekey — decouples mailbox rotation from the (deterministic) prekey,
+/// and lets a relay verify a beacon's ownership from public info (the sender knows the recipient's
+/// address for a private send; a beacon is signed by that address, so it can't be forged for another).
+pub fn mailbox_tag(address: &PubKeyBytes, epoch: u64) -> Tag {
+    let mut material = [0u8; 40];
+    material[..32].copy_from_slice(address);
+    material[32..].copy_from_slice(&epoch.to_le_bytes());
+    tag16("hop mailbox tag v2", &material)
 }
 
 #[cfg(test)]
@@ -490,9 +504,9 @@ mod tests {
     fn mailbox_tag_stable_per_prekey_and_rotates() {
         let bob = Identity::generate();
         // Stable across re-derivations of the same (deterministic) prekey epoch.
-        assert_eq!(mailbox_tag(&bob.derive_prekey().public), mailbox_tag(&bob.derive_prekey().public));
+        assert_eq!(mailbox_tag(&bob.address(), 0), mailbox_tag(&bob.address(), 0));
         // A different identity's prekey → a different mailbox (it's a pseudonym, not shared).
         let alice = Identity::generate();
-        assert_ne!(mailbox_tag(&bob.derive_prekey().public), mailbox_tag(&alice.derive_prekey().public));
+        assert_ne!(mailbox_tag(&bob.address(), 0), mailbox_tag(&alice.address(), 0));
     }
 }

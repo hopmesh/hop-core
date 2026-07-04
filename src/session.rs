@@ -90,6 +90,7 @@ mod skipped_serde {
         v.serialize(s)
     }
 
+    #[allow(clippy::type_complexity)] // serde helper signature mirrors the field type exactly
     pub fn deserialize<'de, D: Deserializer<'de>>(
         d: D,
     ) -> std::result::Result<HashMap<(XPubKeyBytes, u32), [u8; 32]>, D::Error> {

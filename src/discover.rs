@@ -76,17 +76,17 @@ pub enum AdvertKind {
     /// key, so only same-app nodes can read it — a foreign app can carry/relay it but can't
     /// enumerate the topic. Never carries the content key.
     HpsTopic { nonce: [u8; 12], ct: Vec<u8> },
-    /// §39 P4 receiver-beacon: the publisher (a recipient in "route-to-me" mode) advertises
-    /// its **mailbox-tag** so nodes lay a soft-state gradient toward it *by prefix*. As this
-    /// floods a few hops, every node records "this mailbox is reachable via the link I heard
-    /// it on", and then forwards a matching **private** bundle down that gradient instead of
-    /// blind-flooding (DESIGN.md §39). The advert's publisher signature (which already binds
-    /// the publisher's identity — the same key that signs its `SignedPreKey`) is what stops
-    /// any other node hijacking/black-holing the prefix: only the mailbox owner can beacon it.
-    /// `prefix_bits` (k) is how many leading bits of `mailbox` are the routable gradient prefix
-    /// — `k=0` ⇒ no useful prefix ⇒ full-flood privacy floor; larger k ⇒ sharper gradient over
-    /// a smaller anonymity set (~N/2^k), trading destination entropy for routability.
-    RecvBeacon { mailbox: Tag, prefix_bits: u8 },
+    /// §39 P4 receiver-beacon: the publisher (a recipient in "route-to-me" mode) advertises its
+    /// **mailbox-tag** so nodes lay a soft-state gradient toward it. As this floods a few hops, every
+    /// node records "this mailbox is reachable via the link I heard it on", then forwards a matching
+    /// **private** bundle down that gradient instead of blind-flooding (DESIGN.md §39). The mailbox
+    /// tag is `H(address ‖ epoch)` and rotates per epoch (F-06). The advert's publisher signature
+    /// alone does NOT stop a hijack; hijack is prevented at ingest (`Node::on_advert`, F-05) by
+    /// requiring `mailbox == mailbox_tag(publisher's own signed address, current/recent epoch)`,
+    /// which the relay recomputes from the beacon's own signed address (unforgeable for another).
+    /// (A k-bit anonymity-set prefix was carried in v1 but never honored; it was removed rather than
+    /// advertise a non-functional privacy control — reintroduce with a real prefix-routing design.)
+    RecvBeacon { mailbox: Tag },
 }
 
 /// The signed body of an advert. The publisher signature covers this exactly.
@@ -122,7 +122,8 @@ pub struct Advert {
 }
 
 /// Current advert wire version.
-pub const ADVERT_VERSION: u8 = 1;
+// v2: RecvBeacon mailbox semantics changed to H(address ‖ epoch) with a rotation window (F-06).
+pub const ADVERT_VERSION: u8 = 2;
 
 impl Advert {
     /// Publish (build + sign) a new advert in the shared fabric namespace.
@@ -162,6 +163,12 @@ impl Advert {
 
     /// Verify the id matches the body and the publisher signature is valid.
     pub fn verify(&self) -> Result<()> {
+        // Reject an advert whose wire version this build doesn't speak, before trusting
+        // any of its fields. Like [`Bundle::from_bytes`], this turns a silent misdecode
+        // after a discriminant shift into a loud [`Error::UnsupportedVersion`].
+        if self.body.version != ADVERT_VERSION {
+            return Err(Error::UnsupportedVersion { got: self.body.version, supported: ADVERT_VERSION });
+        }
         let bytes = postcard::to_allocvec(&self.body)?;
         if *blake3::hash(&bytes).as_bytes() != self.id {
             return Err(Error::BadSignature);

@@ -29,3 +29,5 @@ base64 = "0.22"
 serde_json = "1"
 # Decode the base58 hops endpoint address out of a validated _hopaddress TXT record.
 bs58 = "0.5"
+# Wipe secret key material (prekey secrets, retired prekeys) from memory on drop (F-08).
+zeroize = "1"

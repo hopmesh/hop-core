@@ -19,6 +19,9 @@ pub enum Error {
     #[error("bundle signature verification failed")]
     BadSignature,
 
+    #[error("unsupported wire format version {got} (this build speaks {supported})")]
+    UnsupportedVersion { got: u8, supported: u8 },
+
     #[error("bundle expired or hop limit reached")]
     Undeliverable,
 

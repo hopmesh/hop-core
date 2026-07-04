@@ -31,7 +31,7 @@ use crate::discover::{Advert, AdvertId, AdvertKind, Directory};
 use crate::link::{BearerEvent, LinkHandshake, LinkId, LinkSession, Role};
 use crate::route::RouteTable;
 use crate::routing::{BundleMeta, ForwardDecision, Router, SprayAndWait};
-use crate::{short_app, AppId, FABRIC_APP};
+use crate::{short_app, AppId, ShortApp, FABRIC_APP};
 use crate::app::AppKeys;
 use crate::session::Session;
 use crate::store::{MemoryStore, Store};
@@ -171,11 +171,29 @@ pub const RECV_BEACON_TTL_MS: u32 = 90_000;
 /// under [`RECV_BEACON_TTL_MS`] so a single missed beacon self-heals; the gradient tracks a
 /// mobile recipient at this cadence.
 pub const RECV_BEACON_REFRESH_MS: u64 = 30_000;
-/// Leading bits of the mailbox-tag used as the routable gradient prefix (the `k` of §39). Kept
-/// at the full tag width for v1 (k = 128): a sharp gradient with no false-sharing. The privacy
-/// floor (k=0 ⇒ full flood) is available by setting this to 0; dialing k *down* trades
-/// routability for a larger anonymity set, only worth it once flooding hurts.
-pub const RECV_BEACON_PREFIX_BITS: u8 = 128;
+/// §39 mailbox-tag rotation period (F-06). The pull pseudonym `H(address ‖ epoch)` rotates each
+/// epoch so a global observer can't correlate a recipient's mailbox across epochs. A day is long
+/// enough that a spooled bundle (pulled within minutes/hours) almost always drains inside one epoch.
+pub const MAILBOX_EPOCH_MS: u64 = 86_400_000;
+/// A forward-secret session unused for this long is GC'd from memory + the persisted `session/`
+/// store (D6), so meeting many peers once doesn't grow storage without bound. 30 days is generous:
+/// a real contact is touched far more often, and a pruned session just re-establishes on return.
+const SESSION_MAX_IDLE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// How many extra PAST epochs a recipient keeps beaconing and a relay keeps accepting, so a bundle
+/// addressed/spooled just before an epoch boundary (or under a bit of clock skew) is still routed and
+/// pulled after rotation. Window = 1 ⇒ current + previous epoch are live.
+const MAILBOX_EPOCH_WINDOW: u64 = 1;
+
+/// The current mailbox epoch for a clock reading.
+fn mailbox_epoch(now_ms: u64) -> u64 {
+    now_ms / MAILBOX_EPOCH_MS
+}
+
+/// Per-link inbound rate limit for §39 **private** bundles (F-07). Private bundles are unsigned
+/// and unlimited-mintable, so a hostile/buggy peer could flood them; a legitimate peer never
+/// approaches this. Traced (signed, attributable) bundles and stream carriers are NOT limited.
+const PRIV_INGEST_WINDOW_MS: u64 = 1_000;
+const MAX_PRIV_BUNDLES_PER_WINDOW: u32 = 256;
 /// Cap on the soft-state gradient table (bounds a Sybil flooding fake mailbox-tags; signed
 /// beacons stop *hijack*, this stops *bloat*). On overflow the nearest-to-expiry entry is evicted.
 pub const MAX_RECV_GRADIENT: usize = 4_096;
@@ -433,7 +451,10 @@ pub struct Node<S: Store = MemoryStore> {
     /// Our current signed prekey (published so peers can open sessions to us).
     prekey: SignedPreKey,
     /// Retained prekey secrets by public, so late session inits still resolve.
-    spk_secrets: HashMap<XPubKeyBytes, [u8; 32]>,
+    spk_secrets: HashMap<XPubKeyBytes, zeroize::Zeroizing<[u8; 32]>>,
+    /// Per-link fixed-window counter for inbound §39 private-bundle rate limiting (F-07):
+    /// `link → (window_start_ms, count)`. Bounds an unsigned-bundle flood per peer.
+    priv_ingest: HashMap<LinkId, (u64, u32)>,
     /// §39 P4 soft-state routing gradient: mailbox-tag → the next hop *toward* that recipient.
     /// Laid by recipients' signed [`AdvertKind::RecvBeacon`]s as they flood a few hops; a node
     /// then forwards a matching **private** bundle down `inbound` instead of blind-flooding. Soft
@@ -446,6 +467,10 @@ pub struct Node<S: Store = MemoryStore> {
     wanted_mailboxes: Vec<Tag>,
     /// Forward-secret sessions, by peer address (DESIGN.md §25).
     sessions: HashMap<PubKeyBytes, PeerSession>,
+    /// Last time (ms) each session was used or (re)established. Sessions idle past
+    /// [`SESSION_MAX_IDLE_MS`] are GC'd in [`Node::tick`] so `session/` doesn't leak entries for
+    /// peers we never talk to again (a slow storage growth). In-memory; seeded to now on rehydrate.
+    session_touch: HashMap<PubKeyBytes, u64>,
     /// Bundle ids we've been "vaccinated" against by a passing delivery ACK — we
     /// drop them on sight so a delivered message stops propagating (epidemic
     /// recovery, DESIGN.md §6). Pruned by age in [`Node::tick`].
@@ -552,6 +577,38 @@ pub struct Node<S: Store = MemoryStore> {
     hps_adverts: HashMap<String, crate::discover::AdvertId>,
     /// (topic_tag, epoch) we've already reach-acked, so a flood of broadcasts doesn't ack-storm.
     hps_acked: std::collections::HashSet<([u8; 16], u32)>,
+    /// Persisted records that failed to decode on the last [`Node::rehydrate`] (F-03). A
+    /// non-empty report means an upgrade changed a struct's postcard layout and silently
+    /// dropped state (this ate the deferred-send queue when `PendingContent` gained a field —
+    /// commit 6bb5739). The host drains it via [`Node::take_rehydrate_report`] and surfaces it
+    /// so a silent state wipe is observable instead of invisible.
+    rehydrate_report: RehydrateReport,
+}
+
+/// A tally of persisted records that failed to decode on startup, per kind. Empty is the
+/// healthy case. See [`Node::rehydrate`] and F-03.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RehydrateReport {
+    /// `(kind, count)` pairs — e.g. `("session", 3)` means three ratchet sessions could not
+    /// be decoded (a field was added to `PeerSession` across an upgrade) and were dropped.
+    pub dropped: Vec<(&'static str, u32)>,
+}
+
+impl RehydrateReport {
+    fn note(&mut self, kind: &'static str) {
+        match self.dropped.iter_mut().find(|(k, _)| *k == kind) {
+            Some(e) => e.1 += 1,
+            None => self.dropped.push((kind, 1)),
+        }
+    }
+    /// Total records dropped across all kinds. `0` on a clean upgrade.
+    pub fn total(&self) -> u32 {
+        self.dropped.iter().map(|(_, n)| n).sum()
+    }
+    /// True when no persisted record failed to decode.
+    pub fn is_empty(&self) -> bool {
+        self.dropped.is_empty()
+    }
 }
 
 /// What we keep for a subscribed `hps://` topic: the content key, plus (for a service) the
@@ -626,7 +683,7 @@ impl<S: Store> Node<S> {
         // Deterministic so it survives restarts (peers cache our prekey advert).
         let prekey = identity.derive_prekey();
         let mut spk_secrets = HashMap::new();
-        spk_secrets.insert(prekey.public, prekey.secret_bytes());
+        spk_secrets.insert(prekey.public, zeroize::Zeroizing::new(prekey.secret_bytes()));
         let mut node = Self {
             identity,
             store,
@@ -652,6 +709,7 @@ impl<S: Store> Node<S> {
             recv_gradient: HashMap::new(),
             wanted_mailboxes: Vec::new(),
             sessions: HashMap::new(),
+            session_touch: HashMap::new(),
             immune: HashMap::new(),
             http_requests: Vec::new(),
             http_responses: Vec::new(),
@@ -690,6 +748,8 @@ impl<S: Store> Node<S> {
             hps_members: HashMap::new(),
             hps_adverts: HashMap::new(),
             hps_acked: std::collections::HashSet::new(),
+            priv_ingest: HashMap::new(),
+            rehydrate_report: RehydrateReport::default(),
         };
         node.rehydrate();
         node
@@ -712,16 +772,20 @@ impl<S: Store> Node<S> {
         // (DESIGN.md §32). Re-advertise discoverable ones.
         for (key, bytes) in self.store.list_kv("hps/svc/") {
             let Some(path) = key.strip_prefix("hps/svc/").map(str::to_string) else { continue };
-            if let Ok(cfg) = postcard::from_bytes::<hps::ServiceConfig>(&bytes) {
-                self.services.insert(path, cfg);
+            match postcard::from_bytes::<hps::ServiceConfig>(&bytes) {
+                Ok(cfg) => { self.services.insert(path, cfg); }
+                Err(_) => self.rehydrate_report.note("hps/svc"),
             }
         }
         // Restore subscriptions so we keep decrypting topics we follow.
         for (key, bytes) in self.store.list_kv("hps/sub/") {
             let Some(path) = key.strip_prefix("hps/sub/").map(str::to_string) else { continue };
-            if let Ok(sub) = postcard::from_bytes::<HpsSubscription>(&bytes) {
-                self.directory.subscribe(path.clone());
-                self.subscriptions.insert(path, sub);
+            match postcard::from_bytes::<HpsSubscription>(&bytes) {
+                Ok(sub) => {
+                    self.directory.subscribe(path.clone());
+                    self.subscriptions.insert(path, sub);
+                }
+                Err(_) => self.rehydrate_report.note("hps/sub"),
             }
         }
         // Restore pending join requests + the retained-member set for topics we host, so an
@@ -754,26 +818,37 @@ impl<S: Store> Node<S> {
         }
         // Restore the deferred-content queue (sent messages awaiting a prekey, §25).
         if let Some(b) = self.store.get_kv("pending_content") {
-            if let Ok(v) = postcard::from_bytes::<Vec<PendingContent>>(&b) {
-                for pc in &v { self.tx.entry(pc.display_id).or_default(); } // still "Sending…"
-                self.pending_content = v;
+            match postcard::from_bytes::<Vec<PendingContent>>(&b) {
+                Ok(v) => {
+                    for pc in &v { self.tx.entry(pc.display_id).or_default(); } // still "Sending…"
+                    self.pending_content = v;
+                }
+                // A layout change silently ate the queue before F-03; now it is counted so the
+                // host can surface "N queued sends were lost across an upgrade".
+                Err(_) => self.rehydrate_report.note("pending_content"),
             }
         }
 
         // Restore forward-secret sessions so a restart / beacon-mode relaunch resumes the
-        // ratchet instead of desyncing the peer (DESIGN.md §25).
+        // ratchet instead of desyncing the peer (DESIGN.md §25). A dropped session here is the
+        // "Securing forever" class — count it loudly rather than desyncing the peer in silence.
         for (key, bytes) in self.store.list_kv("session/") {
             let Some(b58) = key.strip_prefix("session/") else { continue };
             let Ok(addr_vec) = bs58::decode(b58).into_vec() else { continue };
             let Ok(addr) = <PubKeyBytes>::try_from(addr_vec.as_slice()) else { continue };
-            if let Ok(ps) = postcard::from_bytes::<PeerSession>(&bytes) {
-                self.sessions.insert(addr, ps);
+            match postcard::from_bytes::<PeerSession>(&bytes) {
+                Ok(ps) => {
+                    self.sessions.insert(addr, ps);
+                    self.session_touch.insert(addr, self.now_ms); // seed so GC doesn't nuke on restart
+                }
+                Err(_) => self.rehydrate_report.note("session"),
             }
         }
 
         // Re-feed persisted carrier chunks so a partial large transfer (an image whose
         // in-memory reassembly was lost to a background suspend/relaunch) resumes instead of
         // restarting — the relay only still holds the chunks we hadn't yet received (§20, §22).
+        #[allow(clippy::type_complexity)] // transient reassembly map, local to rehydrate
         let mut by_stream: std::collections::HashMap<(PubKeyBytes, StreamId), Vec<(u64, bool, Vec<u8>)>> =
             std::collections::HashMap::new();
         for (key, val) in self.store.list_kv("strm/") {
@@ -901,7 +976,8 @@ impl<S: Store> Node<S> {
             if track {
                 self.pending.insert(id, pend);
             }
-            self.offer_bundles_to_all();
+            // F-09: offer just this newly-submitted bundle to all links, not the whole store.
+            self.offer_bundle_to_all_except(id, 0);
         }
     }
 
@@ -1061,8 +1137,9 @@ impl<S: Store> Node<S> {
             &dst,
             &spk_pub,
             &wrapped,
-            Some(crypto::mailbox_tag(&spk_pub)), // mailbox-tag = the gradient key (P4 routing; P5 pull)
-            None, // sub-prefix hint (k<128) — unused for v1's full-tag prefix
+            // mailbox-tag = the gradient key (P4 routing; P5 pull). Derived from the recipient's
+            // address + current epoch (F-06), which the sender knows; rotates per epoch.
+            Some(crypto::mailbox_tag(&dst, mailbox_epoch(self.now_ms))),
             BundleOpts {
                 created_at: self.now_ms,
                 flags: BundleFlags { request_ack, ..Default::default() },
@@ -1164,6 +1241,24 @@ impl<S: Store> Node<S> {
         format!("session/{}", bs58::encode(peer).into_string())
     }
 
+    /// GC forward-secret sessions idle past [`SESSION_MAX_IDLE_MS`] — drop them from memory AND the
+    /// persisted `session/` store, so a device that meets many peers once doesn't grow that store
+    /// forever (D6). A pruned session just re-establishes (with a fresh prekey) if the peer returns.
+    fn gc_idle_sessions(&mut self) {
+        let now = self.now_ms;
+        let stale: Vec<PubKeyBytes> = self
+            .sessions
+            .keys()
+            .filter(|p| now.saturating_sub(*self.session_touch.get(*p).unwrap_or(&now)) > SESSION_MAX_IDLE_MS)
+            .copied()
+            .collect();
+        for p in stale {
+            self.sessions.remove(&p);
+            self.session_touch.remove(&p);
+            self.persist_session(&p); // None → clears the persisted `session/<b58>` entry
+        }
+    }
+
     /// Persist (or, if absent, clear) a peer's ratchet session to the store so it survives a
     /// restart / beacon-mode background-kill. Best-effort: a serialization slip mustn't break
     /// sending.
@@ -1171,11 +1266,17 @@ impl<S: Store> Node<S> {
         let key = Self::session_kv_key(peer);
         match self.sessions.get(peer) {
             Some(ps) => {
+                // D6: persist happens on establish + every ratchet advance, i.e. every session use,
+                // so this is the natural place to record "recently used" for the idle-session GC.
+                self.session_touch.insert(*peer, self.now_ms);
                 if let Ok(bytes) = postcard::to_allocvec(ps) {
                     self.store.put_kv(&key, bytes);
                 }
             }
-            None => self.store.remove_kv(&key),
+            None => {
+                self.session_touch.remove(peer);
+                self.store.remove_kv(&key);
+            }
         }
     }
 
@@ -1203,20 +1304,32 @@ impl<S: Store> Node<S> {
     /// recognizes whatever floods past. Re-published on a short interval from [`Node::tick`] so the
     /// gradient stays fresh + tracks a mobile recipient. Returns the advert id.
     pub fn publish_recv_beacon(&mut self) -> Result<AdvertId> {
-        self.advert_seq += 1;
-        let advert = Advert::publish(
-            &self.identity,
-            AdvertKind::RecvBeacon {
-                mailbox: crypto::mailbox_tag(&self.prekey.public),
-                prefix_bits: RECV_BEACON_PREFIX_BITS,
-            },
-            self.now_ms,
-            RECV_BEACON_TTL_MS,
-            self.advert_seq,
-        )?;
-        let id = advert.id;
-        self.publish(advert);
-        Ok(id)
+        // F-06: beacon the current mailbox epoch AND the past window, so a private bundle addressed
+        // or spooled under a just-rotated tag (sender a bit behind, or spooled before the boundary)
+        // is still routed and pulled. The current-epoch beacon's id is returned.
+        let addr = self.identity.address();
+        let cur = mailbox_epoch(self.now_ms);
+        let mut first_id = None;
+        for back in 0..=MAILBOX_EPOCH_WINDOW {
+            let epoch = cur.saturating_sub(back);
+            self.advert_seq += 1;
+            let advert = Advert::publish(
+                &self.identity,
+                AdvertKind::RecvBeacon { mailbox: crypto::mailbox_tag(&addr, epoch) },
+                self.now_ms,
+                RECV_BEACON_TTL_MS,
+                self.advert_seq,
+            )?;
+            let id = advert.id;
+            self.publish(advert);
+            if first_id.is_none() {
+                first_id = Some(id);
+            }
+            if epoch == 0 {
+                break; // no older epochs exist
+            }
+        }
+        first_id.ok_or(Error::Crypto("no beacon emitted"))
     }
 
     /// Whether we hold a forward-secret session with `addr` — i.e. messages to/from
@@ -1301,8 +1414,7 @@ impl<S: Store> Node<S> {
             &to,
             &spk_pub,
             &wrapped,
-            Some(crypto::mailbox_tag(&spk_pub)), // §39 P4: ride `to`'s gradient back (not blind flood)
-            None,
+            Some(crypto::mailbox_tag(&to, mailbox_epoch(self.now_ms))), // §39 P4: ride `to`'s gradient back (F-06)
             BundleOpts { created_at: self.now_ms, ..Default::default() },
         ) {
             self.last_ack.insert(for_bundle_id, self.now_ms); // throttle re-ACKs by the acked id
@@ -1342,9 +1454,9 @@ impl<S: Store> Node<S> {
                 };
                 if fresh {
                     let secret =
-                        *self.spk_secrets.get(&spk_pub).ok_or(Error::Crypto("unknown prekey"))?;
+                        self.spk_secrets.get(&spk_pub).ok_or(Error::Crypto("unknown prekey"))?.clone();
                     let root = crypto::x3dh_respond(&self.identity, &secret, &from, &ek_pub)?;
-                    let session = Session::init_responder(root, secret, spk_pub);
+                    let session = Session::init_responder(root, *secret, spk_pub);
                     self.sessions.insert(
                         from,
                         PeerSession { session, init_material: None, established_by: Some(ek_pub) },
@@ -1452,6 +1564,7 @@ impl<S: Store> Node<S> {
     /// bound" destination). The endpoint executes it against its own backend and the reply
     /// arrives as an [`HttpRespItem`] via [`Node::take_http_responses`]. Returns the
     /// request id (the response correlates by it).
+    #[allow(clippy::too_many_arguments)] // an HTTP request is inherently many fields
     pub fn send_hops_request(
         &mut self,
         endpoint: PubKeyBytes,
@@ -1569,6 +1682,14 @@ impl<S: Store> Node<S> {
         self.forwarded.insert(id, (self.identity.address(), resolver, self.now_ms));
         self.deliver(bundle);
         Some(id)
+    }
+
+    /// Persisted records that failed to decode during startup rehydrate (F-03), clearing the
+    /// tally. A non-empty result means an upgrade changed a struct's on-disk layout and dropped
+    /// state; the host should log it (e.g. "3 sessions, 1 pending send lost on upgrade") so a
+    /// silent wipe is observable. Empty on a clean start.
+    pub fn take_rehydrate_report(&mut self) -> RehydrateReport {
+        std::mem::take(&mut self.rehydrate_report)
     }
 
     /// Domains the host must look up in real DNS (the `_hopaddress.<domain>` TXT record),
@@ -2612,6 +2733,8 @@ impl<S: Store> Node<S> {
         self.relay_fwd.retain(|id, _| self.store.contains(id));
         // Expire vaccine immunity after a bundle could no longer be live (1h).
         self.immune.retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
+        // D6: GC forward-secret sessions idle past SESSION_MAX_IDLE_MS (memory + persisted store).
+        self.gc_idle_sessions();
         // Forget forwarded-route memory for bundles that can no longer ACK back (§27).
         self.forwarded.retain(|_, (_, _, t)| now_ms.saturating_sub(*t) < 3_600_000);
         // Drop abandoned half-received carrier streams (sender vanished mid-transfer), and
@@ -2662,6 +2785,8 @@ impl<S: Store> Node<S> {
         // us stays alive and re-points if we move. Passive (max-privacy) recipients skip this.
         if self.route_to_me && now_ms.saturating_sub(self.last_recv_beacon_ms) >= RECV_BEACON_REFRESH_MS {
             self.last_recv_beacon_ms = now_ms;
+            // F-06: the mailbox is now bound to our address + epoch (not the prekey), so the beacon is
+            // self-verifying at the relay — no prekey coordination needed. Emits current + window epochs.
             let _ = self.publish_recv_beacon();
         }
         // Retry any content still waiting on a prekey (it gossips, §25).
@@ -2748,6 +2873,7 @@ impl<S: Store> Node<S> {
                     self.peer_sent
                         .insert(est.peer, PeerSent { adverts: est.sent_adverts, bundles: est.sent_bundles });
                 }
+                self.priv_ingest.remove(&link); // F-07: drop the rate-limit counter for a dead link
             }
             BearerEvent::Data(link, bytes) => self.on_data(link, bytes),
         }
@@ -2936,9 +3062,31 @@ impl<S: Store> Node<S> {
         }
     }
 
+    /// F-07: fixed-window per-link rate limit for unsigned §39 private bundles. Returns false
+    /// (drop) when this link has exceeded [`MAX_PRIV_BUNDLES_PER_WINDOW`] in the current window.
+    /// `from_link == 0` is our own re-injection path (rehydrate / stream reassembly) — never limited.
+    fn allow_private_ingest(&mut self, from_link: LinkId) -> bool {
+        if from_link == 0 {
+            return true;
+        }
+        let now = self.now_ms;
+        let (start, count) = self.priv_ingest.entry(from_link).or_insert((now, 0));
+        if now.saturating_sub(*start) >= PRIV_INGEST_WINDOW_MS {
+            *start = now;
+            *count = 0;
+        }
+        *count += 1;
+        *count <= MAX_PRIV_BUNDLES_PER_WINDOW
+    }
+
     fn on_bundle(&mut self, from_link: LinkId, bundle: Bundle) {
         if bundle.verify().is_err() {
             return; // never store/relay unverifiable bundles
+        }
+        // F-07: throttle a flood of unsigned private bundles from a single link before it can
+        // touch the store, dedup table, or flood path. Signed (attributable) traffic is exempt.
+        if bundle.is_private() && !self.allow_private_ingest(from_link) {
+            return;
         }
         let id = bundle.id();
 
@@ -3240,11 +3388,8 @@ impl<S: Store> Node<S> {
                 self.prune_forwarded_if_needed();
             }
             self.evict_relayed_if_needed();
-            let links: Vec<LinkId> =
-                self.links.keys().copied().filter(|l| *l != from_link).collect();
-            for l in links {
-                self.offer_bundles_to_link(l);
-            }
+            // F-09: offer just the bundle we accepted to the other links, not the whole store.
+            self.offer_bundle_to_all_except(id, from_link);
         }
     }
 
@@ -3345,11 +3490,16 @@ impl<S: Store> Node<S> {
         // bounded relay cache). Re-gossip only when newly accepted.
         let is_prekey = matches!(advert.body.kind, AdvertKind::PreKey { .. });
         // §39 P4: a signed receiver-beacon lays/refreshes a gradient toward its mailbox via the
-        // link we heard it on. Read its fields before `ingest` consumes the advert.
+        // link we heard it on. Read its fields (and the publisher) before `ingest` consumes it.
         let beacon = match advert.body.kind {
-            AdvertKind::RecvBeacon { mailbox, .. } => {
-                Some((mailbox, advert.hops, advert.body.created_at, advert.body.ttl_ms, advert.body.seq))
-            }
+            AdvertKind::RecvBeacon { mailbox, .. } => Some((
+                mailbox,
+                advert.body.publisher,
+                advert.hops,
+                advert.body.created_at,
+                advert.body.ttl_ms,
+                advert.body.seq,
+            )),
             _ => None,
         };
         if self.directory.ingest(advert, self.now_ms).unwrap_or(false) {
@@ -3358,8 +3508,19 @@ impl<S: Store> Node<S> {
             if is_prekey {
                 self.flush_pending_content();
             }
-            if let Some((mailbox, hops, created_at, ttl_ms, seq)) = beacon {
-                self.record_gradient(mailbox, from_link, hops, created_at, ttl_ms, seq);
+            if let Some((mailbox, publisher, hops, created_at, ttl_ms, seq)) = beacon {
+                // F-05 + F-06: bind the beacon to its owner before laying a gradient. The mailbox tag
+                // is `H(address ‖ epoch)`, and a beacon is identity-signed by that address, so a node
+                // can only beacon a mailbox it can compute for ITS OWN address — an attacker can't
+                // forge a victim's mailbox because it can't sign an advert as the victim (`directory
+                // .ingest` already verified the signature, so `publisher` is authentic here). Accept
+                // the current epoch and the recent window, so a just-rotated tag still routes.
+                let cur = mailbox_epoch(self.now_ms);
+                let owns_mailbox = (0..=MAILBOX_EPOCH_WINDOW)
+                    .any(|back| crypto::mailbox_tag(&publisher, cur.saturating_sub(back)) == mailbox);
+                if owns_mailbox {
+                    self.record_gradient(mailbox, from_link, hops, created_at, ttl_ms, seq);
+                }
             }
         }
     }
@@ -3476,30 +3637,71 @@ impl<S: Store> Node<S> {
             .collect();
         loaded.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
         for (id, b, _) in loaded {
-            let Some(LinkState::Up(est)) = self.links.get(&link) else {
-                return;
-            };
-            if est.sent_bundles.contains(&id) {
-                continue;
-            }
-            let peer = est.peer;
-            // §39 P4: route a private bundle DOWN its gradient (toward the recipient) instead of
-            // blind-flooding. If we hold a live gradient for its mailbox and the next-hop link is
-            // up, send ONLY on that link — skip every other. No gradient (cold start / passive
-            // recipient) or a flapping next-hop → fall through to the epidemic flood fallback.
-            if b.is_private() {
-                if let Some(mailbox) = b.inner.private.as_ref().and_then(|p| p.mailbox) {
-                    if let Some(&entry) = self.recv_gradient.get(&mailbox) {
-                        // Only a LIVE gradient whose next hop is actually up steers the bundle; an
-                        // expired/flapping entry falls through to the flood fallback (never parks).
-                        let usable = entry.expires_at > now
-                            && matches!(self.links.get(&entry.inbound), Some(LinkState::Up(_)));
-                        if usable && link != entry.inbound {
-                            continue; // the directed copy rides only the gradient's link
-                        }
+            self.offer_one_to_link(link, id, b, me_short, me_app, now);
+        }
+    }
+
+    /// F-09: offer a SINGLE just-arrived bundle to every link (except `except`, usually the link
+    /// it arrived on), instead of rescanning the whole store per link per arrival. The old relay
+    /// hot path did `store.have()` + a `store.get` per id per link on every accepted bundle, which
+    /// under the one node Mutex was the read-storm that starved Noise handshakes ("Securing
+    /// forever"). Same spray/gradient/dedup decisions, just scoped to the one new bundle.
+    fn offer_bundle_to_all_except(&mut self, id: BundleId, except: LinkId) {
+        let Some(b) = self.store.get(&id) else { return };
+        let me_short = if self.trace_app == FABRIC_APP {
+            ShortAddr::default()
+        } else {
+            short_addr(&self.identity.address())
+        };
+        let me_app = short_app(&self.trace_app);
+        let now = self.now_ms;
+        let links: Vec<LinkId> = self.links.keys().copied().filter(|l| *l != except).collect();
+        for l in links {
+            self.offer_one_to_link(l, id, b.clone(), me_short, me_app, now);
+        }
+    }
+
+    /// Offer ONE already-loaded stored bundle to a single link, applying binary spray-and-wait,
+    /// §39 gradient steering, and per-link dedup. Extracted from `offer_bundles_to_link` so a
+    /// just-arrived bundle can be offered without a full-store rescan (F-09).
+    fn offer_one_to_link(
+        &mut self,
+        link: LinkId,
+        id: BundleId,
+        b: Bundle,
+        me_short: ShortAddr,
+        me_app: ShortApp,
+        now: u64,
+    ) {
+        // A prior link's offer in this same pass may have removed it (custody release / drop).
+        if !self.store.contains(&id) {
+            return;
+        }
+        let Some(LinkState::Up(est)) = self.links.get(&link) else {
+            return;
+        };
+        if est.sent_bundles.contains(&id) {
+            return;
+        }
+        let peer = est.peer;
+        // §39 P4: route a private bundle DOWN its gradient (toward the recipient) instead of
+        // blind-flooding. If we hold a live gradient for its mailbox and the next-hop link is
+        // up, send ONLY on that link — skip every other. No gradient (cold start / passive
+        // recipient) or a flapping next-hop → fall through to the epidemic flood fallback.
+        if b.is_private() {
+            if let Some(mailbox) = b.inner.private.as_ref().and_then(|p| p.mailbox) {
+                if let Some(&entry) = self.recv_gradient.get(&mailbox) {
+                    // Only a LIVE gradient whose next hop is actually up steers the bundle; an
+                    // expired/flapping entry falls through to the flood fallback (never parks).
+                    let usable = entry.expires_at > now
+                        && matches!(self.links.get(&entry.inbound), Some(LinkState::Up(_)));
+                    if usable && link != entry.inbound {
+                        return; // the directed copy rides only the gradient's link
                     }
                 }
             }
+        }
+        {
             let meta = BundleMeta::from(&b);
             let direct = is_for(&b, &peer);
             // If we can reach the destination directly right now, don't spray copies
@@ -3722,6 +3924,32 @@ mod tests {
     use crate::bundle::{BundleOpts, Destination, Payload};
     use crate::discover::AdvertKind;
 
+    // --- F-03: rehydrate counts (does not silently drop) undecodable persisted state --------
+    #[test]
+    fn rehydrate_reports_undecodable_records_instead_of_silently_dropping() {
+        let mut store = MemoryStore::new();
+        // Simulate a post-upgrade layout mismatch: bytes that are not a valid encoding of the
+        // struct the current build expects for these keys.
+        store.put_kv("pending_content", vec![0xff, 0xff, 0xff, 0xff]);
+        store.put_kv(
+            &format!("session/{}", bs58::encode([7u8; 32]).into_string()),
+            vec![0xde, 0xad, 0xbe, 0xef],
+        );
+        let mut node = Node::with_store(Identity::generate(), store);
+        let report = node.take_rehydrate_report();
+        assert_eq!(report.total(), 2, "both undecodable records must be counted, not dropped silently");
+        assert!(report.dropped.iter().any(|(k, _)| *k == "pending_content"));
+        assert!(report.dropped.iter().any(|(k, _)| *k == "session"));
+        // Draining clears it.
+        assert!(node.take_rehydrate_report().is_empty());
+    }
+
+    #[test]
+    fn rehydrate_report_is_empty_on_a_clean_store() {
+        let mut node = Node::new(Identity::generate());
+        assert!(node.take_rehydrate_report().is_empty());
+    }
+
     /// In-memory test fabric: pump nodes until quiescent, routing each node's
     /// outgoing bytes to the peer on the matching link id.
     struct Wire2 {
@@ -3887,6 +4115,29 @@ mod tests {
         // The response is the return-path delete: the request no longer lingers in our
         // store (service calls carry no ACK-vaccine, so without this it would pin forever).
         assert!(!nodes[0].store.contains(&req_id), "request purged once its response arrives");
+    }
+
+    #[test]
+    fn idle_sessions_are_gc_d_from_memory_and_store() {
+        // D6: a forward-secret session unused past the horizon is dropped from memory AND the
+        // persisted `session/` store, so meeting many peers once doesn't grow storage forever.
+        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut nodes);
+        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[1].take_inbox() { let _ = nodes[1].read_message(&b); }
+
+        let a = nodes[0].address();
+        assert!(nodes[1].has_session(&a), "B established a session with A");
+        let key = format!("session/{}", bs58::encode(a).into_string());
+        assert!(nodes[1].store.get_kv(&key).is_some(), "session persisted");
+
+        // Idle past the GC horizon → the next tick prunes it (memory + store).
+        nodes[1].tick(SESSION_MAX_IDLE_MS + 1);
+        assert!(!nodes[1].has_session(&a), "idle session GC'd from memory");
+        assert!(nodes[1].store.get_kv(&key).is_none(), "idle session cleared from the store");
     }
 
     #[test]
@@ -4418,7 +4669,7 @@ mod tests {
         net.pump(&mut nodes);
 
         // R laid a gradient toward B's mailbox, pointing at the R—B link (R's link 2).
-        let bmail = crypto::mailbox_tag(&nodes[2].prekey.public);
+        let bmail = crypto::mailbox_tag(&nodes[2].address(), 0);
         let g = nodes[1].recv_gradient.get(&bmail).expect("R holds a gradient toward B");
         assert_eq!(g.inbound, 2, "gradient points down the R—B link, not R—A/R—D");
 
@@ -4431,13 +4682,90 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_tag_rotates_per_epoch_and_beacon_covers_the_recent_window() {
+        // F-06: the pull pseudonym rotates each epoch (a global observer can't correlate across epochs).
+        let bob = Identity::generate();
+        assert_ne!(
+            crypto::mailbox_tag(&bob.address(), 5),
+            crypto::mailbox_tag(&bob.address(), 6),
+            "a recipient's mailbox-tag must differ across epochs"
+        );
+
+        // With every node advanced into epoch 1, B's beacon lays a gradient for BOTH the current
+        // (epoch 1) and previous (epoch 0) mailbox tags — so a bundle addressed just before the
+        // rotation boundary (sender a bit behind) still routes instead of being stranded.
+        let (mut nodes, mut net) = gradient_topology(); // A, R, B, D ; prekeys already exchanged
+        for n in nodes.iter_mut() {
+            n.tick(MAILBOX_EPOCH_MS); // all clocks in epoch 1
+        }
+        let baddr = nodes[2].address();
+        nodes[2].publish_recv_beacon().unwrap();
+        net.pump(&mut nodes);
+
+        assert!(
+            nodes[1].recv_gradient.contains_key(&crypto::mailbox_tag(&baddr, 1)),
+            "relay holds a gradient for B's current-epoch mailbox"
+        );
+        assert!(
+            nodes[1].recv_gradient.contains_key(&crypto::mailbox_tag(&baddr, 0)),
+            "relay ALSO holds a gradient for B's previous-epoch mailbox (the window)"
+        );
+    }
+
+    #[test]
+    fn beacon_cannot_hijack_another_nodes_mailbox() {
+        // F-05: a beacon signed by a NON-owner must not lay a gradient for a victim's mailbox.
+        // The mailbox tag is H(SPK) and the SPK is public, so Mallory can name B's mailbox — but
+        // the gradient only installs if the mailbox matches the *publisher's own* prekey.
+        let (mut nodes, mut net) = gradient_topology();
+        let bmail = crypto::mailbox_tag(&nodes[2].address(), 0); // B's mailbox
+        let now = nodes[1].now_ms;
+
+        // Mallory is a participant R knows (R has her legit prekey), but she is not B.
+        let mallory = Identity::generate();
+        let mspk = mallory.derive_prekey();
+        let pk = Advert::publish(
+            &mallory,
+            AdvertKind::PreKey { spk_pub: mspk.public, spk_sig: mspk.sig.to_vec() },
+            now,
+            10_000_000,
+            1,
+        )
+        .unwrap();
+        nodes[1].on_advert(3, mallory.address(), pk);
+
+        // Mallory forges a receiver-beacon claiming B's mailbox, signed with her own identity.
+        let forged = Advert::publish(
+            &mallory,
+            AdvertKind::RecvBeacon { mailbox: bmail },
+            now,
+            10_000_000,
+            2,
+        )
+        .unwrap();
+        nodes[1].on_advert(3, mallory.address(), forged);
+        assert!(
+            !nodes[1].recv_gradient.contains_key(&bmail),
+            "a beacon signed by a non-owner must NOT lay a gradient for the victim's mailbox"
+        );
+
+        // Control: B's own beacon still lays the gradient (the fix doesn't break legit beacons).
+        nodes[2].publish_recv_beacon().unwrap();
+        net.pump(&mut nodes);
+        assert!(
+            nodes[1].recv_gradient.contains_key(&bmail),
+            "B's own beacon (mailbox matches B's prekey) still lays the gradient"
+        );
+    }
+
+    #[test]
     fn private_bundle_floods_as_fallback_without_a_gradient() {
         // No beacon ⇒ no gradient ⇒ R falls back to the epidemic flood, so the decoy D DOES
         // receive (+ stores) a copy it can't open. This is the contrast that proves the gradient
         // is what makes routing directed — and that delivery still works on the cold-start floor.
         let (mut nodes, mut net) = gradient_topology();
 
-        let bmail = crypto::mailbox_tag(&nodes[2].prekey.public);
+        let bmail = crypto::mailbox_tag(&nodes[2].address(), 0);
         assert!(!nodes[1].recv_gradient.contains_key(&bmail), "no beacon → no gradient at R");
 
         let bob = nodes[2].address();
@@ -4455,7 +4783,7 @@ mod tests {
         let (mut nodes, mut net) = gradient_topology();
         nodes[2].publish_recv_beacon().unwrap();
         net.pump(&mut nodes);
-        let bmail = crypto::mailbox_tag(&nodes[2].prekey.public);
+        let bmail = crypto::mailbox_tag(&nodes[2].address(), 0);
         assert!(nodes[1].recv_gradient.contains_key(&bmail), "gradient laid");
 
         // Advance every node past the beacon TTL with no refresh; tick prunes the dead entry.
@@ -4481,7 +4809,7 @@ mod tests {
         // (the want-beacon → the host reloads the durable spool), and the bundle is no longer
         // spoolable — P4 now owns it (spool XOR live-route, no double-send).
         let bob = Identity::generate();
-        let bob_mailbox = crypto::mailbox_tag(&bob.derive_prekey().public);
+        let bob_mailbox = crypto::mailbox_tag(&bob.address(), 0);
 
         // A private bundle sealed to bob + stamped with bob's mailbox-tag (as dispatch_private does).
         let pb = Bundle::create_private(
@@ -4489,7 +4817,6 @@ mod tests {
             &bob.derive_prekey().public,
             &Payload::PeerMessage { content_type: "t".into(), body: b"offline".to_vec() },
             Some(bob_mailbox),
-            None,
             BundleOpts::default(),
         )
         .unwrap();
@@ -4504,10 +4831,14 @@ mod tests {
         assert_eq!((s[0].0, s[0].1), (pid, bob_mailbox), "keyed by bob's mailbox-tag");
         assert!(relay.undeliverable_device_bundles().is_empty(), "a Broadcast private bundle never rides the device handoff");
 
-        // Bob comes online behind the relay and beacons (the want-beacon).
+        // Bob comes online behind the relay and beacons (the want-beacon). He publishes his
+        // prekey too (as every real node does on startup), so the relay can bind his mailbox to
+        // its owner before laying a gradient (F-05 — a beacon whose owner is unknown is dropped).
         let mut nodes = [relay, Node::from_identity_secret(&bob.to_secret_bytes())];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1); // relay <-> bob
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes); // relay learns bob's prekey
         nodes[1].publish_recv_beacon().unwrap();
         net.pump(&mut nodes);
 

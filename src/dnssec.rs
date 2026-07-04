@@ -7,9 +7,15 @@
 //! (RRSIG → DNSKEY → DS → … → root) against a baked-in root trust anchor.
 //!
 //! Scope of this module: the verification primitives — RRSIG signature checking, DNSKEY key
-//! tags, and DS digests — for **RSA/SHA-256 (algorithm 8)**, which is what the `.sh` / `hopme.sh`
-//! / root chain uses today. ECDSA P-256 (alg 13) and Ed25519 (alg 15) are TODO. The chain
-//! walk that strings these together up to [`ROOT_ANCHORS`] builds on top.
+//! tags, and DS digests. Supported algorithms: **RSA/SHA-256 (alg 8, ≥2048-bit modulus enforced)**,
+//! **ECDSA P-256/SHA-256 (alg 13)**, and **Ed25519 (alg 15, RFC 8080)**. The chain walk that strings
+//! these together up to [`ROOT_ANCHORS`] builds on top.
+//!
+//! FAIL-CLOSED gaps (documented, not silent): wildcard-label expansion and NSEC/NSEC3 denial-of-
+//! existence are NOT implemented, and only the first matching key tag is tried. All of these only
+//! ever cause a valid name to fail to validate — none lets a forged record through — so a resolver
+//! treats them as "unresolved", never as "trusted". They matter only when `hops://` opens to
+//! third-party domains (today the only `_hopaddress` zone is the project's own, non-wildcard).
 
 use rsa::{BigUint, Pkcs1v15Sign, RsaPublicKey};
 use sha2::{Digest, Sha256};
@@ -90,6 +96,13 @@ impl Dnskey {
         }
         let exponent = BigUint::from_bytes_be(&k[off..off + exp_len]);
         let modulus = BigUint::from_bytes_be(&k[off + exp_len..]);
+        // D-dnssec: reject sub-1024-bit RSA moduli (512/768-bit keys are factorable, so a forged
+        // chain could validate). Fail closed rather than trust a trivially-weak signer. 1024 is the
+        // floor rather than 2048 because many real zones still sign ZSKs at 1024 bits — a 2048 floor
+        // would refuse to resolve legitimate domains (fail-closed, but a false negative).
+        if modulus.bits() < 1024 {
+            return Err(DnssecError::Malformed("RSA modulus below 1024 bits"));
+        }
         RsaPublicKey::new(modulus, exponent).map_err(|_| DnssecError::Malformed("bad RSA key"))
     }
 }
@@ -177,6 +190,23 @@ pub fn verify_rrsig(rrset: &[Rr], rrsig: &Rrsig, key: &Dnskey) -> Result<(), Dns
             let sig = Signature::from_slice(&rrsig.signature)
                 .map_err(|_| DnssecError::Malformed("bad P-256 signature"))?;
             vk.verify(&data, &sig).map_err(|_| DnssecError::BadSignature)
+        }
+        ALG_ED25519 => {
+            // RFC 8080: DNSKEY carries the raw 32-byte Ed25519 public key; the RRSIG is a 64-byte
+            // PURE Ed25519 signature over the signed data (no pre-hash). (D-dnssec.)
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            let kb: [u8; 32] = key
+                .public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| DnssecError::Malformed("bad Ed25519 key length"))?;
+            let vk = VerifyingKey::from_bytes(&kb).map_err(|_| DnssecError::Malformed("bad Ed25519 key"))?;
+            let sb: [u8; 64] = rrsig
+                .signature
+                .as_slice()
+                .try_into()
+                .map_err(|_| DnssecError::Malformed("bad Ed25519 signature length"))?;
+            vk.verify(&data, &Signature::from_bytes(&sb)).map_err(|_| DnssecError::BadSignature)
         }
         other => Err(DnssecError::Unsupported(other)),
     }
@@ -470,7 +500,7 @@ fn b64d(s: &str) -> Option<Vec<u8>> {
 
 fn hexd(s: &str) -> Option<Vec<u8>> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -835,7 +865,7 @@ mod tests {
             signer_name: name_to_wire(zone),
             signature: Vec::new(),
         };
-        let digest = Sha256::digest(&signed_data(&rrsig, rrset));
+        let digest = Sha256::digest(signed_data(&rrsig, rrset));
         rrsig.signature = sk.sign(Sign::new::<Sha256>(), &digest).unwrap();
         rrsig
     }
@@ -855,7 +885,7 @@ mod tests {
 
         // Leaf record: the _hopaddress TXT, signed by the zone ZSK.
         let rec = Rr { owner: name_to_wire("_hopaddress.example"), rtype: 16, class: 1, rdata: txt_rdata(value) };
-        let record_rrsig = sign(&zone_zsk_sk, &zone_zsk, "example", &[rec.clone()], 16, 2, now);
+        let record_rrsig = sign(&zone_zsk_sk, &zone_zsk, "example", std::slice::from_ref(&rec), 16, 2, now);
 
         // Zone DNSKEY set self-signed by the zone KSK.
         let zone_keys = vec![zone_ksk.clone(), zone_zsk.clone()];
@@ -988,10 +1018,41 @@ mod tests {
             signature: Vec::new(),
         };
         let rr = Rr { owner: name_to_wire("_x.example"), rtype: 16, class: 1, rdata: txt_rdata("hi") };
-        let sig: Signature = sk.sign(&signed_data(&rrsig, &[rr.clone()]));
+        let sig: Signature = sk.sign(&signed_data(&rrsig, std::slice::from_ref(&rr)));
         rrsig.signature = sig.to_bytes().to_vec();
 
-        verify_rrsig(&[rr.clone()], &rrsig, &dnskey).expect("ECDSA P-256 RRSIG must verify");
+        verify_rrsig(std::slice::from_ref(&rr), &rrsig, &dnskey).expect("ECDSA P-256 RRSIG must verify");
+
+        let bad = Rr { owner: name_to_wire("_x.example"), rtype: 16, class: 1, rdata: txt_rdata("xx") };
+        assert_eq!(verify_rrsig(&[bad], &rrsig, &dnskey), Err(DnssecError::BadSignature));
+    }
+
+    #[test]
+    fn verifies_ed25519_rrsig() {
+        // D-dnssec: Ed25519 (alg 15, RFC 8080) — DNSKEY carries the raw 32-byte public key, the
+        // RRSIG is a 64-byte pure Ed25519 signature over the signed data.
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::generate(&mut rand_core::OsRng);
+        let dnskey = Dnskey {
+            flags: 256,
+            protocol: 3,
+            algorithm: ALG_ED25519,
+            public_key: sk.verifying_key().to_bytes().to_vec(),
+        };
+        let mut rrsig = Rrsig {
+            type_covered: 16,
+            algorithm: ALG_ED25519,
+            labels: 2,
+            original_ttl: 300,
+            sig_inception: 1,
+            sig_expiration: u32::MAX,
+            key_tag: dnskey.key_tag(),
+            signer_name: name_to_wire("example"),
+            signature: Vec::new(),
+        };
+        let rr = Rr { owner: name_to_wire("_x.example"), rtype: 16, class: 1, rdata: txt_rdata("hi") };
+        rrsig.signature = sk.sign(&signed_data(&rrsig, std::slice::from_ref(&rr))).to_bytes().to_vec();
+        verify_rrsig(std::slice::from_ref(&rr), &rrsig, &dnskey).expect("Ed25519 RRSIG must verify");
 
         let bad = Rr { owner: name_to_wire("_x.example"), rtype: 16, class: 1, rdata: txt_rdata("xx") };
         assert_eq!(verify_rrsig(&[bad], &rrsig, &dnskey), Err(DnssecError::BadSignature));
