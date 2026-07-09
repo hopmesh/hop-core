@@ -50,14 +50,24 @@ impl AppKeys {
     /// The reserved fabric namespace: open by design (no secret), so peer discovery / prekeys
     /// flood across every app. Discovery confidentiality and handshake proofs are disabled.
     pub fn fabric() -> Self {
-        Self { secret: [0u8; 32], id: FABRIC_APP, disc_key: None, mac_key: None }
+        Self {
+            secret: [0u8; 32],
+            id: FABRIC_APP,
+            disc_key: None,
+            mac_key: None,
+        }
     }
 
     /// A label-only app id with no secret key material — used by infra (the relay daemon) to
     /// stamp a recognizable [`AppId`] on trace hops without enabling `hps://` isolation (a relay
     /// carries every app's traffic regardless). Behaves like the fabric for isolation purposes.
     pub fn label_only(id: AppId) -> Self {
-        Self { secret: [0u8; 32], id, disc_key: None, mac_key: None }
+        Self {
+            secret: [0u8; 32],
+            id,
+            disc_key: None,
+            mac_key: None,
+        }
     }
 
     /// True if this is the open fabric namespace (no app isolation).
@@ -164,7 +174,7 @@ mod tests {
         assert!(app.verify_join_proof(&proof, "lobby", &who, 101)); // previous-bucket tolerance
         assert!(!app.verify_join_proof(&proof, "lobby", &who, 200)); // too old
         assert!(!app.verify_join_proof(&proof, "other", &who, 100)); // wrong path
-        // A foreign app can't forge a proof this host accepts.
+                                                                     // A foreign app can't forge a proof this host accepts.
         let forged = foreign.join_proof("lobby", &who, 100);
         assert!(!app.verify_join_proof(&forged, "lobby", &who, 100));
     }

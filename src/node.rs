@@ -19,22 +19,22 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::bundle::{
-    Bundle, BundleFlags, BundleId, BundleOpts, Destination, Payload, StreamId,
+use crate::app::AppKeys;
+use crate::bundle::{Bundle, BundleFlags, BundleId, BundleOpts, Destination, Payload, StreamId};
+use crate::crypto::{
+    self, short_addr, Identity, PubKeyBytes, ShortAddr, SignedPreKey, Tag, XPubKeyBytes,
 };
-use crate::stream::StreamReassembler;
-use crate::crypto::{self, short_addr, Identity, PubKeyBytes, ShortAddr, SignedPreKey, Tag, XPubKeyBytes};
-use crate::error::{Error, Result};
-use crate::dnssec;
-use crate::hps;
 use crate::discover::{Advert, AdvertId, AdvertKind, Directory};
+use crate::dnssec;
+use crate::error::{Error, Result};
+use crate::hps;
 use crate::link::{BearerEvent, LinkHandshake, LinkId, LinkSession, Role};
 use crate::route::RouteTable;
 use crate::routing::{BundleMeta, ForwardDecision, Router, SprayAndWait};
-use crate::{short_app, AppId, ShortApp, FABRIC_APP};
-use crate::app::AppKeys;
 use crate::session::Session;
 use crate::store::{MemoryStore, Store};
+use crate::stream::StreamReassembler;
+use crate::{short_app, AppId, ShortApp, FABRIC_APP};
 
 /// A link packet on the wire: a Noise handshake message, or an encrypted record.
 #[derive(Serialize, Deserialize)]
@@ -46,7 +46,11 @@ enum LinkPacket {
     /// so the receiver decrypts in order and concatenates the plaintext before decoding the
     /// [`Wire`]. Without this, an oversized record (e.g. a large `hps://` broadcast) would be
     /// silently dropped at `encrypt` (DESIGN.md §20).
-    DataFrag { idx: u16, cnt: u16, ct: Vec<u8> },
+    DataFrag {
+        idx: u16,
+        cnt: u16,
+        ct: Vec<u8>,
+    },
 }
 
 /// Max plaintext bytes per Noise transport message. Noise caps a message at 65535 bytes
@@ -475,6 +479,14 @@ pub struct Node<S: Store = MemoryStore> {
     /// drop them on sight so a delivered message stops propagating (epidemic
     /// recovery, DESIGN.md §6). Pruned by age in [`Node::tick`].
     immune: HashMap<BundleId, u64>,
+    /// Observability for the sim/debug wrapper: when `observe` is on, each bundle sent over a link
+    /// is recorded as (link, bundle_id, is_final_delivery), drained via [`Node::drain_transfers`].
+    /// Never enabled in production; zero cost when off.
+    observe: bool,
+    transfers: Vec<(LinkId, BundleId, bool)>,
+    sends_delivered: Vec<BundleId>,
+    default_lifetime_ms: u32,
+    beaconed_tick: bool,
     /// Egress HTTP requests addressed to us (as a gateway) awaiting fulfillment (§9).
     http_requests: Vec<HttpReqItem>,
     /// HTTP responses sealed back to us (as a requester).
@@ -683,7 +695,10 @@ impl<S: Store> Node<S> {
         // Deterministic so it survives restarts (peers cache our prekey advert).
         let prekey = identity.derive_prekey();
         let mut spk_secrets = HashMap::new();
-        spk_secrets.insert(prekey.public, zeroize::Zeroizing::new(prekey.secret_bytes()));
+        spk_secrets.insert(
+            prekey.public,
+            zeroize::Zeroizing::new(prekey.secret_bytes()),
+        );
         let mut node = Self {
             identity,
             store,
@@ -711,6 +726,11 @@ impl<S: Store> Node<S> {
             sessions: HashMap::new(),
             session_touch: HashMap::new(),
             immune: HashMap::new(),
+            observe: false,
+            transfers: Vec::new(),
+            sends_delivered: Vec::new(),
+            default_lifetime_ms: BundleOpts::default().lifetime_ms,
+            beaconed_tick: false,
             http_requests: Vec::new(),
             http_responses: Vec::new(),
             routes: RouteTable::new(DEFAULT_MAX_ROUTES),
@@ -771,15 +791,21 @@ impl<S: Store> Node<S> {
         // Restore hosted hps topics (their keys + access/visibility) so they survive a restart
         // (DESIGN.md §32). Re-advertise discoverable ones.
         for (key, bytes) in self.store.list_kv("hps/svc/") {
-            let Some(path) = key.strip_prefix("hps/svc/").map(str::to_string) else { continue };
+            let Some(path) = key.strip_prefix("hps/svc/").map(str::to_string) else {
+                continue;
+            };
             match postcard::from_bytes::<hps::ServiceConfig>(&bytes) {
-                Ok(cfg) => { self.services.insert(path, cfg); }
+                Ok(cfg) => {
+                    self.services.insert(path, cfg);
+                }
                 Err(_) => self.rehydrate_report.note("hps/svc"),
             }
         }
         // Restore subscriptions so we keep decrypting topics we follow.
         for (key, bytes) in self.store.list_kv("hps/sub/") {
-            let Some(path) = key.strip_prefix("hps/sub/").map(str::to_string) else { continue };
+            let Some(path) = key.strip_prefix("hps/sub/").map(str::to_string) else {
+                continue;
+            };
             match postcard::from_bytes::<HpsSubscription>(&bytes) {
                 Ok(sub) => {
                     self.directory.subscribe(path.clone());
@@ -791,13 +817,19 @@ impl<S: Store> Node<S> {
         // Restore pending join requests + the retained-member set for topics we host, so an
         // approval (and a later rekey) still works after a restart (DESIGN.md §32).
         for (key, bytes) in self.store.list_kv("hps/pending/") {
-            let Some(path) = key.strip_prefix("hps/pending/").map(str::to_string) else { continue };
+            let Some(path) = key.strip_prefix("hps/pending/").map(str::to_string) else {
+                continue;
+            };
             if let Ok(q) = postcard::from_bytes::<Vec<PubKeyBytes>>(&bytes) {
-                if !q.is_empty() { self.hps_pending.insert(path, q); }
+                if !q.is_empty() {
+                    self.hps_pending.insert(path, q);
+                }
             }
         }
         for (key, bytes) in self.store.list_kv("hps/members/") {
-            let Some(path) = key.strip_prefix("hps/members/").map(str::to_string) else { continue };
+            let Some(path) = key.strip_prefix("hps/members/").map(str::to_string) else {
+                continue;
+            };
             if let Ok(m) = postcard::from_bytes::<Vec<PubKeyBytes>>(&bytes) {
                 self.hps_members.insert(path, m.into_iter().collect());
             }
@@ -805,22 +837,34 @@ impl<S: Store> Node<S> {
         // Restore received/outstanding invites (§32).
         if let Some(b) = self.store.get_kv("hps/invites_in") {
             if let Ok(v) = postcard::from_bytes::<Vec<(String, PubKeyBytes, bool)>>(&b) {
-                self.hps_invites_in = v.into_iter().map(|(path, host, ch)| HpsInviteItem {
-                    path, host,
-                    kind: if ch { hps::ServiceKind::Channel } else { hps::ServiceKind::Service },
-                }).collect();
+                self.hps_invites_in = v
+                    .into_iter()
+                    .map(|(path, host, ch)| HpsInviteItem {
+                        path,
+                        host,
+                        kind: if ch {
+                            hps::ServiceKind::Channel
+                        } else {
+                            hps::ServiceKind::Service
+                        },
+                    })
+                    .collect();
             }
         }
         if let Some(b) = self.store.get_kv("hps/invites_out") {
             if let Ok(v) = postcard::from_bytes::<Vec<(String, PubKeyBytes)>>(&b) {
-                for k in v { self.hps_invites_out.insert(k, 0); }
+                for k in v {
+                    self.hps_invites_out.insert(k, 0);
+                }
             }
         }
         // Restore the deferred-content queue (sent messages awaiting a prekey, §25).
         if let Some(b) = self.store.get_kv("pending_content") {
             match postcard::from_bytes::<Vec<PendingContent>>(&b) {
                 Ok(v) => {
-                    for pc in &v { self.tx.entry(pc.display_id).or_default(); } // still "Sending…"
+                    for pc in &v {
+                        self.tx.entry(pc.display_id).or_default();
+                    } // still "Sending…"
                     self.pending_content = v;
                 }
                 // A layout change silently ate the queue before F-03; now it is counted so the
@@ -833,9 +877,15 @@ impl<S: Store> Node<S> {
         // ratchet instead of desyncing the peer (DESIGN.md §25). A dropped session here is the
         // "Securing forever" class — count it loudly rather than desyncing the peer in silence.
         for (key, bytes) in self.store.list_kv("session/") {
-            let Some(b58) = key.strip_prefix("session/") else { continue };
-            let Ok(addr_vec) = bs58::decode(b58).into_vec() else { continue };
-            let Ok(addr) = <PubKeyBytes>::try_from(addr_vec.as_slice()) else { continue };
+            let Some(b58) = key.strip_prefix("session/") else {
+                continue;
+            };
+            let Ok(addr_vec) = bs58::decode(b58).into_vec() else {
+                continue;
+            };
+            let Ok(addr) = <PubKeyBytes>::try_from(addr_vec.as_slice()) else {
+                continue;
+            };
             match postcard::from_bytes::<PeerSession>(&bytes) {
                 Ok(ps) => {
                     self.sessions.insert(addr, ps);
@@ -849,14 +899,20 @@ impl<S: Store> Node<S> {
         // in-memory reassembly was lost to a background suspend/relaunch) resumes instead of
         // restarting — the relay only still holds the chunks we hadn't yet received (§20, §22).
         #[allow(clippy::type_complexity)] // transient reassembly map, local to rehydrate
-        let mut by_stream: std::collections::HashMap<(PubKeyBytes, StreamId), Vec<(u64, bool, Vec<u8>)>> =
-            std::collections::HashMap::new();
+        let mut by_stream: std::collections::HashMap<
+            (PubKeyBytes, StreamId),
+            Vec<(u64, bool, Vec<u8>)>,
+        > = std::collections::HashMap::new();
         for (key, val) in self.store.list_kv("strm/") {
             if val.is_empty() {
                 continue;
             }
             if let Some((from, sid, seq)) = parse_stream_key(&key) {
-                by_stream.entry((from, sid)).or_default().push((seq, val[0] != 0, val[1..].to_vec()));
+                by_stream.entry((from, sid)).or_default().push((
+                    seq,
+                    val[0] != 0,
+                    val[1..].to_vec(),
+                ));
             }
         }
         for ((from, sid), mut chunks) in by_stream {
@@ -872,7 +928,9 @@ impl<S: Store> Node<S> {
 
         let me = self.address();
         for id in self.store.have().ids {
-            let Some(b) = self.store.get(&id) else { continue };
+            let Some(b) = self.store.get(&id) else {
+                continue;
+            };
             if b.inner.src == me && !b.inner.flags.is_ack {
                 // Our own message that wasn't yet ACKed (delivered ones were purged).
                 self.tx.entry(id).or_default();
@@ -1064,7 +1122,13 @@ impl<S: Store> Node<S> {
     ) -> BundleId {
         self.pending_seq += 1;
         let h = blake3::hash(
-            &[&dst[..], content_type.as_bytes(), &body, &self.pending_seq.to_be_bytes()].concat(),
+            &[
+                &dst[..],
+                content_type.as_bytes(),
+                &body,
+                &self.pending_seq.to_be_bytes(),
+            ]
+            .concat(),
         );
         let display_id: BundleId = *h.as_bytes();
         self.tx.entry(display_id).or_default(); // shows as Sending… until ratcheted
@@ -1097,7 +1161,10 @@ impl<S: Store> Node<S> {
             &payload,
             BundleOpts {
                 created_at: self.now_ms,
-                flags: BundleFlags { request_ack, ..Default::default() },
+                flags: BundleFlags {
+                    request_ack,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )?;
@@ -1107,8 +1174,9 @@ impl<S: Store> Node<S> {
             self.tx_alias.insert(real, display);
         }
         self.tx.entry(display).or_default(); // track delivery status for the UI
-        // Remember our own send so the returning delivery-ACK teaches us the route (§27).
-        self.forwarded.insert(real, (self.identity.address(), dst, self.now_ms));
+                                             // Remember our own send so the returning delivery-ACK teaches us the route (§27).
+        self.forwarded
+            .insert(real, (self.identity.address(), dst, self.now_ms));
         self.deliver(bundle);
         Ok(display)
     }
@@ -1128,8 +1196,10 @@ impl<S: Store> Node<S> {
         request_ack: bool,
         display_id: Option<BundleId>,
     ) -> Result<BundleId> {
-        let wrapped =
-            Payload::Private { sender: self.identity.address(), inner: Box::new(inner) };
+        let wrapped = Payload::Private {
+            sender: self.identity.address(),
+            inner: Box::new(inner),
+        };
         // §39 P4: stamp the recipient's mailbox-tag so a node holding a gradient toward it can
         // route this bundle there (instead of blind-flooding) — without any cleartext dst. The
         // sender already has `spk_pub`, so it computes the SAME tag the recipient beacons.
@@ -1142,7 +1212,11 @@ impl<S: Store> Node<S> {
             Some(crypto::mailbox_tag(&dst, mailbox_epoch(self.now_ms))),
             BundleOpts {
                 created_at: self.now_ms,
-                flags: BundleFlags { request_ack, ..Default::default() },
+                lifetime_ms: self.default_lifetime_ms,
+                flags: BundleFlags {
+                    request_ack,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )?;
@@ -1166,7 +1240,11 @@ impl<S: Store> Node<S> {
         for pc in std::mem::take(&mut self.pending_content) {
             // A §39 private send also needs the recipient's prekey for its recognition tag —
             // resolve it before encrypting so we never advance the ratchet only to re-defer.
-            let spk_pub = if pc.private { self.directory.prekey(&pc.dst).map(|b| b.spk_pub) } else { None };
+            let spk_pub = if pc.private {
+                self.directory.prekey(&pc.dst).map(|b| b.spk_pub)
+            } else {
+                None
+            };
             if pc.private && spk_pub.is_none() {
                 still.push(pc); // no prekey yet → keep waiting (it gossips, §25)
                 continue;
@@ -1174,11 +1252,16 @@ impl<S: Store> Node<S> {
             match self.session_payload(&pc.dst, pc.content_type.clone(), pc.body.clone()) {
                 Ok(Some(payload)) if pc.private => {
                     let _ = self.dispatch_private(
-                        pc.dst, spk_pub.unwrap(), payload, pc.request_ack, Some(pc.display_id),
+                        pc.dst,
+                        spk_pub.unwrap(),
+                        payload,
+                        pc.request_ack,
+                        Some(pc.display_id),
                     );
                 }
                 Ok(Some(payload)) => {
-                    let _ = self.dispatch_content(pc.dst, payload, pc.request_ack, Some(pc.display_id));
+                    let _ =
+                        self.dispatch_content(pc.dst, payload, pc.request_ack, Some(pc.display_id));
                 }
                 _ => still.push(pc), // still no prekey → keep waiting (it gossips, §25)
             }
@@ -1209,7 +1292,11 @@ impl<S: Store> Node<S> {
             let inner = postcard::to_allocvec(&SessionInner { content_type, body })?;
             let msg = ps.session.encrypt(&inner)?;
             let out = match ps.init_material {
-                Some((ek_pub, spk_pub)) => Payload::SessionInit { ek_pub, spk_pub, msg },
+                Some((ek_pub, spk_pub)) => Payload::SessionInit {
+                    ek_pub,
+                    spk_pub,
+                    msg,
+                },
                 None => Payload::SessionMessage { msg },
             };
             self.persist_session(dst); // ratchet advanced — save it (survives restart)
@@ -1230,7 +1317,11 @@ impl<S: Store> Node<S> {
                 },
             );
             self.persist_session(dst);
-            return Ok(Some(Payload::SessionInit { ek_pub, spk_pub: bundle.spk_pub, msg }));
+            return Ok(Some(Payload::SessionInit {
+                ek_pub,
+                spk_pub: bundle.spk_pub,
+                msg,
+            }));
         }
         // No prekey yet → defer (never static-seal content).
         Ok(None)
@@ -1249,7 +1340,10 @@ impl<S: Store> Node<S> {
         let stale: Vec<PubKeyBytes> = self
             .sessions
             .keys()
-            .filter(|p| now.saturating_sub(*self.session_touch.get(*p).unwrap_or(&now)) > SESSION_MAX_IDLE_MS)
+            .filter(|p| {
+                now.saturating_sub(*self.session_touch.get(*p).unwrap_or(&now))
+                    > SESSION_MAX_IDLE_MS
+            })
             .copied()
             .collect();
         for p in stale {
@@ -1287,7 +1381,10 @@ impl<S: Store> Node<S> {
         self.advert_seq += 1;
         let advert = Advert::publish(
             &self.identity,
-            AdvertKind::PreKey { spk_pub: self.prekey.public, spk_sig: self.prekey.sig.to_vec() },
+            AdvertKind::PreKey {
+                spk_pub: self.prekey.public,
+                spk_sig: self.prekey.sig.to_vec(),
+            },
             self.now_ms,
             PREKEY_TTL_MS,
             self.advert_seq,
@@ -1315,7 +1412,9 @@ impl<S: Store> Node<S> {
             self.advert_seq += 1;
             let advert = Advert::publish(
                 &self.identity,
-                AdvertKind::RecvBeacon { mailbox: crypto::mailbox_tag(&addr, epoch) },
+                AdvertKind::RecvBeacon {
+                    mailbox: crypto::mailbox_tag(&addr, epoch),
+                },
                 self.now_ms,
                 RECV_BEACON_TTL_MS,
                 self.advert_seq,
@@ -1348,7 +1447,34 @@ impl<S: Store> Node<S> {
     /// past. (We keep retired prekey secrets in `spk_secrets`, so a message in flight when we
     /// rotated is still recognized.)
     fn recognizes(&self, bundle: &Bundle) -> bool {
-        self.spk_secrets.values().any(|secret| bundle.recognized_by(secret))
+        self.spk_secrets
+            .values()
+            .any(|secret| bundle.recognized_by(secret))
+    }
+
+    /// The recognition token (ephemeral·SPK DH `shared`) for a private bundle we recognize — the value
+    /// revealed in a delivery vaccine so relays can verify + drop their copy. `None` if not ours.
+    fn vaccine_token_for(&self, bundle: &Bundle) -> Option<[u8; 32]> {
+        let ph = bundle.inner.private.as_ref()?;
+        self.spk_secrets
+            .values()
+            .find(|secret| bundle.recognized_by(secret))
+            .map(|secret| crypto::recognition_shared(secret, &ph.ephemeral))
+    }
+
+    /// §39: flood a delivery vaccine for `delivered`, revealing `token`, so every relay carrying a copy
+    /// verifies it against the tag it stores and drops it. Outlives the message so it can chase the tail.
+    fn emit_vaccine(&mut self, delivered: BundleId, token: [u8; 32]) {
+        let bundle = Bundle::create_vaccine(
+            delivered,
+            token,
+            BundleOpts {
+                created_at: self.now_ms,
+                lifetime_ms: self.default_lifetime_ms,
+                ..Default::default()
+            },
+        );
+        self.submit(bundle);
     }
 
     /// Handle a private (§39) bundle we've recognized as ours. Opens the seal to route on the
@@ -1366,14 +1492,25 @@ impl<S: Store> Node<S> {
             // A private delivery ACK for one of OUR sends: stop carrying/tracking it and mark
             // it Delivered. (No relay vaccine — the acked id can't ride in cleartext without
             // linking, so other relays drop their copy by TTL; the §39 storage cost.)
-            Payload::Ack { for_bundle_id, delivery_hops, delivery_ms, .. } if first => {
+            Payload::Ack {
+                for_bundle_id,
+                delivery_hops,
+                delivery_ms,
+                ..
+            } if first => {
                 self.pending.remove(&for_bundle_id);
                 self.store.remove(&for_bundle_id);
                 let display = self.display_id(&for_bundle_id);
+                let newly = self.tx.get(&display).is_some_and(|i| !i.delivered);
                 if let Some(info) = self.tx.get_mut(&display) {
                     info.delivered = true;
                     info.delivered_hops = delivery_hops;
                     info.delivered_ms = delivery_ms;
+                }
+                // Sim/debug: record that WE (the sender) just learned this send was delivered, from the
+                // returning ACK — the only way the sender knows. Lets a UI show the sender's real status.
+                if newly && self.observe {
+                    self.sends_delivered.push(display);
                 }
             }
             Payload::Ack { .. } => {} // a duplicate ACK — already handled
@@ -1392,6 +1529,15 @@ impl<S: Store> Node<S> {
                         // Report the forward-path (A→B) latency we observed, not a round trip.
                         let fwd = forward_ms(self.now_ms, bundle.inner.created_at);
                         self.emit_private_ack(sender, *id, bundle.env.hops, fwd);
+                        // §39 vaccine (ack-requested only, on first delivery): reveal the recognition
+                        // token so every relay still carrying a copy verifies + drops it. A fire-and-
+                        // forget (no-ack) send has no vaccine and clears by TTL — matches the design:
+                        // "clear on a long TTL, OR when an ack reaches a holder."
+                        if first {
+                            if let Some(token) = self.vaccine_token_for(bundle) {
+                                self.emit_vaccine(*id, token);
+                            }
+                        }
                     }
                 }
             }
@@ -1403,19 +1549,37 @@ impl<S: Store> Node<S> {
     /// floods and is recognized only by `to`. Needs `to`'s prekey; without it we can't ACK
     /// privately and the sender stays "Sent" (a documented §39 limitation — both ends normally
     /// publish prekeys).
-    fn emit_private_ack(&mut self, to: PubKeyBytes, for_bundle_id: BundleId, delivery_hops: u8, delivery_ms: u32) {
+    fn emit_private_ack(
+        &mut self,
+        to: PubKeyBytes,
+        for_bundle_id: BundleId,
+        delivery_hops: u8,
+        delivery_ms: u32,
+    ) {
         let spk_pub = match self.directory.prekey(&to) {
             Some(b) => b.spk_pub,
             None => return,
         };
-        let ack = Payload::Ack { for_bundle_id, status: 0, delivery_hops, delivery_ms };
-        let wrapped = Payload::Private { sender: self.identity.address(), inner: Box::new(ack) };
+        let ack = Payload::Ack {
+            for_bundle_id,
+            status: 0,
+            delivery_hops,
+            delivery_ms,
+        };
+        let wrapped = Payload::Private {
+            sender: self.identity.address(),
+            inner: Box::new(ack),
+        };
         if let Ok(b) = Bundle::create_private(
             &to,
             &spk_pub,
             &wrapped,
             Some(crypto::mailbox_tag(&to, mailbox_epoch(self.now_ms))), // §39 P4: ride `to`'s gradient back (F-06)
-            BundleOpts { created_at: self.now_ms, ..Default::default() },
+            BundleOpts {
+                created_at: self.now_ms,
+                lifetime_ms: self.default_lifetime_ms,
+                ..Default::default()
+            },
         ) {
             self.last_ack.insert(for_bundle_id, self.now_ms); // throttle re-ACKs by the acked id
             self.submit(b);
@@ -1438,12 +1602,22 @@ impl<S: Store> Node<S> {
     /// Decrypt a user-message payload attributed to `from` — shared by the normal path (where
     /// `from` is the cleartext envelope src) and the §39 private path (where it came from
     /// inside the seal). Establishes the responder side of a session on first `SessionInit`.
-    fn read_inner_message(&mut self, from: PubKeyBytes, payload: Payload) -> Result<Option<ReadMessage>> {
+    fn read_inner_message(
+        &mut self,
+        from: PubKeyBytes,
+        payload: Payload,
+    ) -> Result<Option<ReadMessage>> {
         match payload {
-            Payload::PeerMessage { content_type, body } => {
-                Ok(Some(ReadMessage { from, content_type, body }))
-            }
-            Payload::SessionInit { ek_pub, spk_pub, msg } => {
+            Payload::PeerMessage { content_type, body } => Ok(Some(ReadMessage {
+                from,
+                content_type,
+                body,
+            })),
+            Payload::SessionInit {
+                ek_pub,
+                spk_pub,
+                msg,
+            } => {
                 // Build (or rebuild) the responder session when this is a *fresh* handshake:
                 // no session yet, or one established by a different ephemeral — i.e. the peer
                 // reinstalled / lost its ratchet and is re-initiating. Rebuilding lets us
@@ -1453,13 +1627,20 @@ impl<S: Store> Node<S> {
                     Some(ps) => ps.established_by != Some(ek_pub),
                 };
                 if fresh {
-                    let secret =
-                        self.spk_secrets.get(&spk_pub).ok_or(Error::Crypto("unknown prekey"))?.clone();
+                    let secret = self
+                        .spk_secrets
+                        .get(&spk_pub)
+                        .ok_or(Error::Crypto("unknown prekey"))?
+                        .clone();
                     let root = crypto::x3dh_respond(&self.identity, &secret, &from, &ek_pub)?;
                     let session = Session::init_responder(root, *secret, spk_pub);
                     self.sessions.insert(
                         from,
-                        PeerSession { session, init_material: None, established_by: Some(ek_pub) },
+                        PeerSession {
+                            session,
+                            init_material: None,
+                            established_by: Some(ek_pub),
+                        },
                     );
                 }
                 let decrypted = {
@@ -1470,9 +1651,9 @@ impl<S: Store> Node<S> {
                 match decrypted {
                     Ok(inner) => {
                         self.persist_session(&from); // ratchet advanced — save it
-                        // A peer initiating to us establishes a session both ways — so content we'd
-                        // deferred to them (no prekey yet → "Securing…") can ratchet now. Flush it
-                        // here too, not just on the prekey-advert/tick paths.
+                                                     // A peer initiating to us establishes a session both ways — so content we'd
+                                                     // deferred to them (no prekey yet → "Securing…") can ratchet now. Flush it
+                                                     // here too, not just on the prekey-advert/tick paths.
                         self.flush_pending_content();
                         self.surface_session_inner(from, &inner)
                     }
@@ -1513,12 +1694,20 @@ impl<S: Store> Node<S> {
     /// Decode a decrypted session inner into a user message — unless it's a re-establishment
     /// ping (a content-less handshake we send to heal a desynced ratchet), which has done its
     /// job by rebuilding the session and isn't surfaced (DESIGN.md §25).
-    fn surface_session_inner(&self, from: PubKeyBytes, inner: &[u8]) -> Result<Option<ReadMessage>> {
+    fn surface_session_inner(
+        &self,
+        from: PubKeyBytes,
+        inner: &[u8],
+    ) -> Result<Option<ReadMessage>> {
         let si: SessionInner = postcard::from_bytes(inner)?;
         if si.content_type == SESSION_ESTABLISH_CT {
             return Ok(None);
         }
-        Ok(Some(ReadMessage { from, content_type: si.content_type, body: si.body }))
+        Ok(Some(ReadMessage {
+            from,
+            content_type: si.content_type,
+            body: si.body,
+        }))
     }
 
     /// Tell `peer` our ratchet with them is broken so it drops its session and re-initiates
@@ -1538,7 +1727,10 @@ impl<S: Store> Node<S> {
             Destination::Device(peer),
             &peer,
             &Payload::SessionReset,
-            BundleOpts { created_at: self.now_ms, ..Default::default() },
+            BundleOpts {
+                created_at: self.now_ms,
+                ..Default::default()
+            },
         ) {
             self.submit(b);
         }
@@ -1550,11 +1742,12 @@ impl<S: Store> Node<S> {
     fn handle_session_reset(&mut self, peer: PubKeyBytes) {
         self.sessions.remove(&peer);
         self.persist_session(&peer); // None → clears the persisted entry
-        // Re-establish now if we know their prekey; otherwise the next content send re-inits.
-        // A directed control ping to heal the ratchet with a peer who already knows us — the
-        // traced path (not the §39 default), so it's a unicast, not a flood.
+                                     // Re-establish now if we know their prekey; otherwise the next content send re-inits.
+                                     // A directed control ping to heal the ratchet with a peer who already knows us — the
+                                     // traced path (not the §39 default), so it's a unicast, not a flood.
         if self.directory.prekey(&peer).is_some() {
-            let _ = self.send_message_traced(peer, SESSION_ESTABLISH_CT.to_string(), Vec::new(), false);
+            let _ =
+                self.send_message_traced(peer, SESSION_ESTABLISH_CT.to_string(), Vec::new(), false);
         }
     }
 
@@ -1579,12 +1772,23 @@ impl<S: Store> Node<S> {
             &self.identity,
             Destination::Device(endpoint),
             &endpoint,
-            &Payload::HttpRequest { host, method, url, headers, body, max_resp_bytes: max_resp },
-            BundleOpts { created_at: self.now_ms, ..Default::default() },
+            &Payload::HttpRequest {
+                host,
+                method,
+                url,
+                headers,
+                body,
+                max_resp_bytes: max_resp,
+            },
+            BundleOpts {
+                created_at: self.now_ms,
+                ..Default::default()
+            },
         )?;
         let id = bundle.id();
         self.tx.entry(id).or_default();
-        self.forwarded.insert(id, (self.identity.address(), endpoint, self.now_ms));
+        self.forwarded
+            .insert(id, (self.identity.address(), endpoint, self.now_ms));
         self.deliver(bundle);
         Ok(id)
     }
@@ -1673,13 +1877,19 @@ impl<S: Store> Node<S> {
             &self.identity,
             Destination::Device(resolver),
             &resolver,
-            &Payload::HnsQuery { domain: key.to_string() },
-            BundleOpts { created_at: self.now_ms, ..Default::default() },
+            &Payload::HnsQuery {
+                domain: key.to_string(),
+            },
+            BundleOpts {
+                created_at: self.now_ms,
+                ..Default::default()
+            },
         )
         .ok()?;
         let id = bundle.id();
         self.tx.entry(id).or_default();
-        self.forwarded.insert(id, (self.identity.address(), resolver, self.now_ms));
+        self.forwarded
+            .insert(id, (self.identity.address(), resolver, self.now_ms));
         self.deliver(bundle);
         Some(id)
     }
@@ -1716,20 +1926,27 @@ impl<S: Store> Node<S> {
         self.dns_inflight.remove(&key);
         self.pending_resolves.remove(&key);
         let now_secs = (self.now_ms / 1000) as u32;
-        let dohs: Vec<dnssec::DohAnswer> =
-            bodies.iter().filter_map(|b| dnssec::parse_doh(b).ok()).collect();
+        let dohs: Vec<dnssec::DohAnswer> = bodies
+            .iter()
+            .filter_map(|b| dnssec::parse_doh(b).ok())
+            .collect();
         let (address, ttl_secs) = match dnssec::validate_and_extract_to_root(&key, &dohs, now_secs)
         {
             Ok((addr, ttl)) => (Some(addr), ttl),
             Err(_) => (None, 60), // unvalidatable → short negative cache
         };
-        let ttl_ms =
-            (ttl_secs as u64).clamp(MIN_HNS_TTL_MS / 1000, MAX_HNS_TTL_MS / 1000) * 1000;
+        let ttl_ms = (ttl_secs as u64).clamp(MIN_HNS_TTL_MS / 1000, MAX_HNS_TTL_MS / 1000) * 1000;
         self.hns_cache.insert(
             key.clone(),
-            HnsEntry { address, expires_at_ms: self.now_ms.saturating_add(ttl_ms) },
+            HnsEntry {
+                address,
+                expires_at_ms: self.now_ms.saturating_add(ttl_ms),
+            },
         );
-        self.hns_results.push(HnsResult { domain: key.clone(), address });
+        self.hns_results.push(HnsResult {
+            domain: key.clone(),
+            address,
+        });
         // Answer parked mesh queries by handing back the raw proof — the asker re-validates it
         // itself (trustless), rather than trusting our address.
         if let Some(waiters) = self.dns_waiters.remove(&key) {
@@ -1743,16 +1960,27 @@ impl<S: Store> Node<S> {
     /// resolution state machine (cache/waiters/pending) in unit tests. Production always goes
     /// through [`Node::provide_dns_proof`].
     #[cfg(test)]
-    pub fn provide_dns_answer(&mut self, domain: &str, address: Option<PubKeyBytes>, ttl_secs: u32) {
+    pub fn provide_dns_answer(
+        &mut self,
+        domain: &str,
+        address: Option<PubKeyBytes>,
+        ttl_secs: u32,
+    ) {
         let key = normalize_domain(domain);
         self.dns_inflight.remove(&key);
         self.pending_resolves.remove(&key); // resolved (positive or negative) — stop retrying
         let ttl_ms = (ttl_secs as u64).clamp(MIN_HNS_TTL_MS / 1000, MAX_HNS_TTL_MS / 1000) * 1000;
         self.hns_cache.insert(
             key.clone(),
-            HnsEntry { address, expires_at_ms: self.now_ms.saturating_add(ttl_ms) },
+            HnsEntry {
+                address,
+                expires_at_ms: self.now_ms.saturating_add(ttl_ms),
+            },
         );
-        self.hns_results.push(HnsResult { domain: key.clone(), address });
+        self.hns_results.push(HnsResult {
+            domain: key.clone(),
+            address,
+        });
         // (Test path doesn't answer mesh waiters — that requires a real DNSSEC proof, which
         // only provide_dns_proof produces.)
         self.dns_waiters.remove(&key);
@@ -1799,7 +2027,9 @@ impl<S: Store> Node<S> {
     /// Verify an inbound hps proof from `sender`, and that the bundle is on our app.
     fn hps_authorized(&self, bundle: &Bundle, path: &str, proof: &[u8; 32]) -> bool {
         bundle.inner.app == self.app.id
-            && self.app.verify_join_proof(proof, path, &bundle.inner.src, self.join_bucket())
+            && self
+                .app
+                .verify_join_proof(proof, path, &bundle.inner.src, self.join_bucket())
     }
 
     /// Subscribe to `hps://{host}/{path}`: send a sealed, proof-carrying join request to `host`.
@@ -1807,7 +2037,13 @@ impl<S: Store> Node<S> {
     /// Invite topics can't be self-joined (wait for an invite).
     pub fn hps_subscribe(&mut self, host: PubKeyBytes, path: &str) -> Result<BundleId> {
         let proof = self.hps_proof(path, &self.identity.address());
-        self.send_to_host(host, Payload::HpsJoinRequest { path: path.to_string(), proof })
+        self.send_to_host(
+            host,
+            Payload::HpsJoinRequest {
+                path: path.to_string(),
+                proof,
+            },
+        )
     }
 
     /// Host → destination: invite an address to a topic we host (Invite mode). The destination
@@ -1819,26 +2055,49 @@ impl<S: Store> Node<S> {
             .ok_or_else(|| Error::Other("not a topic we host".into()))?;
         let kind = cfg.kind;
         let proof = self.hps_proof(path, &self.identity.address());
-        self.hps_invites_out.insert((path.to_string(), dest), self.now_ms);
+        self.hps_invites_out
+            .insert((path.to_string(), dest), self.now_ms);
         self.persist_invites();
-        self.send_to_host(dest, Payload::HpsInvite { path: path.to_string(), kind, proof })
+        self.send_to_host(
+            dest,
+            Payload::HpsInvite {
+                path: path.to_string(),
+                kind,
+                proof,
+            },
+        )
     }
 
     /// Member → host: accept an invite we received, which prompts the host to seal us the keys.
     pub fn hps_accept_invite(&mut self, host: PubKeyBytes, path: &str) -> Result<BundleId> {
-        self.hps_invites_in.retain(|i| !(i.path == path && i.host == host));
+        self.hps_invites_in
+            .retain(|i| !(i.path == path && i.host == host));
         self.persist_invites();
         let proof = self.hps_proof(path, &self.identity.address());
-        self.send_to_host(host, Payload::HpsInviteAccept { path: path.to_string(), proof })
+        self.send_to_host(
+            host,
+            Payload::HpsInviteAccept {
+                path: path.to_string(),
+                proof,
+            },
+        )
     }
 
     /// Member → host: leave a topic (drop from the retained set so we're not re-keyed).
     pub fn hps_leave(&mut self, path: &str) -> Result<Option<BundleId>> {
-        let Some(sub) = self.subscriptions.remove(path) else { return Ok(None) };
+        let Some(sub) = self.subscriptions.remove(path) else {
+            return Ok(None);
+        };
         self.directory.unsubscribe(path);
         self.store.remove_kv(&Self::hps_sub_key(path));
         let proof = self.hps_proof(path, &self.identity.address());
-        Ok(Some(self.send_to_host(sub.host, Payload::HpsLeave { path: path.to_string(), proof })?))
+        Ok(Some(self.send_to_host(
+            sub.host,
+            Payload::HpsLeave {
+                path: path.to_string(),
+                proof,
+            },
+        )?))
     }
 
     /// Host: pending join requests for a RequestToJoin topic.
@@ -1871,7 +2130,10 @@ impl<S: Store> Node<S> {
 
     /// Host: the retained-member set (joined/approved/accepted/acked), used for rekey.
     pub fn hps_members(&self, path: &str) -> Vec<PubKeyBytes> {
-        self.hps_members.get(path).map(|s| s.iter().copied().collect()).unwrap_or_default()
+        self.hps_members
+            .get(path)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Member: invites we've received and not yet accepted (DESIGN.md §32 Invite mode).
@@ -1883,7 +2145,8 @@ impl<S: Store> Node<S> {
 
     /// Decline an invite (member side) — drop it from the durable set so it doesn't reappear.
     pub fn hps_decline_invite(&mut self, host: PubKeyBytes, path: &str) {
-        self.hps_invites_in.retain(|i| !(i.path == path && i.host == host));
+        self.hps_invites_in
+            .retain(|i| !(i.path == path && i.host == host));
         self.persist_invites();
     }
 
@@ -1897,7 +2160,11 @@ impl<S: Store> Node<S> {
         new_path: Option<&str>,
         remove: &[PubKeyBytes],
     ) -> Result<Vec<BundleId>> {
-        let mut cfg = self.services.get(path).cloned().ok_or_else(|| Error::Other("not a topic we host".into()))?;
+        let mut cfg = self
+            .services
+            .get(path)
+            .cloned()
+            .ok_or_else(|| Error::Other("not a topic we host".into()))?;
         cfg.rotate();
         let new_path = new_path.unwrap_or(path).to_string();
         let svc_pk = cfg.service_pubkey();
@@ -1963,12 +2230,17 @@ impl<S: Store> Node<S> {
             let (nonce, ct) = hps::seal_content(&content_key, plaintext);
             let sig = match cfg.signing_seed {
                 Some(seed) => hps::sign_publish(&seed, path, &nonce, &ct).to_vec(),
-                None => self.identity.sign(&hps::publish_signing_bytes(path, &nonce, &ct)).to_vec(),
+                None => self
+                    .identity
+                    .sign(&hps::publish_signing_bytes(path, &nonce, &ct))
+                    .to_vec(),
             };
             return self.broadcast_publish(path, epoch, nonce, ct, sig);
         } else if let Some(sub) = self.subscriptions.get(path) {
             if sub.service_pubkey.is_some() {
-                return Err(Error::Other("cannot publish to a service you don't host".into()));
+                return Err(Error::Other(
+                    "cannot publish to a service you don't host".into(),
+                ));
             }
             (sub.content_key, sub.epoch)
         } else {
@@ -1976,7 +2248,10 @@ impl<S: Store> Node<S> {
         };
         // Channel member path: sign with our own identity.
         let (nonce, ct) = hps::seal_content(&content_key, plaintext);
-        let signature = self.identity.sign(&hps::publish_signing_bytes(path, &nonce, &ct)).to_vec();
+        let signature = self
+            .identity
+            .sign(&hps::publish_signing_bytes(path, &nonce, &ct))
+            .to_vec();
         self.broadcast_publish(path, epoch, nonce, ct, signature)
     }
 
@@ -1995,8 +2270,18 @@ impl<S: Store> Node<S> {
             &self.identity,
             Destination::Broadcast,
             &hps::broadcast_identity().address(),
-            &Payload::HpsPublish { topic_tag, epoch, nonce: nonce.to_vec(), ciphertext, sig },
-            BundleOpts { app: self.app.id, created_at: self.now_ms, ..Default::default() },
+            &Payload::HpsPublish {
+                topic_tag,
+                epoch,
+                nonce: nonce.to_vec(),
+                ciphertext,
+                sig,
+            },
+            BundleOpts {
+                app: self.app.id,
+                created_at: self.now_ms,
+                ..Default::default()
+            },
         )?;
         let id = bundle.id();
         self.submit(bundle);
@@ -2012,14 +2297,20 @@ impl<S: Store> Node<S> {
     /// sender's signature against the known path, decrypt, surface it, and reach-ack the host.
     /// Drops stale-epoch messages (post-rekey) and anything we can't verify/decrypt.
     fn process_broadcast(&mut self, bundle: &Bundle) {
-        let Ok(Payload::HpsPublish { topic_tag, epoch, nonce, ciphertext, sig }) =
-            bundle.open(&hps::broadcast_identity())
+        let Ok(Payload::HpsPublish {
+            topic_tag,
+            epoch,
+            nonce,
+            ciphertext,
+            sig,
+        }) = bundle.open(&hps::broadcast_identity())
         else {
             return;
         };
-        let (Ok(nonce12), Ok(sig64)) =
-            (<[u8; 12]>::try_from(nonce.as_slice()), <[u8; 64]>::try_from(sig.as_slice()))
-        else {
+        let (Ok(nonce12), Ok(sig64)) = (
+            <[u8; 12]>::try_from(nonce.as_slice()),
+            <[u8; 64]>::try_from(sig.as_slice()),
+        ) else {
             return;
         };
         // Match the tag to a topic we follow (subscription) OR a channel we host. The host must
@@ -2036,7 +2327,9 @@ impl<S: Store> Node<S> {
         } else if let Some((p, cfg)) = self
             .services
             .iter()
-            .find(|(p, c)| c.kind == hps::ServiceKind::Channel && self.app.topic_tag(p) == topic_tag)
+            .find(|(p, c)| {
+                c.kind == hps::ServiceKind::Channel && self.app.topic_tag(p) == topic_tag
+            })
             .map(|(p, c)| (p.clone(), c.clone()))
         {
             (p, cfg.content_key, None, cfg.epoch, None) // None host = we are the host
@@ -2054,7 +2347,11 @@ impl<S: Store> Node<S> {
         let Some(body) = hps::open_content(&content_key, &nonce12, &ciphertext) else {
             return;
         };
-        self.hps_inbox.push(HpsMessage { path: path.clone(), sender: bundle.inner.src, body });
+        self.hps_inbox.push(HpsMessage {
+            path: path.clone(),
+            sender: bundle.inner.src,
+            body,
+        });
         match host {
             Some(h) => {
                 // We're a member: reach-ack the host once per (topic, epoch) so it tallies us.
@@ -2065,7 +2362,10 @@ impl<S: Store> Node<S> {
             None => {
                 // We're the host: a member posting is direct evidence of membership.
                 self.record_member(&path, bundle.inner.src);
-                self.hps_reach.entry(path).or_default().insert(bundle.inner.src);
+                self.hps_reach
+                    .entry(path)
+                    .or_default()
+                    .insert(bundle.inner.src);
             }
         }
     }
@@ -2079,18 +2379,26 @@ impl<S: Store> Node<S> {
             Destination::Device(to),
             &to,
             &payload,
-            BundleOpts { app: self.app.id, created_at: self.now_ms, ..Default::default() },
+            BundleOpts {
+                app: self.app.id,
+                created_at: self.now_ms,
+                ..Default::default()
+            },
         )?;
         let id = bundle.id();
         self.tx.entry(id).or_default();
-        self.forwarded.insert(id, (self.identity.address(), to, self.now_ms));
+        self.forwarded
+            .insert(id, (self.identity.address(), to, self.now_ms));
         self.deliver(bundle);
         Ok(id)
     }
 
     /// Host: seal the current keys for `path` to a member.
     fn send_keys(&mut self, path: &str, to: PubKeyBytes) -> Result<BundleId> {
-        let cfg = self.services.get(path).ok_or_else(|| Error::Other("no such topic".into()))?;
+        let cfg = self
+            .services
+            .get(path)
+            .ok_or_else(|| Error::Other("no such topic".into()))?;
         let payload = Payload::HpsKeys {
             path: path.to_string(),
             content_key: cfg.content_key,
@@ -2102,14 +2410,25 @@ impl<S: Store> Node<S> {
 
     /// Host: remember a member for reach/rekey.
     fn record_member(&mut self, path: &str, who: PubKeyBytes) {
-        let added = self.hps_members.entry(path.to_string()).or_default().insert(who);
+        let added = self
+            .hps_members
+            .entry(path.to_string())
+            .or_default()
+            .insert(who);
         if added {
             self.persist_members(path);
         }
     }
 
     /// Store a subscription we've been handed (Open keys, invite/approve keys, or a rekey).
-    fn install_subscription(&mut self, path: &str, host: PubKeyBytes, content_key: [u8; 32], service_pubkey: Option<[u8; 32]>, epoch: u32) {
+    fn install_subscription(
+        &mut self,
+        path: &str,
+        host: PubKeyBytes,
+        content_key: [u8; 32],
+        service_pubkey: Option<[u8; 32]>,
+        epoch: u32,
+    ) {
         let sub = HpsSubscription {
             content_key,
             service_pubkey,
@@ -2124,7 +2443,9 @@ impl<S: Store> Node<S> {
 
     /// Build + gossip a Discoverable topic's advert (descriptor encrypted under the app key).
     fn publish_topic_advert(&mut self, path: &str, cfg: &hps::ServiceConfig) {
-        let Some(disc_key) = self.app.disc_key else { return }; // fabric: no discovery isolation
+        let Some(disc_key) = self.app.disc_key else {
+            return;
+        }; // fabric: no discovery isolation
         let (nonce, ct) = hps::seal_meta(&disc_key, &cfg.meta(path));
         self.advert_seq += 1;
         if let Ok(advert) = crate::discover::Advert::publish_in(
@@ -2173,7 +2494,11 @@ impl<S: Store> Node<S> {
             out.push(HpsTopicState {
                 host: sub.host,
                 path: path.clone(),
-                kind: if sub.service_pubkey.is_some() { hps::ServiceKind::Service } else { hps::ServiceKind::Channel },
+                kind: if sub.service_pubkey.is_some() {
+                    hps::ServiceKind::Service
+                } else {
+                    hps::ServiceKind::Channel
+                },
                 hosting: false,
                 access: hps::AccessMode::Open,
             });
@@ -2183,7 +2508,9 @@ impl<S: Store> Node<S> {
 
     /// Same-app discoverable topics we can see (decrypted descriptors + host address).
     pub fn browse_discoverable(&self, tag: Option<&str>) -> Vec<(PubKeyBytes, hps::TopicMeta)> {
-        let Some(disc_key) = self.app.disc_key else { return Vec::new() };
+        let Some(disc_key) = self.app.disc_key else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         for advert in self.directory.hps_topics() {
             if let crate::discover::AdvertKind::HpsTopic { nonce, ct } = &advert.body.kind {
@@ -2228,8 +2555,11 @@ impl<S: Store> Node<S> {
         }
     }
     fn persist_members(&mut self, path: &str) {
-        let m: Vec<PubKeyBytes> =
-            self.hps_members.get(path).map(|s| s.iter().copied().collect()).unwrap_or_default();
+        let m: Vec<PubKeyBytes> = self
+            .hps_members
+            .get(path)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
         if let Ok(bytes) = postcard::to_allocvec(&m) {
             self.store.put_kv(&Self::hps_members_key(path), bytes);
         }
@@ -2281,13 +2611,26 @@ impl<S: Store> Node<S> {
     }
 
     /// Seal an [`Payload::HnsAnswer`] (the DNSSEC `proof`) back to a querier.
-    fn seal_hns_answer(&mut self, to: PubKeyBytes, domain: &str, proof: Vec<String>, for_query: BundleId) {
+    fn seal_hns_answer(
+        &mut self,
+        to: PubKeyBytes,
+        domain: &str,
+        proof: Vec<String>,
+        for_query: BundleId,
+    ) {
         if let Ok(bundle) = Bundle::create(
             &self.identity,
             Destination::Device(to),
             &to,
-            &Payload::HnsAnswer { domain: domain.to_string(), proof, for_query },
-            BundleOpts { created_at: self.now_ms, ..Default::default() },
+            &Payload::HnsAnswer {
+                domain: domain.to_string(),
+                proof,
+                for_query,
+            },
+            BundleOpts {
+                created_at: self.now_ms,
+                ..Default::default()
+            },
         ) {
             self.deliver(bundle);
         }
@@ -2306,8 +2649,16 @@ impl<S: Store> Node<S> {
             &self.identity,
             Destination::Device(to),
             &to,
-            &Payload::HttpResponse { status, headers, body, for_bundle_id: for_id },
-            BundleOpts { created_at: self.now_ms, ..Default::default() },
+            &Payload::HttpResponse {
+                status,
+                headers,
+                body,
+                for_bundle_id: for_id,
+            },
+            BundleOpts {
+                created_at: self.now_ms,
+                ..Default::default()
+            },
         )?;
         let id = bundle.id();
         self.deliver(bundle);
@@ -2343,7 +2694,11 @@ impl<S: Store> Node<S> {
 
     /// This node's identity record, as the built-in `hop.identify` service reports it.
     pub fn identity_record(&self) -> IdentityRecord {
-        IdentityRecord { name: self.name.clone(), kind: self.kind, address: self.address() }
+        IdentityRecord {
+            name: self.name.clone(),
+            kind: self.kind,
+            address: self.address(),
+        }
     }
 
     /// Call a service/command on `dst` (DESIGN.md §29). `service` is namespaced
@@ -2361,13 +2716,21 @@ impl<S: Store> Node<S> {
             &self.identity,
             Destination::Device(dst),
             &dst,
-            &Payload::ServiceRequest { service, method, args },
-            BundleOpts { created_at: self.now_ms, ..Default::default() },
+            &Payload::ServiceRequest {
+                service,
+                method,
+                args,
+            },
+            BundleOpts {
+                created_at: self.now_ms,
+                ..Default::default()
+            },
         )?;
         let id = bundle.id();
         self.tx.entry(id).or_default();
         // Remember the send so a returning delivery learns the route (§27).
-        self.forwarded.insert(id, (self.identity.address(), dst, self.now_ms));
+        self.forwarded
+            .insert(id, (self.identity.address(), dst, self.now_ms));
         self.deliver(bundle);
         Ok(id)
     }
@@ -2385,8 +2748,15 @@ impl<S: Store> Node<S> {
             &self.identity,
             Destination::Device(to),
             &to,
-            &Payload::ServiceResponse { for_bundle_id: for_id, status, body },
-            BundleOpts { created_at: self.now_ms, ..Default::default() },
+            &Payload::ServiceResponse {
+                for_bundle_id: for_id,
+                status,
+                body,
+            },
+            BundleOpts {
+                created_at: self.now_ms,
+                ..Default::default()
+            },
         )?;
         let id = bundle.id();
         self.deliver(bundle);
@@ -2429,12 +2799,15 @@ impl<S: Store> Node<S> {
         };
         let dst = match bundle.inner.dst {
             Destination::Device(d) | Destination::AckTo(d, _) => d,
-            Destination::Broadcast => return self.submit(bundle), // no single dst
+            Destination::Broadcast | Destination::Vaccine(..) => return self.submit(bundle), // no single dst — floods
         };
         let sid = self.next_stream_id();
         let opts = BundleOpts {
             created_at: self.now_ms,
-            flags: BundleFlags { request_ack: true, ..Default::default() },
+            flags: BundleFlags {
+                request_ack: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let orig = bundle.id(); // the message id the UI tracks; carriers map back to it
@@ -2445,7 +2818,12 @@ impl<S: Store> Node<S> {
                 &self.identity,
                 Destination::Device(dst),
                 &dst,
-                &Payload::Carrier { stream_id: sid, seq: i as u64, bytes: chunk.to_vec(), fin: i + 1 == n },
+                &Payload::Carrier {
+                    stream_id: sid,
+                    seq: i as u64,
+                    bytes: chunk.to_vec(),
+                    fin: i + 1 == n,
+                },
                 opts,
             ) {
                 self.carrier_owner.insert(carrier.id(), orig); // attribute relay/ownership
@@ -2472,17 +2850,26 @@ impl<S: Store> Node<S> {
         let mut val = Vec::with_capacity(bytes.len() + 1);
         val.push(fin as u8);
         val.extend_from_slice(&bytes);
-        self.store.put_kv(&stream_chunk_key(&from, &stream_id, seq), val);
+        self.store
+            .put_kv(&stream_chunk_key(&from, &stream_id, seq), val);
 
-        let entry = self.incoming_streams.entry((from, stream_id)).or_insert_with(|| {
-            IncomingStream { reassembler: StreamReassembler::new(), data: Vec::new(), at: now }
-        });
+        let entry = self
+            .incoming_streams
+            .entry((from, stream_id))
+            .or_insert_with(|| IncomingStream {
+                reassembler: StreamReassembler::new(),
+                data: Vec::new(),
+                at: now,
+            });
         entry.at = now;
         for chunk in entry.reassembler.accept(seq, bytes, fin) {
             entry.data.extend_from_slice(&chunk);
         }
         if entry.reassembler.is_finished() {
-            let data = self.incoming_streams.remove(&(from, stream_id)).map(|s| s.data);
+            let data = self
+                .incoming_streams
+                .remove(&(from, stream_id))
+                .map(|s| s.data);
             self.clear_persisted_stream(&from, &stream_id); // whole message assembled
             data
         } else {
@@ -2517,7 +2904,12 @@ impl<S: Store> Node<S> {
         self.advert_seq += 1;
         let advert = Advert::publish(
             &self.identity,
-            AdvertKind::Service { service, title, summary, tags },
+            AdvertKind::Service {
+                service,
+                title,
+                summary,
+                tags,
+            },
             self.now_ms,
             ttl_ms,
             self.advert_seq,
@@ -2539,9 +2931,14 @@ impl<S: Store> Node<S> {
     /// Delivered (_, true, hops). `delivery_hops` is the forward path length the
     /// destination observed (0 until delivered).
     pub fn message_status(&self, id: &BundleId) -> Option<(u32, bool, u8, u32)> {
-        self.tx
-            .get(id)
-            .map(|i| (i.relayed.len() as u32, i.delivered, i.delivered_hops, i.delivered_ms))
+        self.tx.get(id).map(|i| {
+            (
+                i.relayed.len() as u32,
+                i.delivered,
+                i.delivered_hops,
+                i.delivered_ms,
+            )
+        })
     }
 
     /// The relay queue for display: our messages awaiting send (pinned) and peer
@@ -2558,7 +2955,7 @@ impl<S: Store> Node<S> {
                 own: self.tx.contains_key(&b.id()) || self.carrier_owner.contains_key(&b.id()),
                 to: match b.inner.dst {
                     Destination::Device(a) | Destination::AckTo(a, _) => Some(a),
-                    Destination::Broadcast => None,
+                    Destination::Broadcast | Destination::Vaccine(..) => None,
                 },
                 priority: b.inner.priority,
                 hops: b.env.hops,
@@ -2579,19 +2976,24 @@ impl<S: Store> Node<S> {
         let connected: HashSet<PubKeyBytes> = self.peers().into_iter().collect();
         let mut out = Vec::new();
         for id in self.store.have().ids {
-            let Some(b) = self.store.get(&id) else { continue };
+            let Some(b) = self.store.get(&id) else {
+                continue;
+            };
             // Both user messages (Device) and delivery-ACKs (AckTo) are addressed to a
             // specific node, so both ride the handoff — otherwise an ACK back to an
             // offline cross-region sender would never arrive (no live peering, §28).
             let dst = match b.inner.dst {
                 Destination::Device(d) | Destination::AckTo(d, _) => d,
-                Destination::Broadcast => continue,
+                Destination::Broadcast | Destination::Vaccine(..) => continue,
             };
             if connected.contains(&dst) {
                 continue; // deliverable directly on this node — no handoff needed
             }
             if let Ok(bytes) = b.to_bytes() {
-                let expires = b.inner.created_at.saturating_add(b.inner.lifetime_ms as u64);
+                let expires = b
+                    .inner
+                    .created_at
+                    .saturating_add(b.inner.lifetime_ms as u64);
                 out.push((id, dst, bytes, expires));
             }
         }
@@ -2608,11 +3010,15 @@ impl<S: Store> Node<S> {
         let now = self.now_ms;
         let mut out = Vec::new();
         for id in self.store.have().ids {
-            let Some(b) = self.store.get(&id) else { continue };
+            let Some(b) = self.store.get(&id) else {
+                continue;
+            };
             if !b.is_private() {
                 continue;
             }
-            let Some(tag) = b.inner.private.as_ref().and_then(|p| p.mailbox) else { continue };
+            let Some(tag) = b.inner.private.as_ref().and_then(|p| p.mailbox) else {
+                continue;
+            };
             // A live, usable gradient means P4 already steers this bundle — don't also spool it.
             // (Same liveness predicate as the forward gate in offer_bundles_to_link.)
             let live = self.recv_gradient.get(&tag).is_some_and(|e| {
@@ -2622,7 +3028,10 @@ impl<S: Store> Node<S> {
                 continue;
             }
             if let Ok(bytes) = b.to_bytes() {
-                let expires = b.inner.created_at.saturating_add(b.inner.lifetime_ms as u64);
+                let expires = b
+                    .inner
+                    .created_at
+                    .saturating_add(b.inner.lifetime_ms as u64);
                 out.push((id, tag, bytes, expires));
             }
         }
@@ -2698,7 +3107,12 @@ impl<S: Store> Node<S> {
         // Directly-connected fast path: the peer already knows our identity (the link
         // authenticated it), so untraceability vs them is moot — send a directed unicast
         // rather than flooding. Reach any *non*-adjacent address untraceably via send_message.
-        Ok(Some(self.send_message_traced(*address, content_type, body, request_ack)?))
+        Ok(Some(self.send_message_traced(
+            *address,
+            content_type,
+            body,
+            request_ack,
+        )?))
     }
 
     /// Advance time: expire stale adverts and retransmit unacked bundles whose
@@ -2718,7 +3132,10 @@ impl<S: Store> Node<S> {
             let stale: Vec<String> = self
                 .services
                 .iter()
-                .filter(|(p, c)| c.visibility == hps::Visibility::Discoverable && !self.hps_adverts.contains_key(*p))
+                .filter(|(p, c)| {
+                    c.visibility == hps::Visibility::Discoverable
+                        && !self.hps_adverts.contains_key(*p)
+                })
                 .map(|(p, _)| p.clone())
                 .collect();
             for path in stale {
@@ -2732,11 +3149,13 @@ impl<S: Store> Node<S> {
         self.relay_order.retain(|id| self.store.contains(id));
         self.relay_fwd.retain(|id, _| self.store.contains(id));
         // Expire vaccine immunity after a bundle could no longer be live (1h).
-        self.immune.retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
+        self.immune
+            .retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
         // D6: GC forward-secret sessions idle past SESSION_MAX_IDLE_MS (memory + persisted store).
         self.gc_idle_sessions();
         // Forget forwarded-route memory for bundles that can no longer ACK back (§27).
-        self.forwarded.retain(|_, (_, _, t)| now_ms.saturating_sub(*t) < 3_600_000);
+        self.forwarded
+            .retain(|_, (_, _, t)| now_ms.saturating_sub(*t) < 3_600_000);
         // Drop abandoned half-received carrier streams (sender vanished mid-transfer), and
         // clear their persisted chunks so they don't linger in the store.
         let dropped: Vec<(PubKeyBytes, StreamId)> = self
@@ -2752,7 +3171,8 @@ impl<S: Store> Node<S> {
         // Forget carrier→original links once the carrier is no longer held (delivered/expired).
         self.carrier_owner.retain(|cid, _| self.store.contains(cid));
         // Forget deferred-content aliases once their real bundle is gone (delivered/expired).
-        self.tx_alias.retain(|real, _| self.store.contains(real) || self.pending.contains_key(real));
+        self.tx_alias
+            .retain(|real, _| self.store.contains(real) || self.pending.contains_key(real));
         // Periodically RE-gossip adverts to every live link. Adverts (presence, and crucially
         // prekeys, §25) are otherwise offered only once per link — at link-up — so a node that
         // didn't have a peer's prekey at connect time could never open a forward-secret session to
@@ -2769,7 +3189,9 @@ impl<S: Store> Node<S> {
             // on a STABLE link (no flap to trigger the link-up re-offer) re-secure within the interval.
             // The foreign bulk stays per-peer-deduped; newly published/ingested adverts still propagate
             // immediately via on_advert/publish → offer_adverts_to_all.
-            let own = self.directory.advert_ids_by_publisher(&self.identity.address());
+            let own = self
+                .directory
+                .advert_ids_by_publisher(&self.identity.address());
             if !own.is_empty() {
                 for state in self.links.values_mut() {
                     if let LinkState::Up(est) = state {
@@ -2783,18 +3205,22 @@ impl<S: Store> Node<S> {
         }
         // §39 P4: keep our receiver-beacon fresh (short interval ≪ its TTL) so the gradient toward
         // us stays alive and re-points if we move. Passive (max-privacy) recipients skip this.
-        if self.route_to_me && now_ms.saturating_sub(self.last_recv_beacon_ms) >= RECV_BEACON_REFRESH_MS {
+        if self.route_to_me
+            && now_ms.saturating_sub(self.last_recv_beacon_ms) >= RECV_BEACON_REFRESH_MS
+        {
             self.last_recv_beacon_ms = now_ms;
             // F-06: the mailbox is now bound to our address + epoch (not the prekey), so the beacon is
             // self-verifying at the relay — no prekey coordination needed. Emits current + window epochs.
             let _ = self.publish_recv_beacon();
+            self.beaconed_tick = true; // sim/debug: pulse this node in the viz (drain_beaconed)
         }
         // Retry any content still waiting on a prekey (it gossips, §25).
         self.flush_pending_content();
         // ACK bookkeeping: forget replication tracking for ACKs no longer held, and age
         // out the re-ACK throttle map.
         self.ack_replicate.retain(|id, _| self.store.contains(id));
-        self.last_ack.retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
+        self.last_ack
+            .retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
         // Expired HNS records leave the device entirely (DESIGN.md §30): once a cached
         // endpoint's DNS-derived TTL lapses it's dropped, so the next request re-resolves
         // all the way back to DNS rather than reusing a stale address.
@@ -2861,6 +3287,96 @@ impl<S: Store> Node<S> {
         std::mem::take(&mut self.outgoing)
     }
 
+    /// Sim/debug: enable recording of which bundle crosses which link (see [`Self::drain_transfers`]).
+    pub fn set_observe(&mut self, on: bool) {
+        self.observe = on;
+    }
+
+    /// Sim/debug: take the `(link, bundle_id, is_final_delivery)` transfers recorded since the last
+    /// call. Lets a visualizer color each hop by the real bundle that crossed it. Empty unless
+    /// [`Self::set_observe`]`(true)` was called.
+    pub fn drain_transfers(&mut self) -> Vec<(LinkId, BundleId, bool)> {
+        // Report DISPLAY ids: a deferred send (queued while the recipient's prekey gossips over, §25)
+        // flushes later under a fresh wire id — the UI tracked the id `send` returned, so without this
+        // mapping a deferred message's flood is invisible to the visualizer.
+        std::mem::take(&mut self.transfers)
+            .into_iter()
+            .map(|(l, id, d)| (l, self.display_id(&id), d))
+            .collect()
+    }
+
+    /// Sim/debug: take the ids of our OWN sends that were confirmed delivered (by a returning ACK)
+    /// since the last call. A sender only learns delivery this way — never from the recipient directly
+    /// — so a per-device UI can show the sender "delivered" only once its ACK is home.
+    pub fn drain_delivered(&mut self) -> Vec<BundleId> {
+        std::mem::take(&mut self.sends_delivered)
+    }
+
+    /// Set the lifetime stamped on new messages/ACKs this node originates. A real per-bundle sender
+    /// choice (`BundleOpts::lifetime_ms`); the store's own prune enforces it on tick. The sim sets a
+    /// short one so relay copies of a delivered message actually expire within a demo (§39 has no relay
+    /// vaccine, so relays clean up by TTL). Production leaves it at the 24h default.
+    pub fn set_default_lifetime_ms(&mut self, ms: u32) {
+        self.default_lifetime_ms = ms;
+    }
+
+    /// Sim/debug: the §39 P4 recv-gradient as `(mailbox_tag, inbound_link, hops)` — the reachable
+    /// mailbox-tags this node can route a private bundle toward, and the next hop for each. Read-only
+    /// view of the distributed routing tree (each node holds a slice); lets the sim draw it.
+    pub fn recv_gradient_view(&self) -> Vec<(Tag, LinkId, u8)> {
+        self.recv_gradient
+            .iter()
+            .map(|(tag, e)| (*tag, e.inbound, e.hops))
+            .collect()
+    }
+
+    /// Sim/debug: this node's current mailbox-tag (its address at the current epoch) — the key a
+    /// relay's gradient points toward. Lets the sim match a recipient to the gradient tree steering to it.
+    pub fn current_mailbox_tag(&self) -> Tag {
+        crypto::mailbox_tag(&self.identity.address(), mailbox_epoch(self.now_ms))
+    }
+
+    /// Sim/debug: did this node emit a §39 recv-beacon since the last call? Lets the sim pulse a node
+    /// as it advertises its reachability (the presence signal that lays the gradient tree).
+    pub fn drain_beaconed(&mut self) -> bool {
+        std::mem::take(&mut self.beaconed_tick)
+    }
+
+    /// Sim/debug: do we currently hold `addr`'s prekey (i.e. could we seal a private send to them now)?
+    pub fn knows_prekey(&self, addr: &PubKeyBytes) -> bool {
+        self.directory.prekey(addr).is_some()
+    }
+
+    /// Sim/debug: send status for each message we originated — `(display id, distinct peers we've handed
+    /// it to, delivered)`. Mirrors the debug app's "Sending / Sent · N / Delivered" (peers==0 = Sending,
+    /// N>0 = Sent·N, delivered = ACK home). Read-only.
+    pub fn sends_status(&self) -> Vec<(BundleId, u16, bool)> {
+        self.tx
+            .iter()
+            .map(|(id, info)| {
+                (
+                    *id,
+                    info.relayed.len().min(u16::MAX as usize) as u16,
+                    info.delivered,
+                )
+            })
+            .collect()
+    }
+
+    /// Sim/debug: ids of the bundles this node currently holds — lets a visualizer show which
+    /// devices still have a copy (they drop it as the delivery-ACK/vaccine reaches them). Read-only;
+    /// storage lifecycle stays entirely with the core + its `Store` (real TTL, real prune).
+    pub fn held_bundle_ids_display(&self) -> Vec<BundleId> {
+        self.held_bundle_ids()
+            .into_iter()
+            .map(|id| self.display_id(&id))
+            .collect()
+    }
+
+    pub fn held_bundle_ids(&self) -> Vec<BundleId> {
+        self.store.have().ids
+    }
+
     /// Feed one bearer event into the loop.
     pub fn handle(&mut self, event: BearerEvent) {
         match event {
@@ -2870,8 +3386,13 @@ impl<S: Store> Node<S> {
                 // the whole directory (the flapping-link resource-exhaustion bug). Keyed by peer, not
                 // by link instance — the link id changes on every reconnect, the peer address doesn't.
                 if let Some(LinkState::Up(est)) = self.links.remove(&link) {
-                    self.peer_sent
-                        .insert(est.peer, PeerSent { adverts: est.sent_adverts, bundles: est.sent_bundles });
+                    self.peer_sent.insert(
+                        est.peer,
+                        PeerSent {
+                            adverts: est.sent_adverts,
+                            bundles: est.sent_bundles,
+                        },
+                    );
                 }
                 self.priv_ingest.remove(&link); // F-07: drop the rate-limit counter for a dead link
             }
@@ -2882,7 +3403,9 @@ impl<S: Store> Node<S> {
     // --- connection lifecycle -------------------------------------------------
 
     fn auth_payload(&self) -> Vec<u8> {
-        let auth = LinkAuth { address: self.identity.address() };
+        let auth = LinkAuth {
+            address: self.identity.address(),
+        };
         postcard::to_allocvec(&auth).expect("auth encode")
     }
 
@@ -2906,8 +3429,10 @@ impl<S: Store> Node<S> {
                 self.send_packet(link, LinkPacket::Handshake(msg));
             }
         }
-        self.links
-            .insert(link, LinkState::Handshaking(Box::new(Handshaking { hs, verified: None })));
+        self.links.insert(
+            link,
+            LinkState::Handshaking(Box::new(Handshaking { hs, verified: None })),
+        );
     }
 
     fn on_data(&mut self, link: LinkId, bytes: Vec<u8>) {
@@ -2973,18 +3498,29 @@ impl<S: Store> Node<S> {
             // restored per-peer dedup so they go out again. A peer that lost state (restart / data-
             // wipe / cache-evict) must be able to re-secure to us — it needs our prekey. The FOREIGN
             // directory bulk stays deduped (no reflood), so this re-offers only ~2-3 small adverts.
-            let own = self.directory.advert_ids_by_publisher(&self.identity.address());
+            let own = self
+                .directory
+                .advert_ids_by_publisher(&self.identity.address());
             // Our own UNDELIVERED messages (awaiting an ACK): re-offer them on link-up too, so a
             // reconnect re-sends them IMMEDIATELY instead of waiting out the exponential-backoff
             // retransmit timer (30s → 15min). A bundle "sent" on a link that then dropped sits in the
             // restored per-peer dedup marked already-sent — which is what made delivery take minutes
             // on a flaky BLE link even after securing succeeded.
             let pending_ids: Vec<BundleId> = self.pending.keys().copied().collect();
+            // Generalize that to EVERYTHING we still hold: delivery-ACKs and vaccines have no
+            // retransmit timer of their own, so a copy lost to a link flap (marked sent, never
+            // received) would otherwise be stranded against this peer FOREVER — the stuck-"Sending…"
+            // sender the sim exposed. If we still hold a bundle it is still relevant; the receiver
+            // dedups duplicates by `seen`, so re-offering on a fresh contact costs only bandwidth.
+            let held_ids = self.store.have().ids;
             if let Some(LinkState::Up(est)) = self.links.get_mut(&link) {
                 for id in &own {
                     est.sent_adverts.remove(id);
                 }
                 for id in &pending_ids {
+                    est.sent_bundles.remove(id);
+                }
+                for id in &held_ids {
                     est.sent_bundles.remove(id);
                 }
             }
@@ -3001,7 +3537,8 @@ impl<S: Store> Node<S> {
                 }
             }
         } else {
-            self.links.insert(link, LinkState::Handshaking(Box::new(state)));
+            self.links
+                .insert(link, LinkState::Handshaking(Box::new(state)));
         }
     }
 
@@ -3125,8 +3662,12 @@ impl<S: Store> Node<S> {
             if bundle.inner.flags.is_ack {
                 // An ACK for one of our sent bundles: stop tracking & carrying it,
                 // and mark it Delivered for the UI.
-                if let Ok(Payload::Ack { for_bundle_id, delivery_hops, delivery_ms, .. }) =
-                    bundle.open(&self.identity)
+                if let Ok(Payload::Ack {
+                    for_bundle_id,
+                    delivery_hops,
+                    delivery_ms,
+                    ..
+                }) = bundle.open(&self.identity)
                 {
                     self.pending.remove(&for_bundle_id);
                     self.store.remove(&for_bundle_id);
@@ -3146,7 +3687,12 @@ impl<S: Store> Node<S> {
                 // Route by payload: HTTP req/resp go to their own queues; peer/session
                 // messages stay raw for read_message (sessions need stateful decrypt).
                 match bundle.open(&self.identity) {
-                    Ok(Payload::HttpResponse { status, headers, body, for_bundle_id }) => {
+                    Ok(Payload::HttpResponse {
+                        status,
+                        headers,
+                        body,
+                        for_bundle_id,
+                    }) => {
                         // The response answers our request → drop the request bundle so it
                         // stops being held/re-offered, and vaccinate any in-flight copies.
                         self.pending.remove(&for_bundle_id);
@@ -3164,7 +3710,14 @@ impl<S: Store> Node<S> {
                     }
                     // A hops:// request sealed to us (we're a hop-endpoint, §30): surface
                     // it for the operator's translator to execute against its backend.
-                    Ok(Payload::HttpRequest { host, method, url, headers, body, max_resp_bytes }) => {
+                    Ok(Payload::HttpRequest {
+                        host,
+                        method,
+                        url,
+                        headers,
+                        body,
+                        max_resp_bytes,
+                    }) => {
                         self.http_requests.push(HttpReqItem {
                             from: bundle.inner.src,
                             id,
@@ -3176,7 +3729,11 @@ impl<S: Store> Node<S> {
                             max_resp: max_resp_bytes,
                         });
                     }
-                    Ok(Payload::ServiceResponse { for_bundle_id, status, body }) => {
+                    Ok(Payload::ServiceResponse {
+                        for_bundle_id,
+                        status,
+                        body,
+                    }) => {
                         // A response is the return-path "delete" for our request: service
                         // calls carry no ACK-vaccine of their own, so without this the
                         // request bundle would sit pinned in our store forever. Drop it
@@ -3193,12 +3750,16 @@ impl<S: Store> Node<S> {
                             body,
                         });
                     }
-                    Ok(Payload::ServiceRequest { service, method, args }) => {
+                    Ok(Payload::ServiceRequest {
+                        service,
+                        method,
+                        args,
+                    }) => {
                         let from = bundle.inner.src;
                         if service == SERVICE_IDENTIFY {
                             // Built-in: the node answers with its own identity record.
-                            let body = postcard::to_allocvec(&self.identity_record())
-                                .unwrap_or_default();
+                            let body =
+                                postcard::to_allocvec(&self.identity_record()).unwrap_or_default();
                             let _ = self.send_service_response(from, id, 0, body);
                         } else {
                             // Custom service: hand to the embedding app to fulfill.
@@ -3224,14 +3785,21 @@ impl<S: Store> Node<S> {
                         let key = normalize_domain(&domain);
                         let from = bundle.inner.src;
                         if self.internet {
-                            self.dns_waiters.entry(key.clone()).or_default().push((from, id));
+                            self.dns_waiters
+                                .entry(key.clone())
+                                .or_default()
+                                .push((from, id));
                             self.queue_dns_lookup(&key);
                         }
                     }
                     // An HNS answer (a DNSSEC proof) to a query we sent (§30): validate it
                     // ourselves and cache on success, then purge the query bundle. We never
                     // trust the answering node — only the proof.
-                    Ok(Payload::HnsAnswer { domain, proof, for_query }) => {
+                    Ok(Payload::HnsAnswer {
+                        domain,
+                        proof,
+                        for_query,
+                    }) => {
                         self.provide_dns_proof(&domain, proof);
                         self.pending.remove(&for_query);
                         self.store.remove(&for_query);
@@ -3266,7 +3834,11 @@ impl<S: Store> Node<S> {
                     Ok(Payload::HpsInvite { path, kind, proof }) => {
                         if self.hps_authorized(&bundle, &path, &proof) {
                             let host = bundle.inner.src;
-                            if !self.hps_invites_in.iter().any(|i| i.path == path && i.host == host) {
+                            if !self
+                                .hps_invites_in
+                                .iter()
+                                .any(|i| i.path == path && i.host == host)
+                            {
                                 self.hps_invites_in.push(HpsInviteItem { path, host, kind });
                                 self.persist_invites();
                             }
@@ -3287,12 +3859,19 @@ impl<S: Store> Node<S> {
                     Ok(Payload::HpsLeave { path, proof }) => {
                         if self.hps_authorized(&bundle, &path, &proof) {
                             let who = bundle.inner.src;
-                            if let Some(m) = self.hps_members.get_mut(&path) { m.remove(&who); }
-                            if let Some(r) = self.hps_reach.get_mut(&path) { r.remove(&who); }
+                            if let Some(m) = self.hps_members.get_mut(&path) {
+                                m.remove(&who);
+                            }
+                            if let Some(r) = self.hps_reach.get_mut(&path) {
+                                r.remove(&who);
+                            }
                         }
                     }
                     // Member → host: reach ack — tally unique acking addresses (§32).
-                    Ok(Payload::HpsReachAck { topic_tag, epoch: _ }) => {
+                    Ok(Payload::HpsReachAck {
+                        topic_tag,
+                        epoch: _,
+                    }) => {
                         // Map the opaque tag back to a path we host.
                         let who = bundle.inner.src;
                         let path = self
@@ -3306,7 +3885,14 @@ impl<S: Store> Node<S> {
                         }
                     }
                     // Host → us: rotate to a new key generation (revocation, §32).
-                    Ok(Payload::HpsRekey { old_path, new_path, epoch, content_key, service_pubkey, proof }) => {
+                    Ok(Payload::HpsRekey {
+                        old_path,
+                        new_path,
+                        epoch,
+                        content_key,
+                        service_pubkey,
+                        proof,
+                    }) => {
                         if self.hps_authorized(&bundle, &old_path, &proof) {
                             if let Some(old) = self.subscriptions.get(&old_path) {
                                 if epoch > old.epoch {
@@ -3316,21 +3902,37 @@ impl<S: Store> Node<S> {
                                         self.directory.unsubscribe(&old_path);
                                         self.store.remove_kv(&Self::hps_sub_key(&old_path));
                                     }
-                                    self.install_subscription(&new_path, host, content_key, service_pubkey, epoch);
+                                    self.install_subscription(
+                                        &new_path,
+                                        host,
+                                        content_key,
+                                        service_pubkey,
+                                        epoch,
+                                    );
                                 }
                             }
                         }
                     }
                     // The keys for a topic we subscribed to (§32): remember them so we can
                     // decrypt + verify its broadcasts.
-                    Ok(Payload::HpsKeys { path, content_key, service_pubkey, epoch }) => {
+                    Ok(Payload::HpsKeys {
+                        path,
+                        content_key,
+                        service_pubkey,
+                        epoch,
+                    }) => {
                         let host = bundle.inner.src;
                         self.install_subscription(&path, host, content_key, service_pubkey, epoch);
                     }
                     // A transport carrier chunk: reassemble (§20); once complete, reconstruct
                     // the original bundle and process it as if it had arrived whole.
                     // (Application streams use StreamData and are delivered progressively.)
-                    Ok(Payload::Carrier { stream_id, seq, bytes, fin }) => {
+                    Ok(Payload::Carrier {
+                        stream_id,
+                        seq,
+                        bytes,
+                        fin,
+                    }) => {
                         let from = bundle.inner.src;
                         if let Some(inner_bytes) =
                             self.accept_stream_chunk(from, stream_id, seq, bytes, fin)
@@ -3359,15 +3961,53 @@ impl<S: Store> Node<S> {
         // drop our copy and remember to drop any future copy (epidemic recovery). The
         // acked id rides in the *unsealed* AckTo destination, so relays can read it.
         if bundle.inner.flags.is_ack {
-            if let Destination::AckTo(_, delivered) = bundle.inner.dst {
-                self.store.remove(&delivered);
-                self.relay_order.retain(|x| *x != delivered);
-                self.immune.insert(delivered, self.now_ms);
-                // The ACK for a bundle we forwarded is passing back through us — we're
-                // on a working path between its endpoints, in both directions (§27).
-                if let Some((s, d, _)) = self.forwarded.remove(&delivered) {
-                    self.routes.learn(&s, &d, self.now_ms);
+            match bundle.inner.dst {
+                Destination::AckTo(_, delivered) => {
+                    self.store.remove(&delivered);
+                    self.relay_order.retain(|x| *x != delivered);
+                    self.immune.insert(delivered, self.now_ms);
+                    // The ACK for a bundle we forwarded is passing back through us — we're
+                    // on a working path between its endpoints, in both directions (§27).
+                    if let Some((s, d, _)) = self.forwarded.remove(&delivered) {
+                        self.routes.learn(&s, &d, self.now_ms);
+                    }
                 }
+                // §39 delivery vaccine: drop our copy ONLY if the revealed token matches the tag we
+                // hold — so a forged token can't purge a live bundle. If we don't hold it, we can't
+                // verify; we just relay the anti-packet onward (below) so real holders can act on it.
+                Destination::Vaccine(delivered, token) => {
+                    let verified = self
+                        .store
+                        .get(&delivered)
+                        .and_then(|b| b.inner.private.as_ref().map(|p| p.tag))
+                        .is_some_and(|tag| {
+                            crypto::recognition_tag_from_shared(&token, &delivered) == tag
+                        });
+                    if verified {
+                        // The SENDER treats a verified vaccine as PROOF OF DELIVERY. Its private ACK
+                        // can be lost (a throttled link, a single-carrier contact) — and once the
+                        // vaccine has immunized the mesh, retransmits can never trigger a re-ACK, so
+                        // a lost ack would strand the sender on "Sending…" forever. The vaccine floods
+                        // network-wide and carries the same CDH token only the true recipient can
+                        // compute, so it is exactly as trustworthy as the ACK (minus hop/latency
+                        // metadata, which stays at its last-known values).
+                        let display = self.display_id(&delivered);
+                        if let Some(info) = self.tx.get_mut(&display) {
+                            if !info.delivered {
+                                info.delivered = true;
+                                self.pending.remove(&delivered);
+                                self.pending.remove(&display);
+                                if self.observe {
+                                    self.sends_delivered.push(display);
+                                }
+                            }
+                        }
+                        self.store.remove(&delivered);
+                        self.relay_order.retain(|x| *x != delivered);
+                        self.immune.insert(delivered, self.now_ms);
+                    }
+                }
+                _ => {}
             }
         } else if self.immune.contains_key(&id) {
             return; // already delivered elsewhere — don't re-store or re-flood it
@@ -3384,7 +4024,9 @@ impl<S: Store> Node<S> {
             // Remember we're carrying this toward `dst` so a returning ACK teaches the
             // route (§27). `or_insert` keeps our own-send record if we have one.
             if let Some(d) = relay_dst {
-                self.forwarded.entry(id).or_insert((relay_src, d, self.now_ms));
+                self.forwarded
+                    .entry(id)
+                    .or_insert((relay_src, d, self.now_ms));
                 self.prune_forwarded_if_needed();
             }
             self.evict_relayed_if_needed();
@@ -3405,8 +4047,9 @@ impl<S: Store> Node<S> {
     fn evict_relayed_if_needed(&mut self) {
         let now = self.now_ms;
         while self.relay_order.len() > self.max_relayed {
-            let victim =
-                self.pick_evict_victim(now, true).or_else(|| self.pick_evict_victim(now, false));
+            let victim = self
+                .pick_evict_victim(now, true)
+                .or_else(|| self.pick_evict_victim(now, false));
             let Some((idx, id)) = victim else { break };
             self.relay_order.remove(idx);
             self.store.remove(&id);
@@ -3471,7 +4114,10 @@ impl<S: Store> Node<S> {
                 created_at: self.now_ms,
                 lifetime_ms: lifetime,
                 priority: orig.inner.priority.saturating_add(1),
-                flags: BundleFlags { is_ack: true, ..Default::default() },
+                flags: BundleFlags {
+                    is_ack: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
@@ -3486,8 +4132,8 @@ impl<S: Store> Node<S> {
 
     fn on_advert(&mut self, from_link: LinkId, peer: PubKeyBytes, advert: Advert) {
         let _ = peer; // reserved for finer-grained relay scoring (DESIGN.md §18)
-        // Service adverts flood the directory (subscribed → full retention, else the
-        // bounded relay cache). Re-gossip only when newly accepted.
+                      // Service adverts flood the directory (subscribed → full retention, else the
+                      // bounded relay cache). Re-gossip only when newly accepted.
         let is_prekey = matches!(advert.body.kind, AdvertKind::PreKey { .. });
         // §39 P4: a signed receiver-beacon lays/refreshes a gradient toward its mailbox via the
         // link we heard it on. Read its fields (and the publisher) before `ingest` consumes it.
@@ -3516,8 +4162,9 @@ impl<S: Store> Node<S> {
                 // .ingest` already verified the signature, so `publisher` is authentic here). Accept
                 // the current epoch and the recent window, so a just-rotated tag still routes.
                 let cur = mailbox_epoch(self.now_ms);
-                let owns_mailbox = (0..=MAILBOX_EPOCH_WINDOW)
-                    .any(|back| crypto::mailbox_tag(&publisher, cur.saturating_sub(back)) == mailbox);
+                let owns_mailbox = (0..=MAILBOX_EPOCH_WINDOW).any(|back| {
+                    crypto::mailbox_tag(&publisher, cur.saturating_sub(back)) == mailbox
+                });
                 if owns_mailbox {
                     self.record_gradient(mailbox, from_link, hops, created_at, ttl_ms, seq);
                 }
@@ -3531,12 +4178,25 @@ impl<S: Store> Node<S> {
     /// equal seq, the closer (fewer-hop) copy wins. After recording, immediately re-offer any
     /// already-HELD private bundles down the new link — without this, a bundle parked before the
     /// gradient existed waits forever (the relay already deduped it on the bridge link at link-up).
-    fn record_gradient(&mut self, mailbox: Tag, from_link: LinkId, hops: u8, created_at: u64, ttl_ms: u32, seq: u64) {
+    fn record_gradient(
+        &mut self,
+        mailbox: Tag,
+        from_link: LinkId,
+        hops: u8,
+        created_at: u64,
+        ttl_ms: u32,
+        seq: u64,
+    ) {
         let expires_at = created_at.saturating_add(ttl_ms as u64);
         if expires_at <= self.now_ms {
             return; // already stale on arrival
         }
-        let entry = GradientEntry { inbound: from_link, hops, expires_at, seq };
+        let entry = GradientEntry {
+            inbound: from_link,
+            hops,
+            expires_at,
+            seq,
+        };
         let install = match self.recv_gradient.get(&mailbox) {
             // Fresher beacon, or same generation but a closer/equal path → take it.
             Some(e) => seq > e.seq || (seq == e.seq && hops <= e.hops),
@@ -3545,7 +4205,9 @@ impl<S: Store> Node<S> {
         if !install {
             return;
         }
-        if self.recv_gradient.len() >= MAX_RECV_GRADIENT && !self.recv_gradient.contains_key(&mailbox) {
+        if self.recv_gradient.len() >= MAX_RECV_GRADIENT
+            && !self.recv_gradient.contains_key(&mailbox)
+        {
             // Bound the table (Sybil): evict the nearest-to-expiry entry.
             if let Some(&victim) = self
                 .recv_gradient
@@ -3593,7 +4255,9 @@ impl<S: Store> Node<S> {
     /// reachability toward the destination orders bundles *within* a band — so a bundle
     /// toward a destination we have a route to beats one toward an unknown destination.
     fn bundle_utility(&self, id: &BundleId, now: u64) -> f64 {
-        let Some(b) = self.store.get(id) else { return 0.0 };
+        let Some(b) = self.store.get(id) else {
+            return 0.0;
+        };
         self.bundle_utility_of(&b, now)
     }
 
@@ -3615,7 +4279,11 @@ impl<S: Store> Node<S> {
         // never WHICH devices carried it. Infra relays self-identify (their address is public) so a
         // recipient can still see "via Hop Relay". A device's own address is in the bundle `src`
         // anyway, so hiding it in the trace loses nothing — it only protects intermediate relays.
-        let me_short = if self.trace_app == FABRIC_APP { ShortAddr::default() } else { short_addr(&self.identity.address()) };
+        let me_short = if self.trace_app == FABRIC_APP {
+            ShortAddr::default()
+        } else {
+            short_addr(&self.identity.address())
+        };
         let me_app = short_app(&self.trace_app);
         let now = self.now_ms;
         // Snapshot ids, ordered by utility so the most-likely-to-deliver bundles go
@@ -3655,7 +4323,12 @@ impl<S: Store> Node<S> {
         };
         let me_app = short_app(&self.trace_app);
         let now = self.now_ms;
-        let links: Vec<LinkId> = self.links.keys().copied().filter(|l| *l != except).collect();
+        let links: Vec<LinkId> = self
+            .links
+            .keys()
+            .copied()
+            .filter(|l| *l != except)
+            .collect();
         for l in links {
             self.offer_one_to_link(l, id, b.clone(), me_short, me_app, now);
         }
@@ -3723,13 +4396,13 @@ impl<S: Store> Node<S> {
                     let mut copy = b.clone();
                     if copy.forwarded() {
                         copy.add_hop(me_short, me_app); // provenance (§27)
-                        // Release custody only for fire-and-forget bundles. For request_ack
-                        // ones (carrier chunks, messages), keep custody until the delivery
-                        // ACK confirms receipt — handing to the destination is optimistic, and
-                        // a chunk it misses in a brief background window must be re-offerable
-                        // on its next wake, not deleted here (the ACK vaccine removes it for
-                        // real). Without this, a large transfer to a backgrounded device can
-                        // lose chunks the relay already dropped, and dedup blocks re-injection.
+                                                        // Release custody only for fire-and-forget bundles. For request_ack
+                                                        // ones (carrier chunks, messages), keep custody until the delivery
+                                                        // ACK confirms receipt — handing to the destination is optimistic, and
+                                                        // a chunk it misses in a brief background window must be re-offerable
+                                                        // on its next wake, not deleted here (the ACK vaccine removes it for
+                                                        // real). Without this, a large transfer to a backgrounded device can
+                                                        // lose chunks the relay already dropped, and dedup blocks re-injection.
                         if !own && !b.inner.flags.request_ack {
                             self.store.remove(&id);
                         }
@@ -3757,6 +4430,9 @@ impl<S: Store> Node<S> {
 
             if let Some(copy) = to_send {
                 self.send_record(link, &Wire::Bundle(copy));
+                if self.observe {
+                    self.transfers.push((link, id, direct));
+                }
                 if let Some(LinkState::Up(est)) = self.links.get_mut(&link) {
                     est.sent_bundles.insert(id);
                 }
@@ -3842,9 +4518,11 @@ impl<S: Store> Node<S> {
             let Ok(ct) = est.session.encrypt(piece) else {
                 return; // ratchet would desync; abandon the rest of this record
             };
-            if let Ok(bytes) =
-                postcard::to_allocvec(&LinkPacket::DataFrag { idx: i as u16, cnt, ct })
-            {
+            if let Ok(bytes) = postcard::to_allocvec(&LinkPacket::DataFrag {
+                idx: i as u16,
+                cnt,
+                ct,
+            }) {
                 self.outgoing.push((link, bytes));
             }
         }
@@ -3857,7 +4535,7 @@ impl<S: Store> Node<S> {
     fn dest_is_connected(&self, bundle: &Bundle) -> bool {
         let dst = match bundle.inner.dst {
             Destination::Device(a) | Destination::AckTo(a, _) => a,
-            Destination::Broadcast => return false,
+            Destination::Broadcast | Destination::Vaccine(..) => return false,
         };
         self.links
             .values()
@@ -3879,7 +4557,11 @@ fn stream_chunk_key(from: &PubKeyBytes, sid: &StreamId, seq: u64) -> String {
 
 /// KV prefix for all of one carrier stream's persisted chunks.
 fn stream_prefix(from: &PubKeyBytes, sid: &StreamId) -> String {
-    format!("strm/{}/{}/", bs58::encode(from).into_string(), bs58::encode(sid).into_string())
+    format!(
+        "strm/{}/{}/",
+        bs58::encode(from).into_string(),
+        bs58::encode(sid).into_string()
+    )
 }
 
 /// Parse a persisted-chunk key back into `(from, stream_id, seq)`.
@@ -3906,7 +4588,7 @@ fn is_for(bundle: &Bundle, addr: &PubKeyBytes) -> bool {
     match &bundle.inner.dst {
         Device(d) => d == addr,
         AckTo(d, _) => d == addr,
-        Broadcast => false,
+        Broadcast | Vaccine(..) => false,
     }
 }
 
@@ -3937,7 +4619,11 @@ mod tests {
         );
         let mut node = Node::with_store(Identity::generate(), store);
         let report = node.take_rehydrate_report();
-        assert_eq!(report.total(), 2, "both undecodable records must be counted, not dropped silently");
+        assert_eq!(
+            report.total(),
+            2,
+            "both undecodable records must be counted, not dropped silently"
+        );
         assert!(report.dropped.iter().any(|(k, _)| *k == "pending_content"));
         assert!(report.dropped.iter().any(|(k, _)| *k == "session"));
         // Draining clears it.
@@ -3960,7 +4646,9 @@ mod tests {
 
     impl Wire2 {
         fn new() -> Self {
-            Self { routes: HashMap::new() }
+            Self {
+                routes: HashMap::new(),
+            }
         }
 
         /// Connect nodes `a` and `b` with the given link ids and run the handshake.
@@ -3996,7 +4684,10 @@ mod tests {
             &from.identity,
             Destination::Device(to.address()),
             &to.identity.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: body.to_vec() },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: body.to_vec(),
+            },
             BundleOpts::default(),
         )
         .unwrap()
@@ -4023,7 +4714,10 @@ mod tests {
             &alice,
             Destination::Device(bob.address()),
             &bob.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: b"hi".to_vec() },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"hi".to_vec(),
+            },
             BundleOpts::default(),
         )
         .unwrap();
@@ -4031,7 +4725,11 @@ mod tests {
 
         relay.ingest(b.clone());
         let u = relay.undeliverable_device_bundles();
-        assert_eq!(u.len(), 1, "the held device bundle is undeliverable while bob is offline");
+        assert_eq!(
+            u.len(),
+            1,
+            "the held device bundle is undeliverable while bob is offline"
+        );
         assert_eq!(u[0].0, id);
         assert_eq!(u[0].1, bob.address());
         let round = Bundle::from_bytes(&u[0].2).expect("sealed bytes round-trip");
@@ -4046,17 +4744,28 @@ mod tests {
     fn identify_service_round_trips() {
         // Calling the built-in hop.identify on a peer returns its name/kind/address,
         // answered by the node itself — nothing surfaces to the responder's app (§29).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         nodes[1].set_name(Some("Bob's Phone".into()));
 
         nodes[0]
-            .send_service_request(nodes[1].address(), SERVICE_IDENTIFY.into(), String::new(), vec![])
+            .send_service_request(
+                nodes[1].address(),
+                SERVICE_IDENTIFY.into(),
+                String::new(),
+                vec![],
+            )
             .unwrap();
         net.pump(&mut nodes);
 
-        assert!(nodes[1].take_service_requests().is_empty(), "built-in is auto-answered");
+        assert!(
+            nodes[1].take_service_requests().is_empty(),
+            "built-in is auto-answered"
+        );
         let resps = nodes[0].take_service_responses();
         assert_eq!(resps.len(), 1);
         assert_eq!(resps[0].status, 0);
@@ -4070,12 +4779,20 @@ mod tests {
     fn unnamed_node_identifies_with_no_name() {
         // A device with no name set returns None — the caller falls back to its short
         // address. The full address still comes back so the caller can resolve it.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
         nodes[0]
-            .send_service_request(nodes[1].address(), SERVICE_IDENTIFY.into(), String::new(), vec![])
+            .send_service_request(
+                nodes[1].address(),
+                SERVICE_IDENTIFY.into(),
+                String::new(),
+                vec![],
+            )
             .unwrap();
         net.pump(&mut nodes);
 
@@ -4089,12 +4806,20 @@ mod tests {
     fn custom_service_dispatches_to_app_and_replies() {
         // A non-hop. service surfaces to the responder's app, which replies; the caller
         // gets the response correlated by the request id.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
         let req_id = nodes[0]
-            .send_service_request(nodes[1].address(), "app.echo".into(), "say".into(), b"hi".to_vec())
+            .send_service_request(
+                nodes[1].address(),
+                "app.echo".into(),
+                "say".into(),
+                b"hi".to_vec(),
+            )
             .unwrap();
         net.pump(&mut nodes);
 
@@ -4105,7 +4830,9 @@ mod tests {
         assert_eq!(reqs[0].args, b"hi");
         assert_eq!(reqs[0].id, req_id);
         let (from, for_id) = (reqs[0].from, reqs[0].id);
-        nodes[1].send_service_response(from, for_id, 0, b"hi back".to_vec()).unwrap();
+        nodes[1]
+            .send_service_response(from, for_id, 0, b"hi back".to_vec())
+            .unwrap();
         net.pump(&mut nodes);
 
         let resps = nodes[0].take_service_responses();
@@ -4114,20 +4841,30 @@ mod tests {
         assert_eq!(resps[0].body, b"hi back");
         // The response is the return-path delete: the request no longer lingers in our
         // store (service calls carry no ACK-vaccine, so without this it would pin forever).
-        assert!(!nodes[0].store.contains(&req_id), "request purged once its response arrives");
+        assert!(
+            !nodes[0].store.contains(&req_id),
+            "request purged once its response arrives"
+        );
     }
 
     #[test]
     fn idle_sessions_are_gc_d_from_memory_and_store() {
         // D6: a forward-secret session unused past the horizon is dropped from memory AND the
         // persisted `session/` store, so meeting many peers once doesn't grow storage forever.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         exchange_prekeys(&mut net, &mut nodes);
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
-        for b in nodes[1].take_inbox() { let _ = nodes[1].read_message(&b); }
+        for b in nodes[1].take_inbox() {
+            let _ = nodes[1].read_message(&b);
+        }
 
         let a = nodes[0].address();
         assert!(nodes[1].has_session(&a), "B established a session with A");
@@ -4137,7 +4874,10 @@ mod tests {
         // Idle past the GC horizon → the next tick prunes it (memory + store).
         nodes[1].tick(SESSION_MAX_IDLE_MS + 1);
         assert!(!nodes[1].has_session(&a), "idle session GC'd from memory");
-        assert!(nodes[1].store.get_kv(&key).is_none(), "idle session cleared from the store");
+        assert!(
+            nodes[1].store.get_kv(&key).is_none(),
+            "idle session cleared from the store"
+        );
     }
 
     #[test]
@@ -4147,28 +4887,40 @@ mod tests {
         // a SessionReset asks it to re-establish → a fresh handshake re-syncs the ratchet and
         // subsequent messages decrypt again (DESIGN.md §25).
         let id1_secret = Identity::generate().to_secret_bytes();
-        let mut nodes =
-            [Node::new(Identity::generate()), Node::from_identity_secret(&id1_secret)];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::from_identity_secret(&id1_secret),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         nodes[0].publish_prekey().unwrap();
         nodes[1].publish_prekey().unwrap();
         net.pump(&mut nodes);
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         for b in nodes[1].take_inbox() {
             nodes[1].read_message(&b).unwrap();
         }
-        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true).unwrap();
+        nodes[1]
+            .send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         for b in nodes[0].take_inbox() {
             nodes[0].read_message(&b).unwrap();
         }
-        assert!(nodes[0].has_session(&nodes[1].address()), "n0 has a session");
+        assert!(
+            nodes[0].has_session(&nodes[1].address()),
+            "n0 has a session"
+        );
 
         // n1 uninstalls: same identity, but a fresh store (no persisted session).
         nodes[1] = Node::from_identity_secret(&id1_secret);
-        assert!(!nodes[1].has_session(&nodes[0].address()), "n1 lost its session");
+        assert!(
+            !nodes[1].has_session(&nodes[0].address()),
+            "n1 lost its session"
+        );
         nodes[0].handle(BearerEvent::Disconnected(1));
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 2, 1, 2);
@@ -4176,7 +4928,14 @@ mod tests {
         net.pump(&mut nodes);
 
         // n0 still thinks it has a session → sends a SessionMessage n1 can't read.
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"during desync".to_vec(), true).unwrap();
+        nodes[0]
+            .send_message_traced(
+                nodes[1].address(),
+                "t".into(),
+                b"during desync".to_vec(),
+                true,
+            )
+            .unwrap();
         net.pump(&mut nodes);
         // Reading the undecryptable message makes n1 ask n0 to reset.
         for b in nodes[1].take_inbox() {
@@ -4188,7 +4947,9 @@ mod tests {
         }
 
         // The ratchet is healed: a fresh message now decrypts.
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"healed".to_vec(), true).unwrap();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"healed".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         let mut got: Vec<Vec<u8>> = Vec::new();
         for b in nodes[1].take_inbox() {
@@ -4196,7 +4957,10 @@ mod tests {
                 got.push(m.body);
             }
         }
-        assert!(got.contains(&b"healed".to_vec()), "ratchet recovered after the reset");
+        assert!(
+            got.contains(&b"healed".to_vec()),
+            "ratchet recovered after the reset"
+        );
     }
 
     #[test]
@@ -4207,7 +4971,10 @@ mod tests {
         // flush only ran on tick/prekey-advert, so a message queued just before the app
         // backgrounded never left even though a session later formed via the inbound path.)
         let alice = Identity::generate().to_secret_bytes();
-        let mut nodes = [Node::from_identity_secret(&alice), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::from_identity_secret(&alice),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         // Alice publishes her prekey so Bob can initiate; Bob does NOT, so Alice must defer.
@@ -4215,12 +4982,19 @@ mod tests {
         net.pump(&mut nodes);
 
         // Alice messages Bob with no prekey for him → deferred; nothing reaches Bob yet.
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"deferred".to_vec(), false).unwrap();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"deferred".to_vec(), false)
+            .unwrap();
         net.pump(&mut nodes);
-        assert!(nodes[1].take_inbox().is_empty(), "no prekey for Bob → message defers, not sent");
+        assert!(
+            nodes[1].take_inbox().is_empty(),
+            "no prekey for Bob → message defers, not sent"
+        );
 
         // Bob messages Alice first; his SessionInit establishes a session on Alice's side.
-        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"hi".to_vec(), false).unwrap();
+        nodes[1]
+            .send_message_traced(nodes[0].address(), "t".into(), b"hi".to_vec(), false)
+            .unwrap();
         net.pump(&mut nodes);
         for b in nodes[0].take_inbox() {
             let _ = nodes[0].read_message(&b); // establishing the session here must flush the deferral
@@ -4244,27 +5018,38 @@ mod tests {
         // Over a multi-copy DTN, two SessionMessages can be reassembled/processed out of
         // order. read_message must recover the earlier one from the ratchet's skipped-key
         // store — not just at the Session unit level, but through the node accessor (§25).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         nodes[0].publish_prekey().unwrap();
         nodes[1].publish_prekey().unwrap();
         net.pump(&mut nodes);
         // Establish both directions.
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         for b in nodes[1].take_inbox() {
             nodes[1].read_message(&b).unwrap();
         }
-        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true).unwrap();
+        nodes[1]
+            .send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         for b in nodes[0].take_inbox() {
             nodes[0].read_message(&b).unwrap();
         }
 
         // Two messages from 0; deliver, then process them in reverse order.
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"first".to_vec(), true).unwrap();
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"second".to_vec(), true).unwrap();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"first".to_vec(), true)
+            .unwrap();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"second".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         let mut inbox = nodes[1].take_inbox();
         assert_eq!(inbox.len(), 2, "both arrived");
@@ -4272,9 +5057,18 @@ mod tests {
 
         let mut bodies: Vec<Vec<u8>> = Vec::new();
         for b in &inbox {
-            bodies.push(nodes[1].read_message(b).unwrap().expect("decrypts out of order").body);
+            bodies.push(
+                nodes[1]
+                    .read_message(b)
+                    .unwrap()
+                    .expect("decrypts out of order")
+                    .body,
+            );
         }
-        assert!(bodies.contains(&b"first".to_vec()), "earlier message recovered from skipped keys");
+        assert!(
+            bodies.contains(&b"first".to_vec()),
+            "earlier message recovered from skipped keys"
+        );
         assert!(bodies.contains(&b"second".to_vec()));
     }
 
@@ -4292,7 +5086,9 @@ mod tests {
         let mut r = Node::from_identity_secret(&secret);
         // First three chunks arrive in one wake (not the final one).
         for (i, c) in chunks.iter().take(3).enumerate() {
-            assert!(r.accept_stream_chunk(from, sid, i as u64, c.clone(), false).is_none());
+            assert!(r
+                .accept_stream_chunk(from, sid, i as u64, c.clone(), false)
+                .is_none());
         }
 
         // Beacon-mode kill + relaunch: rebuild from the persisted store. In-memory reassembly
@@ -4301,12 +5097,21 @@ mod tests {
         let mut r = Node::with_store(Identity::from_secret_bytes(&secret), store);
 
         // Remaining chunks arrive on a later wake; the final one completes the message.
-        assert!(r.accept_stream_chunk(from, sid, 3, chunks[3].clone(), false).is_none());
+        assert!(r
+            .accept_stream_chunk(from, sid, 3, chunks[3].clone(), false)
+            .is_none());
         let done = r.accept_stream_chunk(from, sid, 4, chunks[4].clone(), true);
-        assert_eq!(done.as_deref(), Some(full.as_slice()), "resumed and completed across restart");
+        assert_eq!(
+            done.as_deref(),
+            Some(full.as_slice()),
+            "resumed and completed across restart"
+        );
 
         // Completion clears the persisted chunks.
-        assert!(r.clone_store().list_kv("strm/").is_empty(), "persisted chunks cleared");
+        assert!(
+            r.clone_store().list_kv("strm/").is_empty(),
+            "persisted chunks cleared"
+        );
     }
 
     #[test]
@@ -4316,25 +5121,34 @@ mod tests {
         // fails to decrypt. With the session persisted to the store, a restart rehydrates it
         // and decryption resumes (DESIGN.md §25).
         let id1_secret = Identity::generate().to_secret_bytes();
-        let mut nodes =
-            [Node::new(Identity::generate()), Node::from_identity_secret(&id1_secret)];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::from_identity_secret(&id1_secret),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
         nodes[0].publish_prekey().unwrap();
         nodes[1].publish_prekey().unwrap();
         net.pump(&mut nodes);
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         for b in nodes[1].take_inbox() {
             nodes[1].read_message(&b).unwrap();
         }
-        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true).unwrap();
+        nodes[1]
+            .send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         for b in nodes[0].take_inbox() {
             nodes[0].read_message(&b).unwrap();
         }
-        assert!(nodes[1].has_session(&nodes[0].address()), "n1 has a session before restart");
+        assert!(
+            nodes[1].has_session(&nodes[0].address()),
+            "n1 has a session before restart"
+        );
 
         // Beacon-mode kill + relaunch of n1: rebuild it from its persisted store.
         let store = nodes[1].clone_store();
@@ -4349,14 +5163,21 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 2, 1, 2);
         nodes[0]
-            .send_message_traced(nodes[1].address(), "image/jpeg".into(), b"after restart".to_vec(), true)
+            .send_message_traced(
+                nodes[1].address(),
+                "image/jpeg".into(),
+                b"after restart".to_vec(),
+                true,
+            )
             .unwrap();
         net.pump(&mut nodes);
 
         let inbox = nodes[1].take_inbox();
         assert_eq!(inbox.len(), 1, "message after restart delivered");
-        let m =
-            nodes[1].read_message(&inbox[0]).unwrap().expect("decrypts with the restored ratchet");
+        let m = nodes[1]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("decrypts with the restored ratchet");
         assert_eq!(m.body, b"after restart");
     }
 
@@ -4367,7 +5188,10 @@ mod tests {
         // SessionMessage, which deliver() then carrier-chunks. Reassembly + ratchet-decrypt
         // must yield the exact bytes. (Earlier large-message tests had no session → static
         // seal, so they never exercised the ratchet + carrier interaction.)
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
@@ -4378,17 +5202,24 @@ mod tests {
 
         // Establish the session both ways, reading each received bundle exactly as the app
         // does (take_inbox → read_message), so the ratchet actually advances on both sides.
-        nodes[0].send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true).unwrap();
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         for b in nodes[1].take_inbox() {
             nodes[1].read_message(&b).unwrap();
         }
-        nodes[1].send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true).unwrap();
+        nodes[1]
+            .send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
         for b in nodes[0].take_inbox() {
             nodes[0].read_message(&b).unwrap();
         }
-        assert!(nodes[0].has_session(&nodes[1].address()), "session established");
+        assert!(
+            nodes[0].has_session(&nodes[1].address()),
+            "session established"
+        );
 
         // Now the large image over the established session.
         let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
@@ -4399,7 +5230,10 @@ mod tests {
 
         let inbox = nodes[1].take_inbox();
         assert_eq!(inbox.len(), 1, "large image over a session reassembled");
-        let m = nodes[1].read_message(&inbox[0]).unwrap().expect("a user message");
+        let m = nodes[1]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("a user message");
         assert_eq!(m.content_type, "image/jpeg");
         assert_eq!(m.body, body, "ratchet-decrypted bytes match exactly");
     }
@@ -4419,9 +5253,15 @@ mod tests {
             &alice,
             Destination::Device(bob.address()),
             &bob.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: b"hi".to_vec() },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"hi".to_vec(),
+            },
             BundleOpts {
-                flags: BundleFlags { request_ack: true, ..Default::default() },
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -4453,7 +5293,10 @@ mod tests {
             }
         }
         assert!(got, "bob received the message");
-        assert!(relay.store.contains(&id), "relay keeps custody — ACK not yet seen");
+        assert!(
+            relay.store.contains(&id),
+            "relay keeps custody — ACK not yet seen"
+        );
 
         // Deliver bob's withheld ACK; the vaccine now releases the relay's copy.
         for (l, bytes) in bob.drain_outgoing() {
@@ -4481,18 +5324,33 @@ mod tests {
 
         let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect(); // ~300KB
         let dst = nodes[2].address();
-        let orig = nodes[0].send_message_traced(dst, "image/jpeg".into(), body.clone(), true).unwrap();
+        let orig = nodes[0]
+            .send_message_traced(dst, "image/jpeg".into(), body.clone(), true)
+            .unwrap();
         net.pump(&mut nodes);
 
         // The chunked message reports real relay progress + delivery under its original id
         // (carriers travel as separate bundles but attribute back — not a stuck "Sending").
         let (relayed, delivered, _, _) = nodes[0].message_status(&orig).expect("tracked");
-        assert!(relayed >= 1, "shows Sent N (carriers relayed to the relay), not 0");
-        assert!(delivered, "delivery ACK for the reassembled original marks it Delivered");
+        assert!(
+            relayed >= 1,
+            "shows Sent N (carriers relayed to the relay), not 0"
+        );
+        assert!(
+            delivered,
+            "delivery ACK for the reassembled original marks it Delivered"
+        );
 
         let inbox = nodes[2].take_inbox();
-        assert_eq!(inbox.len(), 1, "reassembled into exactly one message through the relay");
-        let m = nodes[2].read_message(&inbox[0]).unwrap().expect("a user message");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "reassembled into exactly one message through the relay"
+        );
+        let m = nodes[2]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("a user message");
         assert_eq!(m.content_type, "image/jpeg");
         assert_eq!(m.body, body, "bytes reassembled exactly, in order");
     }
@@ -4522,18 +5380,37 @@ mod tests {
         net.pump(&mut nodes);
 
         // The relay never recognized it as anyone's — it just floods past.
-        assert!(nodes[1].take_inbox().is_empty(), "the relay can't tell the message is Bob's");
+        assert!(
+            nodes[1].take_inbox().is_empty(),
+            "the relay can't tell the message is Bob's"
+        );
 
         // Bob recognized + holds exactly one; on the wire it named no src and flooded.
         let inbox = nodes[2].take_inbox();
-        assert_eq!(inbox.len(), 1, "only the intended recipient recognizes the private bundle");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "only the intended recipient recognizes the private bundle"
+        );
         assert!(inbox[0].is_private());
-        assert_eq!(inbox[0].inner.src, [0u8; 32], "no cleartext sender on the wire");
-        assert!(matches!(inbox[0].inner.dst, Destination::Broadcast), "floods — no cleartext dst");
+        assert_eq!(
+            inbox[0].inner.src, [0u8; 32],
+            "no cleartext sender on the wire"
+        );
+        assert!(
+            matches!(inbox[0].inner.dst, Destination::Broadcast),
+            "floods — no cleartext dst"
+        );
 
         // ...and Bob reads the *real* sender (from inside the seal) plus the content.
-        let m = nodes[2].read_message(&inbox[0]).unwrap().expect("a user message");
-        assert_eq!(m.from, alice, "sender recovered from the seal, not the (zeroed) envelope");
+        let m = nodes[2]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("a user message");
+        assert_eq!(
+            m.from, alice,
+            "sender recovered from the seal, not the (zeroed) envelope"
+        );
         assert_eq!(m.content_type, "text/plain");
         assert_eq!(m.body, b"meet at dawn");
     }
@@ -4542,21 +5419,31 @@ mod tests {
     fn private_conversation_round_trips_both_ways() {
         // A full private exchange: Alice → Bob, then Bob → Alice — both untraceable and both
         // forward-secret (the reply rides the session Bob established from Alice's first message).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         exchange_prekeys(&mut net, &mut nodes);
         let alice = nodes[0].address();
         let bob = nodes[1].address();
 
-        nodes[0].send_message(bob, "t".into(), b"hi bob".to_vec(), false).unwrap();
+        nodes[0]
+            .send_message(bob, "t".into(), b"hi bob".to_vec(), false)
+            .unwrap();
         net.pump(&mut nodes);
         let inb = nodes[1].take_inbox();
         let m = nodes[1].read_message(&inb[0]).unwrap().expect("msg");
         assert_eq!((m.from, m.body.as_slice()), (alice, b"hi bob".as_slice()));
-        assert!(nodes[1].has_session(&alice), "Bob established a session from the private SessionInit");
+        assert!(
+            nodes[1].has_session(&alice),
+            "Bob established a session from the private SessionInit"
+        );
 
-        nodes[1].send_message(alice, "t".into(), b"hi alice".to_vec(), false).unwrap();
+        nodes[1]
+            .send_message(alice, "t".into(), b"hi alice".to_vec(), false)
+            .unwrap();
         net.pump(&mut nodes);
         let inb = nodes[0].take_inbox();
         let m = nodes[0].read_message(&inb[0]).unwrap().expect("reply");
@@ -4568,21 +5455,33 @@ mod tests {
         // require-ratchet (§25) holds for private sends too: with no prekey for Bob yet, the
         // message is queued ("Sending…"), never static-sealed — then flushes the moment Bob's
         // prekey advert arrives, and reaches him untraceably.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         nodes[0].publish_prekey().unwrap(); // Alice's prekey out; Bob's NOT yet
         net.pump(&mut nodes);
 
         let bob = nodes[1].address();
-        nodes[0].send_message(bob, "t".into(), b"later".to_vec(), false).unwrap();
+        nodes[0]
+            .send_message(bob, "t".into(), b"later".to_vec(), false)
+            .unwrap();
         net.pump(&mut nodes);
-        assert!(nodes[1].take_inbox().is_empty(), "no prekey for Bob → deferred, not sent");
+        assert!(
+            nodes[1].take_inbox().is_empty(),
+            "no prekey for Bob → deferred, not sent"
+        );
 
         nodes[1].publish_prekey().unwrap(); // Bob's prekey arrives → Alice can ratchet + tag
         net.pump(&mut nodes);
         let inb = nodes[1].take_inbox();
-        assert_eq!(inb.len(), 1, "deferred private message flushed once the prekey was known");
+        assert_eq!(
+            inb.len(),
+            1,
+            "deferred private message flushed once the prekey was known"
+        );
         let m = nodes[1].read_message(&inb[0]).unwrap().expect("msg");
         assert_eq!(m.body, b"later");
         assert_eq!(m.from, nodes[0].address());
@@ -4605,14 +5504,26 @@ mod tests {
         exchange_prekeys(&mut net, &mut nodes);
 
         let bob = nodes[2].address();
-        let id = nodes[0].send_message(bob, "t".into(), b"ack me".to_vec(), true).unwrap();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"ack me".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
 
-        assert_eq!(nodes[2].take_inbox().len(), 1, "Bob received the private message");
+        assert_eq!(
+            nodes[2].take_inbox().len(),
+            1,
+            "Bob received the private message"
+        );
         let (_, delivered, _, _) = nodes[0].message_status(&id).expect("tracked");
-        assert!(delivered, "the private ACK flipped Alice's message to Delivered");
+        assert!(
+            delivered,
+            "the private ACK flipped Alice's message to Delivered"
+        );
         // The relay is an endpoint for neither leg — both were anonymous broadcasts.
-        assert!(nodes[1].take_inbox().is_empty(), "the relay is not an endpoint for either leg");
+        assert!(
+            nodes[1].take_inbox().is_empty(),
+            "the relay is not an endpoint for either leg"
+        );
     }
 
     #[test]
@@ -4620,7 +5531,10 @@ mod tests {
         // "Delivered" should tell the sender how long A→B took (the forward leg the recipient
         // observed), not the A→B→A round trip. The recipient stamps `received − created_at`
         // into the ACK; the sender surfaces it via message_status's 4th field.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         exchange_prekeys(&mut net, &mut nodes);
@@ -4630,12 +5544,17 @@ mod tests {
         nodes[0].set_time(1_000);
         nodes[1].set_time(2_500);
         let bob = nodes[1].address();
-        let id = nodes[0].send_message(bob, "t".into(), b"time me".to_vec(), true).unwrap();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"time me".to_vec(), true)
+            .unwrap();
         net.pump(&mut nodes);
 
         let (_, delivered, _, fwd_ms) = nodes[0].message_status(&id).expect("tracked");
         assert!(delivered);
-        assert_eq!(fwd_ms, 1_500, "ACK carries the A→B forward latency the recipient saw");
+        assert_eq!(
+            fwd_ms, 1_500,
+            "ACK carries the A→B forward latency the recipient saw"
+        );
     }
 
     // --- §39 P4 gradient routing -----------------------------------------------
@@ -4670,15 +5589,30 @@ mod tests {
 
         // R laid a gradient toward B's mailbox, pointing at the R—B link (R's link 2).
         let bmail = crypto::mailbox_tag(&nodes[2].address(), 0);
-        let g = nodes[1].recv_gradient.get(&bmail).expect("R holds a gradient toward B");
-        assert_eq!(g.inbound, 2, "gradient points down the R—B link, not R—A/R—D");
+        let g = nodes[1]
+            .recv_gradient
+            .get(&bmail)
+            .expect("R holds a gradient toward B");
+        assert_eq!(
+            g.inbound, 2,
+            "gradient points down the R—B link, not R—A/R—D"
+        );
 
         let bob = nodes[2].address();
-        let id = nodes[0].send_message(bob, "t".into(), b"routed".to_vec(), false).unwrap();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"routed".to_vec(), false)
+            .unwrap();
         net.pump(&mut nodes);
 
-        assert_eq!(nodes[2].take_inbox().len(), 1, "B received it via the gradient (through R)");
-        assert!(!nodes[3].store.contains(&id), "decoy D never got a copy — directed, not flooded");
+        assert_eq!(
+            nodes[2].take_inbox().len(),
+            1,
+            "B received it via the gradient (through R)"
+        );
+        assert!(
+            !nodes[3].store.contains(&id),
+            "decoy D never got a copy — directed, not flooded"
+        );
     }
 
     #[test]
@@ -4703,11 +5637,15 @@ mod tests {
         net.pump(&mut nodes);
 
         assert!(
-            nodes[1].recv_gradient.contains_key(&crypto::mailbox_tag(&baddr, 1)),
+            nodes[1]
+                .recv_gradient
+                .contains_key(&crypto::mailbox_tag(&baddr, 1)),
             "relay holds a gradient for B's current-epoch mailbox"
         );
         assert!(
-            nodes[1].recv_gradient.contains_key(&crypto::mailbox_tag(&baddr, 0)),
+            nodes[1]
+                .recv_gradient
+                .contains_key(&crypto::mailbox_tag(&baddr, 0)),
             "relay ALSO holds a gradient for B's previous-epoch mailbox (the window)"
         );
     }
@@ -4726,7 +5664,10 @@ mod tests {
         let mspk = mallory.derive_prekey();
         let pk = Advert::publish(
             &mallory,
-            AdvertKind::PreKey { spk_pub: mspk.public, spk_sig: mspk.sig.to_vec() },
+            AdvertKind::PreKey {
+                spk_pub: mspk.public,
+                spk_sig: mspk.sig.to_vec(),
+            },
             now,
             10_000_000,
             1,
@@ -4766,14 +5707,232 @@ mod tests {
         let (mut nodes, mut net) = gradient_topology();
 
         let bmail = crypto::mailbox_tag(&nodes[2].address(), 0);
-        assert!(!nodes[1].recv_gradient.contains_key(&bmail), "no beacon → no gradient at R");
+        assert!(
+            !nodes[1].recv_gradient.contains_key(&bmail),
+            "no beacon → no gradient at R"
+        );
 
         let bob = nodes[2].address();
-        let id = nodes[0].send_message(bob, "t".into(), b"flooded".to_vec(), false).unwrap();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"flooded".to_vec(), false)
+            .unwrap();
         net.pump(&mut nodes);
 
-        assert_eq!(nodes[2].take_inbox().len(), 1, "B still gets it on the flood fallback");
-        assert!(nodes[3].store.contains(&id), "decoy D got a copy — flooded (no gradient to steer it)");
+        assert_eq!(
+            nodes[2].take_inbox().len(),
+            1,
+            "B still gets it on the flood fallback"
+        );
+        assert!(
+            nodes[3].store.contains(&id),
+            "decoy D got a copy — flooded (no gradient to steer it)"
+        );
+    }
+
+    #[test]
+    fn reply_ack_returns_via_intermittent_carrier() {
+        // The sim's stuck topology: `you` is BLE-only and meets a carrier only in passes; the
+        // carrier and `friend` sit on a relay. m1 you→friend acks fine. friend's REPLY m2 reaches
+        // `you` on a later pass — and m2's ACK must ride back on subsequent passes. In the browser
+        // sim this ack never comes home (friend stays "Sending…" forever).
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 you (intermittent)
+            Node::new(Identity::generate()), // 1 carrier
+            Node::new(Identity::generate()), // 2 relay
+            Node::new(Identity::generate()), // 3 friend
+        ];
+        for n in nodes.iter_mut() {
+            n.publish_prekey().unwrap();
+        } // like the sim shim does at add()
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 1, 51, 2, 52); // carrier <-> relay (always up)
+        net.connect(&mut nodes, 2, 53, 3, 54); // relay <-> friend (always up)
+
+        // pass 1: `you` meets the carrier; prekeys gossip everywhere (re-gossip needs TIME to fire).
+        net.connect(&mut nodes, 0, 11, 1, 12);
+        let mut now = 0u64;
+        let settle = |nodes: &mut [Node], net: &mut Wire2, now: &mut u64, secs: u64| {
+            for _ in 0..secs.div_ceil(5) {
+                *now += 5_000;
+                for n in nodes.iter_mut() {
+                    n.tick(*now);
+                }
+                net.pump(nodes);
+            }
+        };
+        settle(&mut nodes, &mut net, &mut now, 60);
+        let friend = nodes[3].address();
+        let you = nodes[0].address();
+        assert!(nodes[0].knows_prekey(&friend), "prekeys gossiped to you");
+        assert!(nodes[3].knows_prekey(&you), "prekeys gossiped to friend");
+
+        // m1 you→friend delivers + acks while the pass is live.
+        let _m1 = nodes[0]
+            .send_message(friend, "t".into(), b"m1".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[3].take_inbox().len(), 1, "m1 delivered");
+
+        // the pass ends: you drops off. friend replies while you is away.
+        nodes[0].handle(BearerEvent::Disconnected(11));
+        nodes[1].handle(BearerEvent::Disconnected(12));
+        net.routes.remove(&(0, 11));
+        net.routes.remove(&(1, 12));
+        let m2 = nodes[3]
+            .send_message(you, "t".into(), b"m2".to_vec(), true)
+            .unwrap();
+        settle(&mut nodes, &mut net, &mut now, 120); // m2 spreads to relay + carrier, parks there
+
+        // pass 2: the carrier meets you again — m2 must deliver, and you's ACK must start back.
+        net.connect(&mut nodes, 0, 13, 1, 14);
+        settle(&mut nodes, &mut net, &mut now, 60);
+        assert_eq!(
+            nodes[0].take_inbox().len(),
+            1,
+            "m2 delivered to you on the second pass"
+        );
+        settle(&mut nodes, &mut net, &mut now, 120);
+
+        // the ACK rides the still-connected carrier→relay→friend chain: friend must see Delivered.
+        let done = nodes[3]
+            .sends_status()
+            .iter()
+            .any(|(id, _, delivered)| id == &m2 && *delivered);
+        assert!(
+            done,
+            "friend's reply must flip to Delivered once the ACK rides back"
+        );
+    }
+
+    #[test]
+    fn a_verified_vaccine_is_delivery_proof_for_the_sender() {
+        // The sender's private ACK can be lost, and once the vaccine immunizes the mesh a
+        // retransmit can never trigger a re-ACK — so the SENDER must accept a verified vaccine
+        // as proof of delivery (same CDH token, same forgery bar as the relay-purge check).
+        let (mut nodes, mut net) = gradient_topology();
+        let bob = nodes[2].address();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"vaxproof".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[2].take_inbox().len(), 1, "delivered");
+
+        // Simulate the ACK being lost: sender still shows undelivered.
+        let before = nodes[0]
+            .sends_status()
+            .iter()
+            .any(|(i, _, d)| i == &id && *d);
+        // (If the ack already made it through the pump, the point still holds — craft the vaccine
+        // path explicitly against a FRESH sender copy below.)
+        let eph = nodes[1]
+            .store
+            .get(&id)
+            .map(|b| b.inner.private.unwrap().ephemeral);
+        if let (false, Some(eph)) = (before, eph) {
+            let token = crypto::recognition_shared(&nodes[2].prekey.secret_bytes(), &eph);
+            let vax = Bundle::create_vaccine(
+                id,
+                token,
+                BundleOpts {
+                    created_at: 0,
+                    ..Default::default()
+                },
+            );
+            nodes[0].on_bundle(9, vax);
+        }
+        // Whether via the pumped ack or the crafted vaccine: the sender must show Delivered.
+        let done = nodes[0]
+            .sends_status()
+            .iter()
+            .any(|(i, _, d)| i == &id && *d);
+        assert!(
+            done,
+            "a verified vaccine flips the sender's send to Delivered"
+        );
+
+        // A forged vaccine must NOT flip an undelivered send.
+        let id2 = nodes[0]
+            .send_message(bob, "t".into(), b"fresh".to_vec(), true)
+            .unwrap();
+        let forged = Bundle::create_vaccine(
+            id2,
+            [0xEE; 32],
+            BundleOpts {
+                created_at: 0,
+                ..Default::default()
+            },
+        );
+        nodes[0].on_bundle(9, forged);
+        let bad = nodes[0]
+            .sends_status()
+            .iter()
+            .any(|(i, _, d)| i == &id2 && *d);
+        assert!(!bad, "a forged vaccine must not mark a send delivered");
+    }
+
+    #[test]
+    fn delivery_vaccine_purges_relay_copy_but_a_forged_token_cannot() {
+        // §39 vaccine: on delivery the recipient reveals its recognition DH; a relay holding the
+        // bundle verifies token→tag and drops its copy. A forged token (anyone who saw the flood
+        // knows the id) must NOT purge it — only a real delivery can. No src/dst is ever revealed.
+        let (mut nodes, mut net) = gradient_topology();
+
+        // No-ack send ⇒ B delivers but emits NO vaccine, so R keeps its relayed copy for us to test.
+        let bob = nodes[2].address();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"vax".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[2].take_inbox().len(), 1, "B received it");
+        assert!(
+            nodes[1].store.contains(&id),
+            "relay R holds a copy after the flood"
+        );
+
+        // The real recognition token = B's prekey secret DH'd against the bundle's ephemeral.
+        let eph = nodes[1]
+            .store
+            .get(&id)
+            .unwrap()
+            .inner
+            .private
+            .unwrap()
+            .ephemeral;
+        let real = crypto::recognition_shared(&nodes[2].prekey.secret_bytes(), &eph);
+
+        // A forged vaccine (wrong token) is rejected — R keeps its copy.
+        let forged = Bundle::create_vaccine(
+            id,
+            [0xAB; 32],
+            BundleOpts {
+                created_at: 0,
+                ..Default::default()
+            },
+        );
+        nodes[1].on_bundle(9, forged);
+        assert!(
+            nodes[1].store.contains(&id),
+            "a forged token must NOT purge the relay's copy"
+        );
+
+        // The real vaccine drops it and marks it immune (a late copy would be dropped too).
+        let vax = Bundle::create_vaccine(
+            id,
+            real,
+            BundleOpts {
+                created_at: 0,
+                ..Default::default()
+            },
+        );
+        nodes[1].on_bundle(9, vax);
+        assert!(
+            !nodes[1].store.contains(&id),
+            "the real vaccine purges the relay's copy"
+        );
+        assert!(
+            nodes[1].immune.contains_key(&id),
+            "and marks it immune against re-flood"
+        );
     }
 
     #[test]
@@ -4791,14 +5950,26 @@ mod tests {
         for n in nodes.iter_mut() {
             n.tick(t);
         }
-        assert!(!nodes[1].recv_gradient.contains_key(&bmail), "stale gradient pruned at R");
+        assert!(
+            !nodes[1].recv_gradient.contains_key(&bmail),
+            "stale gradient pruned at R"
+        );
 
         // Delivery still works (via flood), and the decoy now sees it again (no gradient to steer).
         let bob = nodes[2].address();
-        let id = nodes[0].send_message(bob, "t".into(), b"after expiry".to_vec(), false).unwrap();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"after expiry".to_vec(), false)
+            .unwrap();
         net.pump(&mut nodes);
-        assert_eq!(nodes[2].take_inbox().len(), 1, "B still reachable after the gradient expired");
-        assert!(nodes[3].store.contains(&id), "fell back to flood (decoy got a copy)");
+        assert_eq!(
+            nodes[2].take_inbox().len(),
+            1,
+            "B still reachable after the gradient expired"
+        );
+        assert!(
+            nodes[3].store.contains(&id),
+            "fell back to flood (decoy got a copy)"
+        );
     }
 
     #[test]
@@ -4815,7 +5986,10 @@ mod tests {
         let pb = Bundle::create_private(
             &bob.address(),
             &bob.derive_prekey().public,
-            &Payload::PeerMessage { content_type: "t".into(), body: b"offline".to_vec() },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"offline".to_vec(),
+            },
             Some(bob_mailbox),
             BundleOpts::default(),
         )
@@ -4827,9 +6001,20 @@ mod tests {
 
         // No recipient, no beacon → spoolable by mailbox-tag; and NOT on the device handoff path.
         let s = relay.spoolable_private_bundles();
-        assert_eq!(s.len(), 1, "private bundle with no live gradient is spoolable");
-        assert_eq!((s[0].0, s[0].1), (pid, bob_mailbox), "keyed by bob's mailbox-tag");
-        assert!(relay.undeliverable_device_bundles().is_empty(), "a Broadcast private bundle never rides the device handoff");
+        assert_eq!(
+            s.len(),
+            1,
+            "private bundle with no live gradient is spoolable"
+        );
+        assert_eq!(
+            (s[0].0, s[0].1),
+            (pid, bob_mailbox),
+            "keyed by bob's mailbox-tag"
+        );
+        assert!(
+            relay.undeliverable_device_bundles().is_empty(),
+            "a Broadcast private bundle never rides the device handoff"
+        );
 
         // Bob comes online behind the relay and beacons (the want-beacon). He publishes his
         // prekey too (as every real node does on startup), so the relay can bind his mailbox to
@@ -4843,11 +6028,23 @@ mod tests {
         net.pump(&mut nodes);
 
         // The relay laid a gradient toward bob AND surfaced his mailbox as a want-beacon (pull trigger).
-        assert!(nodes[0].recv_gradient.contains_key(&bob_mailbox), "gradient laid from the beacon");
-        assert!(nodes[0].take_wanted_mailboxes().contains(&bob_mailbox), "beacon surfaced the wanted mailbox");
-        assert!(nodes[0].take_wanted_mailboxes().is_empty(), "wanted drains once");
+        assert!(
+            nodes[0].recv_gradient.contains_key(&bob_mailbox),
+            "gradient laid from the beacon"
+        );
+        assert!(
+            nodes[0].take_wanted_mailboxes().contains(&bob_mailbox),
+            "beacon surfaced the wanted mailbox"
+        );
+        assert!(
+            nodes[0].take_wanted_mailboxes().is_empty(),
+            "wanted drains once"
+        );
         // Live gradient now → the bundle is no longer spooled (P4 owns it).
-        assert!(nodes[0].spoolable_private_bundles().is_empty(), "live gradient → not spooled (spool XOR route)");
+        assert!(
+            nodes[0].spoolable_private_bundles().is_empty(),
+            "live gradient → not spooled (spool XOR route)"
+        );
     }
 
     #[test]
@@ -4855,7 +6052,10 @@ mod tests {
         // A big message (e.g. an image body) exceeds one bundle, so it's transparently
         // carried as a stream of chunks and reassembled — arriving as a normal inbox
         // message with the right content type and exact bytes (DESIGN.md §20).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
@@ -4868,7 +6068,10 @@ mod tests {
 
         let inbox = nodes[1].take_inbox();
         assert_eq!(inbox.len(), 1, "reassembled into exactly one message");
-        let m = nodes[1].read_message(&inbox[0]).unwrap().expect("a user message");
+        let m = nodes[1]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("a user message");
         assert_eq!(m.content_type, "image/jpeg");
         assert_eq!(m.body, body, "bytes reassembled exactly, in order");
     }
@@ -4877,7 +6080,10 @@ mod tests {
     fn hops_request_response_round_trips() {
         // A hops:// request sealed to an endpoint surfaces there as an HTTP request; the
         // endpoint replies and the client gets the response, correlated by request id (§30).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         let endpoint = nodes[1].address();
@@ -4902,7 +6108,9 @@ mod tests {
         assert_eq!(reqs[0].method, "GET");
         assert_eq!(reqs[0].url, "/hello");
         let (from, rid) = (reqs[0].from, reqs[0].id);
-        nodes[1].send_http_response(from, rid, 200, vec![], b"world".to_vec()).unwrap();
+        nodes[1]
+            .send_http_response(from, rid, 200, vec![], b"world".to_vec())
+            .unwrap();
         net.pump(&mut nodes);
 
         // Client side: the response arrives, correlated to the request.
@@ -4911,7 +6119,10 @@ mod tests {
         assert_eq!(resps[0].for_id, req);
         assert_eq!(resps[0].status, 200);
         assert_eq!(resps[0].body, b"world");
-        assert!(!nodes[0].store.contains(&req), "request purged once answered");
+        assert!(
+            !nodes[0].store.contains(&req),
+            "request purged once answered"
+        );
     }
 
     #[test]
@@ -4924,7 +6135,11 @@ mod tests {
 
         assert_eq!(node.resolve_hns("Example.HopMe.sh."), HnsLookup::Pending);
         let lookups = node.take_dns_lookups();
-        assert_eq!(lookups, vec!["example.hopme.sh".to_string()], "normalized + queued for host");
+        assert_eq!(
+            lookups,
+            vec!["example.hopme.sh".to_string()],
+            "normalized + queued for host"
+        );
 
         let endpoint = Identity::generate().address();
         node.provide_dns_answer("example.hopme.sh", Some(endpoint), 300);
@@ -4935,7 +6150,10 @@ mod tests {
         assert_eq!(results[0].address, Some(endpoint));
 
         // Now cached: a second resolve serves from cache with no new lookup.
-        assert_eq!(node.resolve_hns("example.hopme.sh"), HnsLookup::Cached(Some(endpoint)));
+        assert_eq!(
+            node.resolve_hns("example.hopme.sh"),
+            HnsLookup::Cached(Some(endpoint))
+        );
         assert!(node.take_dns_lookups().is_empty());
     }
 
@@ -4951,7 +6169,10 @@ mod tests {
         let results = node.take_hns_results();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].address, None, "no endpoint → resolution error");
-        assert_eq!(node.resolve_hns("thisdoesnotexist.com"), HnsLookup::Cached(None));
+        assert_eq!(
+            node.resolve_hns("thisdoesnotexist.com"),
+            HnsLookup::Cached(None)
+        );
     }
 
     #[test]
@@ -4961,7 +6182,10 @@ mod tests {
         // reaches the internet peer and is surfaced for a DNS lookup; the peer then answers with
         // a DNSSEC proof the asker re-validates (that round-trip needs real DNSSEC data, so it's
         // covered by the dnssec module tests + live verification, not here).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         nodes[1].set_internet(true); // the nearby peer has internet
@@ -4981,11 +6205,17 @@ mod tests {
         // fail — it stays pending and completes once we gain internet (§30).
         let mut node = Node::new(Identity::generate());
         assert_eq!(node.resolve_hns("example.hopme.sh"), HnsLookup::Pending);
-        assert!(node.take_dns_lookups().is_empty(), "nothing to look up while offline");
+        assert!(
+            node.take_dns_lookups().is_empty(),
+            "nothing to look up while offline"
+        );
 
         // Gain internet → the pending domain is queued for our own DNS lookup.
         node.set_internet(true);
-        assert_eq!(node.take_dns_lookups(), vec!["example.hopme.sh".to_string()]);
+        assert_eq!(
+            node.take_dns_lookups(),
+            vec!["example.hopme.sh".to_string()]
+        );
         let endpoint = Identity::generate().address();
         node.provide_dns_answer("example.hopme.sh", Some(endpoint), 300);
         assert_eq!(node.cached_hns("example.hopme.sh"), Some(Some(endpoint)));
@@ -4996,7 +6226,10 @@ mod tests {
         // If our delivery-ACK is lost, the sender retransmits; a duplicate reaching the
         // destination must re-emit the ACK (so the sender can stop) — but throttled, so a
         // burst of duplicates can't cause an ACK storm (DESIGN.md §7).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
@@ -5005,7 +6238,10 @@ mod tests {
             .send_to(&nodes[1].address(), "t".into(), b"hi".to_vec(), true)
             .unwrap()
             .unwrap();
-        let msg = nodes[0].store.get(&id).expect("our message is in the store");
+        let msg = nodes[0]
+            .store
+            .get(&id)
+            .expect("our message is in the store");
         net.pump(&mut nodes);
         assert!(nodes[1].take_inbox().len() == 1, "delivered once");
 
@@ -5013,12 +6249,21 @@ mod tests {
         nodes[1].set_time(REACK_MIN_INTERVAL_MS + 1);
         let _ = nodes[1].drain_outgoing();
         nodes[1].ingest(msg.clone());
-        assert!(!nodes[1].drain_outgoing().is_empty(), "re-acked the duplicate");
-        assert!(nodes[1].take_inbox().is_empty(), "but did NOT re-deliver to the inbox");
+        assert!(
+            !nodes[1].drain_outgoing().is_empty(),
+            "re-acked the duplicate"
+        );
+        assert!(
+            nodes[1].take_inbox().is_empty(),
+            "but did NOT re-deliver to the inbox"
+        );
 
         // Another duplicate immediately → within throttle → no new ACK.
         nodes[1].ingest(msg);
-        assert!(nodes[1].drain_outgoing().is_empty(), "throttled: no ACK storm");
+        assert!(
+            nodes[1].drain_outgoing().is_empty(),
+            "throttled: no ACK storm"
+        );
     }
 
     #[test]
@@ -5026,7 +6271,10 @@ mod tests {
         // Custody policy (§6): under cap pressure, a bundle we've already relayed (and held
         // past the grace window) is evicted before one we haven't relayed yet — so a flood
         // of big transfers can't push out legitimate, not-yet-forwarded messages.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         nodes[0].set_time(0);
@@ -5038,7 +6286,10 @@ mod tests {
                 &Identity::generate(),
                 Destination::Device(third),
                 &third,
-                &Payload::PeerMessage { content_type: "t".into(), body: b.to_vec() },
+                &Payload::PeerMessage {
+                    content_type: "t".into(),
+                    body: b.to_vec(),
+                },
                 BundleOpts::default(),
             )
             .unwrap()
@@ -5059,13 +6310,22 @@ mod tests {
         let b_id = b.id();
         nodes[0].ingest(b);
 
-        assert!(!nodes[0].store.contains(&a_id), "already-relayed, past-grace bundle is evicted");
-        assert!(nodes[0].store.contains(&b_id), "not-yet-relayed bundle is kept");
+        assert!(
+            !nodes[0].store.contains(&a_id),
+            "already-relayed, past-grace bundle is evicted"
+        );
+        assert!(
+            nodes[0].store.contains(&b_id),
+            "not-yet-relayed bundle is kept"
+        );
     }
 
     #[test]
     fn handshake_then_direct_delivery() {
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
@@ -5089,7 +6349,10 @@ mod tests {
         // the (few-KB/s) BLE pipe — which is exactly the megabyte flood seen on-device. This test
         // reproduces it deterministically: connect two nodes with TWO link pairs, then verify the
         // network reaches quiescence with BOUNDED traffic (no loop) and the peer is identified once.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1); // link pair #1: node0 link1 <-> node1 link1
         net.connect(&mut nodes, 0, 2, 1, 2); // link pair #2: node0 link2 <-> node1 link2 (SAME peer)
@@ -5121,13 +6384,20 @@ mod tests {
             }
         };
 
-        assert!(quiesced, "node never reached quiescence — TRAFFIC LOOP (rounds={rounds}, bytes={total_bytes})");
+        assert!(
+            quiesced,
+            "node never reached quiescence — TRAFFIC LOOP (rounds={rounds}, bytes={total_bytes})"
+        );
         assert!(
             total_bytes < 50_000,
             "two-link handshake + one tiny message moved {total_bytes} bytes — amplification loop"
         );
         // The message must actually be delivered exactly once (not lost in the loop, not duplicated).
-        assert_eq!(nodes[1].take_inbox().len(), 1, "message should deliver exactly once over duplicate links");
+        assert_eq!(
+            nodes[1].take_inbox().len(),
+            1,
+            "message should deliver exactly once over duplicate links"
+        );
     }
 
     #[test]
@@ -5137,7 +6407,10 @@ mod tests {
         // messages crawl through over minutes/hours. This reproduces steady-state operation: two
         // connected nodes, prekeys exchanged, then many "ticks" with the periodic presence/prekey
         // re-publish the bearer does — and asserts an idle link moves only a TRICKLE, not a flood.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         exchange_prekeys(&mut net, &mut nodes);
@@ -5170,7 +6443,13 @@ mod tests {
             now += 1000;
             if s % 20 == 0 {
                 for n in nodes.iter_mut() {
-                    let _ = n.publish_service("presence".into(), "x".into(), String::new(), vec![], 120_000);
+                    let _ = n.publish_service(
+                        "presence".into(),
+                        "x".into(),
+                        String::new(),
+                        vec![],
+                        120_000,
+                    );
                 }
             }
             if s % 120 == 0 {
@@ -5187,7 +6466,13 @@ mod tests {
             now += 1000;
             if s % 20 == 0 {
                 for n in nodes.iter_mut() {
-                    let _ = n.publish_service("presence".into(), "x".into(), String::new(), vec![], 120_000);
+                    let _ = n.publish_service(
+                        "presence".into(),
+                        "x".into(),
+                        String::new(),
+                        vec![],
+                        120_000,
+                    );
                 }
             }
             tick_pump(&mut nodes, now, &mut bytes);
@@ -5195,7 +6480,10 @@ mod tests {
 
         // 30 idle seconds on an established link should move only a handful of presence adverts —
         // KB, not the tens-to-hundreds of KB the device shows. A flood means a gossip re-send loop.
-        assert!(bytes < 20_000, "idle link flooded {bytes} bytes in 30s — steady-state gossip loop");
+        assert!(
+            bytes < 20_000,
+            "idle link flooded {bytes} bytes in 30s — steady-state gossip loop"
+        );
     }
 
     #[test]
@@ -5206,7 +6494,10 @@ mod tests {
         // starves real messages — minutes-to-hours delivery. New adverts already propagate on their
         // own (not in sent_adverts), and prekeys/presence are periodically RE-published, so the full
         // re-flood is redundant. Assert the re-gossip moves only a trickle when nothing changed.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
@@ -5254,7 +6545,10 @@ mod tests {
                 }
             }
         }
-        assert!(bytes < 5_000, "re-gossip re-flooded the directory: {bytes} bytes over 5 idle cycles");
+        assert!(
+            bytes < 5_000,
+            "re-gossip re-flooded the directory: {bytes} bytes over 5 idle cycles"
+        );
     }
 
     #[test]
@@ -5279,7 +6573,13 @@ mod tests {
         // Each node's OWN securing adverts (prekey + presence) — these SHOULD re-offer on every flap.
         for n in nodes.iter_mut() {
             n.publish_prekey().unwrap();
-            let _ = n.publish_service("presence".into(), "x".into(), String::new(), vec![], 120_000);
+            let _ = n.publish_service(
+                "presence".into(),
+                "x".into(),
+                String::new(),
+                vec![],
+                120_000,
+            );
         }
         // A LARGE FOREIGN directory (40 other devices' service adverts) — the bulk that must NOT be
         // re-flooded on a flap. This is what made the field flood catastrophic.
@@ -5351,7 +6651,10 @@ mod tests {
         // AFTER the link is up must still reach the peer over the STABLE link (no reconnect), so a
         // deferred forward-secret message flushes. This was the "move out of range and back to send"
         // case — now served by immediate new-advert propagation, not a directory re-flood.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1); // connect with NO prekeys exchanged
 
@@ -5360,7 +6663,11 @@ mod tests {
             .send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), false)
             .unwrap();
         net.pump(&mut nodes);
-        assert_eq!(nodes[1].take_inbox().len(), 0, "no prekey yet → nothing delivered");
+        assert_eq!(
+            nodes[1].take_inbox().len(),
+            0,
+            "no prekey yet → nothing delivered"
+        );
 
         // node 1 publishes its prekey AFTER connect — over the stable link it must reach node 0.
         nodes[1].publish_prekey().unwrap();
@@ -5378,7 +6685,10 @@ mod tests {
         // Messaging a connected peer is always forward-secret (DESIGN.md §25): once prekeys
         // are exchanged, send_to opens a ratchet session and the message decrypts via
         // read_message — content is never static-sealed.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         exchange_prekeys(&mut net, &mut nodes);
@@ -5387,16 +6697,27 @@ mod tests {
         assert_eq!(peers, vec![nodes[1].address()]);
 
         let sent = nodes[0]
-            .send_to(&nodes[1].address(), "text/plain".into(), b"hello peer".to_vec(), false)
+            .send_to(
+                &nodes[1].address(),
+                "text/plain".into(),
+                b"hello peer".to_vec(),
+                false,
+            )
             .unwrap();
         assert!(sent.is_some());
         net.pump(&mut nodes);
 
         let inbox = nodes[1].take_inbox();
         assert_eq!(inbox.len(), 1);
-        let m = nodes[1].read_message(&inbox[0]).unwrap().expect("a user message");
+        let m = nodes[1]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("a user message");
         assert_eq!(m.body, b"hello peer");
-        assert!(nodes[1].has_session(&nodes[0].address()), "forward-secret session established");
+        assert!(
+            nodes[1].has_session(&nodes[0].address()),
+            "forward-secret session established"
+        );
 
         // Sending to an unconnected address yields None, not an error.
         assert!(nodes[0]
@@ -5407,13 +6728,21 @@ mod tests {
 
     #[test]
     fn message_status_progresses_to_delivered() {
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
 
         let id = nodes[0]
-            .send_to(&nodes[1].address(), "text/plain".into(), b"yo".to_vec(), true)
+            .send_to(
+                &nodes[1].address(),
+                "text/plain".into(),
+                b"yo".to_vec(),
+                true,
+            )
             .unwrap()
             .unwrap();
         // Direct delivery to the destination isn't a relay handoff, so the relay
@@ -5443,12 +6772,21 @@ mod tests {
         exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
 
         let id = nodes[0]
-            .send_message_traced(nodes[1].address(), "text/plain".into(), b"hi".to_vec(), true)
+            .send_message_traced(
+                nodes[1].address(),
+                "text/plain".into(),
+                b"hi".to_vec(),
+                true,
+            )
             .unwrap();
         net.pump(&mut nodes);
 
         // Destination got it; the relay holds nothing for it.
-        assert_eq!(nodes[1].take_inbox().len(), 1, "destination received directly");
+        assert_eq!(
+            nodes[1].take_inbox().len(),
+            1,
+            "destination received directly"
+        );
         assert!(
             nodes[2].queue().is_empty(),
             "relay should not be holding a needless sprayed copy"
@@ -5464,7 +6802,10 @@ mod tests {
         // The lock bug, fixed: device-to-device content is never static-sealed (DESIGN.md §25).
         // Sending before we know the peer's prekey queues the content (no insecure send); once
         // the prekey gossips in, it flushes forward-secret and a session forms (the 🔒).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
@@ -5474,7 +6815,10 @@ mod tests {
             .send_message_traced(nodes[1].address(), "t".into(), b"secret".to_vec(), true)
             .unwrap();
         net.pump(&mut nodes);
-        assert!(nodes[1].take_inbox().is_empty(), "no static-sealed content while deferred");
+        assert!(
+            nodes[1].take_inbox().is_empty(),
+            "no static-sealed content while deferred"
+        );
         assert!(!nodes[1].has_session(&nodes[0].address()), "no session yet");
 
         // Prekeys gossip in → the queued content flushes forward-secret and decrypts.
@@ -5483,14 +6827,27 @@ mod tests {
         net.pump(&mut nodes);
 
         let inbox = nodes[1].take_inbox();
-        assert_eq!(inbox.len(), 1, "deferred content sends once a session can form");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "deferred content sends once a session can form"
+        );
         assert!(
-            matches!(nodes[1].open(&inbox[0]).unwrap(), Payload::SessionInit { .. }),
+            matches!(
+                nodes[1].open(&inbox[0]).unwrap(),
+                Payload::SessionInit { .. }
+            ),
             "ratcheted, never a static PeerMessage"
         );
-        let m = nodes[1].read_message(&inbox[0]).unwrap().expect("a user message");
+        let m = nodes[1]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("a user message");
         assert_eq!(m.body, b"secret");
-        assert!(nodes[1].has_session(&nodes[0].address()), "🔒 session established");
+        assert!(
+            nodes[1].has_session(&nodes[0].address()),
+            "🔒 session established"
+        );
         // Delivery status follows the original handle through the deferral.
         let (_, delivered, _, _) = nodes[0].message_status(&id).unwrap();
         assert!(delivered, "the ACK lands on the original handle");
@@ -5498,7 +6855,10 @@ mod tests {
 
     #[test]
     fn forward_secret_session_end_to_end() {
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         net.pump(&mut nodes);
@@ -5510,14 +6870,22 @@ mod tests {
 
         // 0 → 1 should open a forward-secret session (prekey known), not a static seal.
         let id = nodes[0]
-            .send_message_traced(nodes[1].address(), "text/plain".into(), b"secret hi".to_vec(), true)
+            .send_message_traced(
+                nodes[1].address(),
+                "text/plain".into(),
+                b"secret hi".to_vec(),
+                true,
+            )
             .unwrap();
         net.pump(&mut nodes);
 
         let inbox = nodes[1].take_inbox();
         assert_eq!(inbox.len(), 1);
         assert!(
-            matches!(nodes[1].open(&inbox[0]).unwrap(), Payload::SessionInit { .. }),
+            matches!(
+                nodes[1].open(&inbox[0]).unwrap(),
+                Payload::SessionInit { .. }
+            ),
             "should ride a session, not a static PeerMessage"
         );
         let msg = nodes[1].read_message(&inbox[0]).unwrap().unwrap();
@@ -5530,7 +6898,12 @@ mod tests {
 
         // 1 → 0 reply rides the same session (responder now has a sending chain).
         nodes[1]
-            .send_message_traced(nodes[0].address(), "text/plain".into(), b"reply".to_vec(), false)
+            .send_message_traced(
+                nodes[0].address(),
+                "text/plain".into(),
+                b"reply".to_vec(),
+                false,
+            )
             .unwrap();
         net.pump(&mut nodes);
         let inbox0 = nodes[0].take_inbox();
@@ -5555,7 +6928,10 @@ mod tests {
         nodes[0].submit(b);
         net.pump(&mut nodes);
 
-        assert!(nodes[1].take_inbox().is_empty(), "relay must not absorb the bundle");
+        assert!(
+            nodes[1].take_inbox().is_empty(),
+            "relay must not absorb the bundle"
+        );
         let inbox = nodes[2].take_inbox();
         assert_eq!(inbox.len(), 1);
         match inbox[0].open(&nodes[2].identity).unwrap() {
@@ -5579,14 +6955,25 @@ mod tests {
         exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
 
         let id = nodes[0]
-            .send_message_traced(nodes[2].address(), "text/plain".into(), b"relay me".to_vec(), true)
+            .send_message_traced(
+                nodes[2].address(),
+                "text/plain".into(),
+                b"relay me".to_vec(),
+                true,
+            )
             .unwrap();
         net.pump(&mut nodes);
 
         let (_, delivered, _, _) = nodes[0].message_status(&id).unwrap();
         assert!(delivered, "should be delivered across the relay");
-        assert!(nodes[1].queue().is_empty(), "relay copy purged by the delivery-ACK vaccine");
-        assert!(nodes[0].queue().is_empty(), "source releases its copy on ACK");
+        assert!(
+            nodes[1].queue().is_empty(),
+            "relay copy purged by the delivery-ACK vaccine"
+        );
+        assert!(
+            nodes[0].queue().is_empty(),
+            "source releases its copy on ACK"
+        );
     }
 
     #[test]
@@ -5615,9 +7002,15 @@ mod tests {
         // Provenance privacy (§27): device hops carry the count + app label but NOT the address —
         // they're anonymized to a zeroed short-addr, so the recipient can't see WHICH devices relayed.
         let _ = (s0, s1);
-        assert!(trace.iter().all(|h| h.node == ShortAddr::default()), "device hops anonymized (no address)");
+        assert!(
+            trace.iter().all(|h| h.node == ShortAddr::default()),
+            "device hops anonymized (no address)"
+        );
         // App defaults to the shared fabric here (no set_app), stamped on each hop.
-        assert!(trace.iter().all(|h| h.app == short_app(&crate::FABRIC_APP)), "carrier app stamped");
+        assert!(
+            trace.iter().all(|h| h.app == short_app(&crate::FABRIC_APP)),
+            "carrier app stamped"
+        );
     }
 
     #[test]
@@ -5637,21 +7030,36 @@ mod tests {
         let a0 = nodes[0].address();
         let a2 = nodes[2].address();
 
-        assert!(!nodes[1].knows_route(&a2), "relay starts with no learned route");
+        assert!(
+            !nodes[1].knows_route(&a2),
+            "relay starts with no learned route"
+        );
         nodes[0]
             .send_message_traced(a2, "text/plain".into(), b"learn me".to_vec(), true)
             .unwrap();
         net.pump(&mut nodes);
 
-        assert!(nodes[1].knows_route(&a0), "relay learned the route toward the source");
-        assert!(nodes[1].knows_route(&a2), "relay learned the route toward the destination");
-        assert!(nodes[0].knows_route(&a2), "source learned it can reach the destination");
+        assert!(
+            nodes[1].knows_route(&a0),
+            "relay learned the route toward the source"
+        );
+        assert!(
+            nodes[1].knows_route(&a2),
+            "relay learned the route toward the destination"
+        );
+        assert!(
+            nodes[0].knows_route(&a2),
+            "source learned it can reach the destination"
+        );
     }
 
     #[test]
     fn link_is_encrypted_on_the_wire() {
         // The plaintext must never appear in the bytes crossing the bearer.
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let a = 0;
         nodes[a].handle(BearerEvent::Connected(1, Role::Initiator));
         nodes[1].handle(BearerEvent::Connected(1, Role::Responder));
@@ -5695,9 +7103,15 @@ mod tests {
             &from.identity,
             Destination::Device(to.address()),
             &to.identity.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: body.to_vec() },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: body.to_vec(),
+            },
             BundleOpts {
-                flags: BundleFlags { request_ack: true, ..Default::default() },
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -5706,19 +7120,37 @@ mod tests {
 
     #[test]
     fn ack_returns_and_clears_sender_pending() {
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
         let b = msg_ack(&nodes[0], &nodes[1], b"please confirm");
         nodes[0].submit(b);
-        assert_eq!(nodes[0].pending_count(), 1, "sender tracks the unacked bundle");
+        assert_eq!(
+            nodes[0].pending_count(),
+            1,
+            "sender tracks the unacked bundle"
+        );
         net.pump(&mut nodes);
 
         assert_eq!(nodes[1].take_inbox().len(), 1, "recipient got the message");
-        assert!(nodes[0].take_inbox().is_empty(), "the ACK is consumed, not inboxed");
-        assert_eq!(nodes[0].pending_count(), 0, "ACK cleared the sender's pending entry");
-        assert_eq!(nodes[1].pending_count(), 0, "ACKs are not themselves tracked");
+        assert!(
+            nodes[0].take_inbox().is_empty(),
+            "the ACK is consumed, not inboxed"
+        );
+        assert_eq!(
+            nodes[0].pending_count(),
+            0,
+            "ACK cleared the sender's pending entry"
+        );
+        assert_eq!(
+            nodes[1].pending_count(),
+            0,
+            "ACKs are not themselves tracked"
+        );
     }
 
     #[test]
@@ -5730,11 +7162,17 @@ mod tests {
             &node.identity,
             Destination::Device(other.address()),
             &other.identity.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: b"x".to_vec() },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"x".to_vec(),
+            },
             BundleOpts {
                 created_at: 0,
                 lifetime_ms: 1_000,
-                flags: BundleFlags { request_ack: true, ..Default::default() },
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -5764,12 +7202,20 @@ mod tests {
         exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
 
         nodes[0]
-            .publish_service("presence".into(), "Alice".into(), String::new(), vec![], 600_000)
+            .publish_service(
+                "presence".into(),
+                "Alice".into(),
+                String::new(),
+                vec![],
+                600_000,
+            )
             .unwrap();
         net.pump(&mut nodes);
 
         let found = nodes[2].browse("presence", None);
-        let alice = found.iter().find(|a| a.body.publisher == nodes[0].address());
+        let alice = found
+            .iter()
+            .find(|a| a.body.publisher == nodes[0].address());
         let alice = alice.expect("2 should discover Alice's presence via 1");
         assert!(matches!(&alice.body.kind, AdvertKind::Service { title, .. } if title == "Alice"));
         assert_eq!(alice.hops, 2, "Alice is two hops away via node 1");
@@ -5782,7 +7228,10 @@ mod tests {
 
         let inbox = nodes[0].take_inbox();
         assert_eq!(inbox.len(), 1);
-        let m = nodes[0].read_message(&inbox[0]).unwrap().expect("a user message");
+        let m = nodes[0]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("a user message");
         assert_eq!(m.body, b"hi Alice");
     }
 
@@ -5824,13 +7273,20 @@ mod tests {
         // A node hosts an hps:// service; a subscriber requests its keys (open access) and
         // then receives the owner's signed broadcasts, verified against the service key. A
         // subscriber can read but never forge a broadcast (§32).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
         // Node 0 hosts a service at "news"; node 1 subscribes and is handed the keys.
-        let svc_pubkey = nodes[0].register_service("news", crate::hps::ServiceKind::Service,
-            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        let svc_pubkey = nodes[0].register_service(
+            "news",
+            crate::hps::ServiceKind::Service,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
         assert!(svc_pubkey.is_some(), "a service mints a signing key");
         nodes[1].hps_subscribe(nodes[0].address(), "news").unwrap();
         net.pump(&mut nodes);
@@ -5865,8 +7321,14 @@ mod tests {
         net.connect(&mut nodes, 1, 3, 2, 3); // 1 <-> 2
 
         assert!(
-            nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
-                crate::hps::AccessMode::Open, crate::hps::Visibility::Private).is_none(),
+            nodes[0]
+                .register_service(
+                    "lobby",
+                    crate::hps::ServiceKind::Channel,
+                    crate::hps::AccessMode::Open,
+                    crate::hps::Visibility::Private
+                )
+                .is_none(),
             "a channel has no service signing key"
         );
         nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
@@ -5879,7 +7341,11 @@ mod tests {
         let msgs = nodes[2].take_hps_messages();
         assert_eq!(msgs.len(), 1, "the post floods to the other member");
         assert_eq!(msgs[0].body, b"hi all");
-        assert_eq!(msgs[0].sender, nodes[1].address(), "verified as member 1's post");
+        assert_eq!(
+            msgs[0].sender,
+            nodes[1].address(),
+            "verified as member 1's post"
+        );
     }
 
     #[test]
@@ -5887,12 +7353,19 @@ mod tests {
         // hps:// broadcasts aren't carrier-chunked (no single dst), so a big channel post
         // exceeds one Noise message (max 65535B) and must fragment at the link layer, or it
         // is silently dropped at encrypt (DESIGN.md §20).
-        let mut nodes = [Node::new(Identity::generate()), Node::new(Identity::generate())];
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
-        nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
-            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        nodes[0].register_service(
+            "lobby",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
         nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
         net.pump(&mut nodes);
 
@@ -5902,7 +7375,11 @@ mod tests {
         net.pump(&mut nodes);
 
         let msgs = nodes[1].take_hps_messages();
-        assert_eq!(msgs.len(), 1, "the large broadcast reassembled and decrypted");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "the large broadcast reassembled and decrypted"
+        );
         assert_eq!(msgs[0].body, big, "bytes intact across link fragmentation");
     }
 
@@ -5930,8 +7407,12 @@ mod tests {
         let mut nodes = [app_node(4), app_node(4)];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
-        nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
-            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        nodes[0].register_service(
+            "lobby",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
         nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
         net.pump(&mut nodes);
 
@@ -5951,16 +7432,27 @@ mod tests {
         let mut nodes = [app_node(5), app_node(5)];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
-        nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
-            crate::hps::AccessMode::RequestToJoin, crate::hps::Visibility::Private);
+        nodes[0].register_service(
+            "lobby",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::RequestToJoin,
+            crate::hps::Visibility::Private,
+        );
         let requester = nodes[1].address();
         nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
         net.pump(&mut nodes);
-        assert_eq!(nodes[0].hps_pending("lobby"), vec![requester], "queued, not keyed");
+        assert_eq!(
+            nodes[0].hps_pending("lobby"),
+            vec![requester],
+            "queued, not keyed"
+        );
 
         nodes[0].hps_publish("lobby", b"members only").unwrap();
         net.pump(&mut nodes);
-        assert!(nodes[1].take_hps_messages().is_empty(), "no keys yet → can't read");
+        assert!(
+            nodes[1].take_hps_messages().is_empty(),
+            "no keys yet → can't read"
+        );
 
         nodes[0].hps_approve("lobby", requester).unwrap();
         net.pump(&mut nodes);
@@ -5978,8 +7470,12 @@ mod tests {
         let mut nodes = [app_node(6), app_node(6)];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
-        nodes[0].register_service("vip", crate::hps::ServiceKind::Channel,
-            crate::hps::AccessMode::Invite, crate::hps::Visibility::Private);
+        nodes[0].register_service(
+            "vip",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Invite,
+            crate::hps::Visibility::Private,
+        );
         let dest = nodes[1].address();
 
         // Self-join is ignored for an Invite topic.
@@ -5987,7 +7483,10 @@ mod tests {
         net.pump(&mut nodes);
         nodes[0].hps_publish("vip", b"x").unwrap();
         net.pump(&mut nodes);
-        assert!(nodes[1].take_hps_messages().is_empty(), "can't self-join an invite topic");
+        assert!(
+            nodes[1].take_hps_messages().is_empty(),
+            "can't self-join an invite topic"
+        );
 
         // Host invites; destination sees it and accepts.
         nodes[0].hps_invite("vip", dest).unwrap();
@@ -5995,7 +7494,9 @@ mod tests {
         let invites = nodes[1].take_hps_invites();
         assert_eq!(invites.len(), 1);
         assert_eq!(invites[0].path, "vip");
-        nodes[1].hps_accept_invite(nodes[0].address(), "vip").unwrap();
+        nodes[1]
+            .hps_accept_invite(nodes[0].address(), "vip")
+            .unwrap();
         net.pump(&mut nodes);
 
         nodes[0].hps_publish("vip", b"hi vip").unwrap();
@@ -6012,14 +7513,24 @@ mod tests {
         let mut nodes = [app_node(1), app_node(2)];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
-        nodes[0].register_service("lobby", crate::hps::ServiceKind::Channel,
-            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        nodes[0].register_service(
+            "lobby",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
         nodes[1].hps_subscribe(nodes[0].address(), "lobby").unwrap();
         net.pump(&mut nodes);
         nodes[0].hps_publish("lobby", b"members only").unwrap();
         net.pump(&mut nodes);
-        assert!(nodes[1].take_hps_messages().is_empty(), "foreign-app node can't join");
-        assert!(nodes[0].hps_members("lobby").is_empty(), "host recorded no foreign member");
+        assert!(
+            nodes[1].take_hps_messages().is_empty(),
+            "foreign-app node can't join"
+        );
+        assert!(
+            nodes[0].hps_members("lobby").is_empty(),
+            "host recorded no foreign member"
+        );
     }
 
     #[test]
@@ -6031,8 +7542,12 @@ mod tests {
         net.connect(&mut nodes, 0, 1, 1, 1);
         net.connect(&mut nodes, 0, 2, 2, 2);
         net.connect(&mut nodes, 1, 3, 2, 3);
-        nodes[0].register_service("room", crate::hps::ServiceKind::Channel,
-            crate::hps::AccessMode::Open, crate::hps::Visibility::Private);
+        nodes[0].register_service(
+            "room",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
         let m2 = nodes[2].address();
         nodes[1].hps_subscribe(nodes[0].address(), "room").unwrap();
         nodes[2].hps_subscribe(nodes[0].address(), "room").unwrap();
@@ -6048,7 +7563,14 @@ mod tests {
         net.pump(&mut nodes);
         nodes[0].hps_publish("room", b"v2").unwrap();
         net.pump(&mut nodes);
-        assert_eq!(nodes[1].take_hps_messages().len(), 1, "retained m1 reads v2");
-        assert!(nodes[2].take_hps_messages().is_empty(), "removed m2 can't read v2");
+        assert_eq!(
+            nodes[1].take_hps_messages().len(),
+            1,
+            "retained m1 reads v2"
+        );
+        assert!(
+            nodes[2].take_hps_messages().is_empty(),
+            "removed m2 can't read v2"
+        );
     }
 }

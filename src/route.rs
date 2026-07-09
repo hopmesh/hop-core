@@ -37,7 +37,10 @@ pub struct RouteTable {
 impl RouteTable {
     /// `cap` bounds the table (tiered: small on mobile, large on cloud nodes).
     pub fn new(cap: usize) -> Self {
-        Self { scores: HashMap::new(), cap: cap.max(1) }
+        Self {
+            scores: HashMap::new(),
+            cap: cap.max(1),
+        }
     }
 
     /// Resize the table (e.g. a cloud node raising its memory).
@@ -58,14 +61,20 @@ impl RouteTable {
     }
 
     fn bump(&mut self, who: &PubKeyBytes, now: u64) {
-        let e = self.scores.entry(*who).or_insert(Entry { score: 0.0, at: now });
+        let e = self.scores.entry(*who).or_insert(Entry {
+            score: 0.0,
+            at: now,
+        });
         e.score = Self::decayed(e, now) + BUMP;
         e.at = now;
     }
 
     /// Decayed reachability utility toward `dst` (0.0 if unknown).
     pub fn utility(&self, dst: &PubKeyBytes, now: u64) -> f64 {
-        self.scores.get(dst).map(|e| Self::decayed(e, now)).unwrap_or(0.0)
+        self.scores
+            .get(dst)
+            .map(|e| Self::decayed(e, now))
+            .unwrap_or(0.0)
     }
 
     /// Whether we have any live learned route toward `dst`.
@@ -116,7 +125,11 @@ mod tests {
         rt.learn(&s, &d, 0);
         assert!(rt.knows(&s, 0), "learned src↔dst should mark src reachable");
         assert!(rt.knows(&d, 0), "and dst reachable — either direction");
-        assert_eq!(rt.utility(&addr(9), 0), 0.0, "unknown endpoint has no utility");
+        assert_eq!(
+            rt.utility(&addr(9), 0),
+            0.0,
+            "unknown endpoint has no utility"
+        );
     }
 
     #[test]
@@ -138,14 +151,17 @@ mod tests {
         }
         let cold = addr(4);
         rt.learn(&addr(3), &cold, 0);
-        assert!(rt.utility(&hot, 4000) > rt.utility(&cold, 4000), "repeated beats one-off");
+        assert!(
+            rt.utility(&hot, 4000) > rt.utility(&cold, 4000),
+            "repeated beats one-off"
+        );
     }
 
     #[test]
     fn capacity_evicts_least_useful() {
         let mut rt = RouteTable::new(2);
         rt.learn(&addr(1), &addr(2), 0); // 1,2
-        // Reinforce 2 so it's the strongest; 1 stays weak.
+                                         // Reinforce 2 so it's the strongest; 1 stays weak.
         rt.learn(&addr(2), &addr(2), 10);
         rt.learn(&addr(5), &addr(6), 20); // pushes the table over cap → evict weakest
         assert!(rt.len() <= 2, "table stays within capacity");

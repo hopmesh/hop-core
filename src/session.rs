@@ -62,15 +62,15 @@ pub struct RatchetMessage {
 /// key) serializes as a sequence of entries, so it round-trips through postcard.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
-    rk: [u8; 32],                // root key
-    dh_self_secret: [u8; 32],    // current ratchet secret
-    dh_self_pub: XPubKeyBytes,   // current ratchet public
+    rk: [u8; 32],              // root key
+    dh_self_secret: [u8; 32],  // current ratchet secret
+    dh_self_pub: XPubKeyBytes, // current ratchet public
     dh_remote: Option<XPubKeyBytes>,
-    cks: Option<[u8; 32]>,       // sending chain key
-    ckr: Option<[u8; 32]>,       // receiving chain key
-    ns: u32,                     // messages sent in current chain
-    nr: u32,                     // messages received in current chain
-    pn: u32,                     // length of previous sending chain
+    cks: Option<[u8; 32]>, // sending chain key
+    ckr: Option<[u8; 32]>, // receiving chain key
+    ns: u32,               // messages sent in current chain
+    nr: u32,               // messages received in current chain
+    pn: u32,               // length of previous sending chain
     #[serde(with = "skipped_serde")]
     skipped: HashMap<(XPubKeyBytes, u32), [u8; 32]>,
 }
@@ -146,7 +146,11 @@ impl Session {
         let ck = self.cks.ok_or(Error::Crypto("no sending chain"))?;
         let (next, mk) = kdf_ck(&ck);
         self.cks = Some(next);
-        let header = Header { dh: self.dh_self_pub, pn: self.pn, n: self.ns };
+        let header = Header {
+            dh: self.dh_self_pub,
+            pn: self.pn,
+            n: self.ns,
+        };
         self.ns += 1;
         let aad = postcard::to_allocvec(&header)?;
         let ciphertext = aead_encrypt(&mk, plaintext, &aad)?;
@@ -183,8 +187,12 @@ impl Session {
     /// Derive and stash message keys for indices `[nr, until)` of the current
     /// receiving chain, so those (earlier) messages still open if they arrive later.
     fn skip(&mut self, until: u32) -> Result<()> {
-        let Some(mut ck) = self.ckr else { return Ok(()) };
-        let remote = self.dh_remote.ok_or(Error::Crypto("skip without remote key"))?;
+        let Some(mut ck) = self.ckr else {
+            return Ok(());
+        };
+        let remote = self
+            .dh_remote
+            .ok_or(Error::Crypto("skip without remote key"))?;
         while self.nr < until {
             if self.skipped.len() >= MAX_SKIP {
                 return Err(Error::Crypto("too many skipped messages"));
@@ -271,9 +279,13 @@ mod tests {
         let bundle = bob_spk.bundle(bob_id.address());
 
         let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle).unwrap();
-        let root_b =
-            crypto::x3dh_respond(&bob_id, &bob_spk.secret_bytes(), &alice_id.address(), &ek_pub)
-                .unwrap();
+        let root_b = crypto::x3dh_respond(
+            &bob_id,
+            &bob_spk.secret_bytes(),
+            &alice_id.address(),
+            &ek_pub,
+        )
+        .unwrap();
         assert_eq!(root_a, root_b);
 
         let mut alice = Session::init_initiator(root_a, bundle.spk_pub);
@@ -303,9 +315,13 @@ mod tests {
         let bob_spk = bob_id.generate_prekey();
         let bundle = bob_spk.bundle(bob_id.address());
         let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle).unwrap();
-        let root_b =
-            crypto::x3dh_respond(&bob_id, &bob_spk.secret_bytes(), &alice_id.address(), &ek_pub)
-                .unwrap();
+        let root_b = crypto::x3dh_respond(
+            &bob_id,
+            &bob_spk.secret_bytes(),
+            &alice_id.address(),
+            &ek_pub,
+        )
+        .unwrap();
 
         let mut alice = Session::init_initiator(root_a, bundle.spk_pub);
         let mut bob = Session::init_responder(root_b, bob_spk.secret_bytes(), bob_spk.public);
@@ -325,9 +341,13 @@ mod tests {
         let bob_spk = bob_id.generate_prekey();
         let bundle = bob_spk.bundle(bob_id.address());
         let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle).unwrap();
-        let root_b =
-            crypto::x3dh_respond(&bob_id, &bob_spk.secret_bytes(), &alice_id.address(), &ek_pub)
-                .unwrap();
+        let root_b = crypto::x3dh_respond(
+            &bob_id,
+            &bob_spk.secret_bytes(),
+            &alice_id.address(),
+            &ek_pub,
+        )
+        .unwrap();
         let mut alice = Session::init_initiator(root_a, bundle.spk_pub);
         let mut bob = Session::init_responder(root_b, bob_spk.secret_bytes(), bob_spk.public);
 

@@ -47,14 +47,28 @@ pub struct RelayScorer {
 impl RelayScorer {
     /// `half_life_ms` controls how fast old encounters fade (e.g. a day).
     pub fn new(half_life_ms: u64) -> Self {
-        Self { half_life_ms, demand: HashMap::new(), supply: HashMap::new() }
+        Self {
+            half_life_ms,
+            demand: HashMap::new(),
+            supply: HashMap::new(),
+        }
     }
 
-    fn bump(map: &mut HashMap<String, HashMap<PeerId, Seen>>, topic: &str, peer: PeerId, now: u64, hl: u64) {
-        let entry = map.entry(topic.to_string()).or_default().entry(peer).or_insert(Seen {
-            last_ms: now,
-            weight: 0.0,
-        });
+    fn bump(
+        map: &mut HashMap<String, HashMap<PeerId, Seen>>,
+        topic: &str,
+        peer: PeerId,
+        now: u64,
+        hl: u64,
+    ) {
+        let entry = map
+            .entry(topic.to_string())
+            .or_default()
+            .entry(peer)
+            .or_insert(Seen {
+                last_ms: now,
+                weight: 0.0,
+            });
         // Decay the existing weight to `now`, then add this fresh encounter.
         entry.weight = entry.decayed(now, hl) + 1.0;
         entry.last_ms = now;
@@ -88,12 +102,21 @@ impl RelayScorer {
 
     /// Topics ranked by relay utility, highest first.
     pub fn hot_topics(&self, now_ms: u64) -> Vec<(String, f64)> {
-        let mut topics: Vec<String> =
-            self.demand.keys().chain(self.supply.keys()).cloned().collect();
+        let mut topics: Vec<String> = self
+            .demand
+            .keys()
+            .chain(self.supply.keys())
+            .cloned()
+            .collect();
         topics.sort();
         topics.dedup();
-        let mut scored: Vec<(String, f64)> =
-            topics.into_iter().map(|t| { let s = self.score(&t, now_ms); (t, s) }).collect();
+        let mut scored: Vec<(String, f64)> = topics
+            .into_iter()
+            .map(|t| {
+                let s = self.score(&t, now_ms);
+                (t, s)
+            })
+            .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored
     }
@@ -131,7 +154,7 @@ mod tests {
     #[test]
     fn repeated_encounters_beat_one_offs_and_decay_over_time() {
         let mut s = RelayScorer::new(1_000); // fast 1s half-life
-        // Peer 1 seen repeatedly; peer 2 once long ago.
+                                             // Peer 1 seen repeatedly; peer 2 once long ago.
         s.observe_interest("t", peer(2), 0);
         for t in [0u64, 1_000, 2_000, 3_000] {
             s.observe_interest("t", peer(1), t);

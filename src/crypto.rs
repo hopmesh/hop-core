@@ -48,7 +48,9 @@ pub struct Identity {
 impl Identity {
     /// Generate a fresh identity from the OS CSPRNG.
     pub fn generate() -> Self {
-        Self { signing: SigningKey::generate(&mut OsRng) }
+        Self {
+            signing: SigningKey::generate(&mut OsRng),
+        }
     }
 
     /// The 32-byte Ed25519 seed — persist it (securely) for a stable address.
@@ -58,7 +60,9 @@ impl Identity {
 
     /// Restore an identity from a saved seed.
     pub fn from_secret_bytes(seed: &[u8; 32]) -> Self {
-        Self { signing: SigningKey::from_bytes(seed) }
+        Self {
+            signing: SigningKey::from_bytes(seed),
+        }
     }
 
     /// The node's address (Ed25519 public key) — also its sealing identity.
@@ -95,7 +99,11 @@ impl Identity {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = XPublicKey::from(&secret).to_bytes();
         let sig = self.sign(&public);
-        SignedPreKey { secret: secret.to_bytes(), public, sig }
+        SignedPreKey {
+            secret: secret.to_bytes(),
+            public,
+            sig,
+        }
     }
 
     /// Derive a **deterministic** signed prekey from the identity seed, so the same
@@ -111,16 +119,25 @@ impl Identity {
         let secret = StaticSecret::from(s);
         let public = XPublicKey::from(&secret).to_bytes();
         let sig = self.sign(&public);
-        SignedPreKey { secret: s, public, sig }
+        SignedPreKey {
+            secret: s,
+            public,
+            sig,
+        }
     }
 
     /// Open a payload sealed to this identity's address.
     pub fn open(&self, sealed: &Sealed) -> Result<Vec<u8>> {
-        let shared = self.x_secret().diffie_hellman(&XPublicKey::from(sealed.ephemeral_pub));
+        let shared = self
+            .x_secret()
+            .diffie_hellman(&XPublicKey::from(sealed.ephemeral_pub));
         let sym = blake3::hash(shared.as_bytes());
         let cipher = ChaCha20Poly1305::new(Key::from_slice(sym.as_bytes()));
         cipher
-            .decrypt(Nonce::from_slice(&sealed.nonce), sealed.ciphertext.as_slice())
+            .decrypt(
+                Nonce::from_slice(&sealed.nonce),
+                sealed.ciphertext.as_slice(),
+            )
             .map_err(|_| Error::Crypto("decrypt failed"))
     }
 }
@@ -136,7 +153,9 @@ pub struct Sealed {
 /// The X25519 (Montgomery) sealing key for an address, or `None` if it isn't a
 /// valid Ed25519 public key. Used to bind a Noise link's static key to an address.
 pub fn address_to_x(address: &PubKeyBytes) -> Option<XPubKeyBytes> {
-    VerifyingKey::from_bytes(address).ok().map(|v| v.to_montgomery().to_bytes())
+    VerifyingKey::from_bytes(address)
+        .ok()
+        .map(|v| v.to_montgomery().to_bytes())
 }
 
 /// Seal `plaintext` to an **address** (Ed25519 public key): ephemeral-static ECDH
@@ -157,7 +176,11 @@ pub fn seal(to_address: &PubKeyBytes, plaintext: &[u8]) -> Result<Sealed> {
         .encrypt(Nonce::from_slice(&nonce), plaintext)
         .map_err(|_| Error::Crypto("encrypt failed"))?;
 
-    Ok(Sealed { ephemeral_pub, nonce, ciphertext })
+    Ok(Sealed {
+        ephemeral_pub,
+        nonce,
+        ciphertext,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -192,12 +215,20 @@ impl SignedPreKey {
 
     /// Reconstruct from persisted parts.
     pub fn from_parts(secret: [u8; 32], public: XPubKeyBytes, sig: [u8; 64]) -> Self {
-        Self { secret, public, sig }
+        Self {
+            secret,
+            public,
+            sig,
+        }
     }
 
     /// The public, shareable bundle for this prekey under `address`.
     pub fn bundle(&self, address: PubKeyBytes) -> PreKeyBundle {
-        PreKeyBundle { address, spk_pub: self.public, spk_sig: self.sig.to_vec() }
+        PreKeyBundle {
+            address,
+            spk_pub: self.public,
+            spk_sig: self.sig.to_vec(),
+        }
     }
 }
 
@@ -237,10 +268,7 @@ fn x3dh_root(dh1: &[u8], dh2: &[u8], dh3: &[u8]) -> [u8; 32] {
 /// Initiator side of the async handshake. Given the recipient's published
 /// [`PreKeyBundle`], derive the shared root secret and the ephemeral public the
 /// recipient needs to derive the same secret. Verifies the bundle's signature.
-pub fn x3dh_initiate(
-    sender: &Identity,
-    bundle: &PreKeyBundle,
-) -> Result<(XPubKeyBytes, [u8; 32])> {
+pub fn x3dh_initiate(sender: &Identity, bundle: &PreKeyBundle) -> Result<(XPubKeyBytes, [u8; 32])> {
     if !bundle.verify() {
         return Err(Error::BadSignature);
     }
@@ -305,11 +333,24 @@ fn tag16(context: &str, key_material: &[u8]) -> Tag {
     t
 }
 
-fn recognition_tag_from_shared(shared: &[u8; 32], bundle_id: &[u8; 32]) -> Tag {
+/// Derive a recognition tag from the ephemeral·SPK DH `shared` secret and the bundle id.
+/// `pub` so a relay can verify a §39 delivery **vaccine**: the recipient reveals `shared`
+/// (a value only it can compute, and which leaks nothing about it — CDH), and a relay holding
+/// the bundle checks this equals the tag it already stores before dropping its copy.
+pub fn recognition_tag_from_shared(shared: &[u8; 32], bundle_id: &[u8; 32]) -> Tag {
     let mut km = [0u8; 64];
     km[..32].copy_from_slice(shared);
     km[32..].copy_from_slice(bundle_id);
     tag16("hop recog tag v1", &km)
+}
+
+/// Recipient side: the raw ephemeral·SPK DH `shared` secret (the recognition token) it reveals in a
+/// §39 delivery vaccine. Same DH as [`recognition_tag_recipient`], returned instead of hashed.
+pub fn recognition_shared(spk_secret: &[u8; 32], ephemeral_pub: &XPubKeyBytes) -> [u8; 32] {
+    let secret = StaticSecret::from(*spk_secret);
+    *secret
+        .diffie_hellman(&XPublicKey::from(*ephemeral_pub))
+        .as_bytes()
 }
 
 /// §39 **recognition tag** — the "is this mine?" primitive (DESIGN.md §39). Bound to a
@@ -327,7 +368,10 @@ pub fn recognition_tag_sender(
     let ephemeral = StaticSecret::random_from_rng(OsRng);
     let eph_pub = XPublicKey::from(&ephemeral).to_bytes();
     let shared = ephemeral.diffie_hellman(&XPublicKey::from(*recipient_spk_pub));
-    (eph_pub, recognition_tag_from_shared(shared.as_bytes(), bundle_id))
+    (
+        eph_pub,
+        recognition_tag_from_shared(shared.as_bytes(), bundle_id),
+    )
 }
 
 /// Recipient side: re-derive the recognition tag for one of its prekeys against the
@@ -379,7 +423,10 @@ mod tests {
         s[31] |= 64;
         let from_secret = XP::from(&StaticSecret::from(s)).to_bytes();
         let from_edwards = sk.verifying_key().to_montgomery().to_bytes();
-        assert_eq!(from_secret, from_edwards, "derived X25519 key must match address");
+        assert_eq!(
+            from_secret, from_edwards,
+            "derived X25519 key must match address"
+        );
     }
 
     #[test]
@@ -421,7 +468,8 @@ mod tests {
 
         // A different identity (not the SPK owner) derives a different secret.
         let mallory = Identity::generate();
-        let sk_m = x3dh_respond(&mallory, &bob_spk.secret_bytes(), &alice.address(), &ek_pub).unwrap();
+        let sk_m =
+            x3dh_respond(&mallory, &bob_spk.secret_bytes(), &alice.address(), &ek_pub).unwrap();
         assert_ne!(sk_a, sk_m, "only the bundle's identity recovers the root");
     }
 
@@ -431,7 +479,10 @@ mod tests {
         let restored = Identity::from_secret_bytes(&id.to_secret_bytes());
         let a = id.derive_prekey();
         let b = restored.derive_prekey();
-        assert_eq!(a.public, b.public, "derived prekey must be identical after restart");
+        assert_eq!(
+            a.public, b.public,
+            "derived prekey must be identical after restart"
+        );
         assert_eq!(a.secret_bytes(), b.secret_bytes());
         assert!(a.bundle(id.address()).verify());
     }
@@ -446,7 +497,10 @@ mod tests {
         bundle.spk_pub[0] ^= 1; // tamper the signed prekey
         assert!(!bundle.verify(), "tampered SPK must fail signature check");
         let alice = Identity::generate();
-        assert!(matches!(x3dh_initiate(&alice, &bundle), Err(Error::BadSignature)));
+        assert!(matches!(
+            x3dh_initiate(&alice, &bundle),
+            Err(Error::BadSignature)
+        ));
     }
 
     #[test]
@@ -471,7 +525,10 @@ mod tests {
         let bundle_id = [42u8; 32];
         let (eph_pub, tag) = recognition_tag_sender(&spk.public, &bundle_id);
         let got = recognition_tag_recipient(&spk.secret_bytes(), &eph_pub, &bundle_id);
-        assert_eq!(tag, got, "recipient must recompute the sender's recognition tag");
+        assert_eq!(
+            tag, got,
+            "recipient must recompute the sender's recognition tag"
+        );
     }
 
     #[test]
@@ -483,9 +540,15 @@ mod tests {
         let bundle_id = [7u8; 32];
         let (eph_pub, tag) = recognition_tag_sender(&spk_bob.public, &bundle_id);
         // Eve's prekey derives a different tag → not hers.
-        assert_ne!(tag, recognition_tag_recipient(&spk_eve.secret_bytes(), &eph_pub, &bundle_id));
+        assert_ne!(
+            tag,
+            recognition_tag_recipient(&spk_eve.secret_bytes(), &eph_pub, &bundle_id)
+        );
         // Same recipient, different bundle id → different tag (no cross-bundle linkage).
-        assert_ne!(tag, recognition_tag_recipient(&spk_bob.secret_bytes(), &eph_pub, &[8u8; 32]));
+        assert_ne!(
+            tag,
+            recognition_tag_recipient(&spk_bob.secret_bytes(), &eph_pub, &[8u8; 32])
+        );
     }
 
     #[test]
@@ -504,9 +567,15 @@ mod tests {
     fn mailbox_tag_stable_per_prekey_and_rotates() {
         let bob = Identity::generate();
         // Stable across re-derivations of the same (deterministic) prekey epoch.
-        assert_eq!(mailbox_tag(&bob.address(), 0), mailbox_tag(&bob.address(), 0));
+        assert_eq!(
+            mailbox_tag(&bob.address(), 0),
+            mailbox_tag(&bob.address(), 0)
+        );
         // A different identity's prekey → a different mailbox (it's a pseudonym, not shared).
         let alice = Identity::generate();
-        assert_ne!(mailbox_tag(&bob.address(), 0), mailbox_tag(&alice.address(), 0));
+        assert_ne!(
+            mailbox_tag(&bob.address(), 0),
+            mailbox_tag(&alice.address(), 0)
+        );
     }
 }

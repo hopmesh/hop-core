@@ -122,7 +122,12 @@ mod tests {
     use super::*;
 
     fn meta(dst: Destination, hop_limit: u8, copies: u16) -> BundleMeta {
-        BundleMeta { id: [7u8; 32], dst, hop_limit, copies }
+        BundleMeta {
+            id: [7u8; 32],
+            dst,
+            hop_limit,
+            copies,
+        }
     }
 
     #[test]
@@ -135,7 +140,11 @@ mod tests {
     #[test]
     fn egress_forwards_toward_gateway() {
         let mut r = SprayAndWait::new();
-        r.on_beacon(&GatewayBeacon { gateway: [1u8; 32], hops: 2, expires_at: 999 });
+        r.on_beacon(&GatewayBeacon {
+            gateway: [1u8; 32],
+            hops: 2,
+            expires_at: 999,
+        });
         assert!(r.knows_gateway());
         let d = r.should_forward(&meta(Destination::Broadcast, 5, 8), &[0u8; 32]);
         assert_eq!(d, ForwardDecision::Forward);
@@ -167,8 +176,16 @@ mod tests {
     #[test]
     fn beacon_keeps_shortest_hop_count() {
         let mut r = SprayAndWait::new();
-        r.on_beacon(&GatewayBeacon { gateway: [1u8; 32], hops: 4, expires_at: 1 });
-        r.on_beacon(&GatewayBeacon { gateway: [1u8; 32], hops: 2, expires_at: 1 });
+        r.on_beacon(&GatewayBeacon {
+            gateway: [1u8; 32],
+            hops: 4,
+            expires_at: 1,
+        });
+        r.on_beacon(&GatewayBeacon {
+            gateway: [1u8; 32],
+            hops: 2,
+            expires_at: 1,
+        });
         assert_eq!(r.gateways[&[1u8; 32]].hops, 2);
     }
 }

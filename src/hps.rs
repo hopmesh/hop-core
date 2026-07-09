@@ -159,7 +159,8 @@ impl ServiceConfig {
 
     /// The public key subscribers use to verify a *service's* broadcasts (`None` for a channel).
     pub fn service_pubkey(&self) -> Option<[u8; 32]> {
-        self.signing_seed.map(|s| SigningKey::from_bytes(&s).verifying_key().to_bytes())
+        self.signing_seed
+            .map(|s| SigningKey::from_bytes(&s).verifying_key().to_bytes())
     }
 }
 
@@ -215,8 +216,11 @@ pub fn verify_publish(
     let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
         return false;
     };
-    vk.verify(&publish_msg(path, nonce, ciphertext), &Signature::from_bytes(sig))
-        .is_ok()
+    vk.verify(
+        &publish_msg(path, nonce, ciphertext),
+        &Signature::from_bytes(sig),
+    )
+    .is_ok()
 }
 
 /// Encrypt a discovery descriptor under the app discovery key, returning `(nonce, ct)` for an
@@ -240,9 +244,16 @@ mod tests {
     fn content_key_round_trips_and_rejects_wrong_key() {
         let cfg = ServiceConfig::new(ServiceKind::Channel);
         let (nonce, ct) = seal_content(&cfg.content_key, b"hello channel");
-        assert_eq!(open_content(&cfg.content_key, &nonce, &ct).as_deref(), Some(&b"hello channel"[..]));
+        assert_eq!(
+            open_content(&cfg.content_key, &nonce, &ct).as_deref(),
+            Some(&b"hello channel"[..])
+        );
         let other = ServiceConfig::new(ServiceKind::Channel);
-        assert_eq!(open_content(&other.content_key, &nonce, &ct), None, "wrong key can't read");
+        assert_eq!(
+            open_content(&other.content_key, &nonce, &ct),
+            None,
+            "wrong key can't read"
+        );
         // Tampered ciphertext fails the AEAD tag.
         let mut bad = ct.clone();
         bad[0] ^= 0xff;
@@ -267,7 +278,11 @@ mod tests {
 
     #[test]
     fn channel_has_no_service_key() {
-        assert!(ServiceConfig::new(ServiceKind::Channel).service_pubkey().is_none());
-        assert!(ServiceConfig::new(ServiceKind::Service).service_pubkey().is_some());
+        assert!(ServiceConfig::new(ServiceKind::Channel)
+            .service_pubkey()
+            .is_none());
+        assert!(ServiceConfig::new(ServiceKind::Service)
+            .service_pubkey()
+            .is_some());
     }
 }

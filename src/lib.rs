@@ -12,8 +12,8 @@ pub mod bundle;
 pub mod crypto;
 pub mod discover;
 pub mod dnssec;
-pub mod hps;
 pub mod error;
+pub mod hps;
 pub mod link;
 pub mod node;
 pub mod relay;
@@ -70,31 +70,30 @@ pub fn relay_app_id() -> AppId {
 
 /// Common imports for working with hop-core.
 pub mod prelude {
+    pub use crate::app::{AppKeys, AppSecret, JOIN_EPOCH_MS};
+    pub use crate::bundle::TraceHop;
     pub use crate::bundle::{
         Bundle, BundleFlags, BundleId, BundleOpts, Destination, Payload, StreamId, StreamKind,
     };
-    pub use crate::stream::{StreamBuffer, StreamReassembler};
     pub use crate::crypto::{
         seal, short_addr, verify, Identity, PubKeyBytes, Sealed, ShortAddr, XPubKeyBytes,
     };
-    pub use crate::route::RouteTable;
     pub use crate::discover::{Advert, AdvertBody, AdvertId, AdvertKind, Directory};
     pub use crate::error::{Error, Result};
     pub use crate::link::{
-        fragment, Bearer, BearerEvent, Frame, LinkHandshake, LinkId, LinkSession, Reassembler,
-        Role,
+        fragment, Bearer, BearerEvent, Frame, LinkHandshake, LinkId, LinkSession, Reassembler, Role,
     };
     pub use crate::node::{
         HnsLookup, HnsResult, IdentityRecord, Node, NodeKind, ServiceReqItem, ServiceRespItem,
         SERVICE_IDENTIFY,
     };
     pub use crate::relay::RelayScorer;
+    pub use crate::route::RouteTable;
     pub use crate::routing::{
         BundleMeta, ForwardDecision, GatewayBeacon, PeerId, Router, SprayAndWait,
     };
     pub use crate::store::{HaveSet, MemoryStore, Store};
+    pub use crate::stream::{StreamBuffer, StreamReassembler};
     pub use crate::util::{compress, decompress};
-    pub use crate::bundle::TraceHop;
     pub use crate::{app_id, relay_app_id, short_app, AppId, ShortApp, FABRIC_APP, RELAY_APP_NAME};
-    pub use crate::app::{AppKeys, AppSecret, JOIN_EPOCH_MS};
 }

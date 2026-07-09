@@ -40,8 +40,9 @@ impl LinkHandshake {
     }
 
     fn build(identity: &Identity, initiator: bool) -> Result<Self> {
-        let params: snow::params::NoiseParams =
-            NOISE_PARAMS.parse().map_err(|_| Error::Crypto("noise params"))?;
+        let params: snow::params::NoiseParams = NOISE_PARAMS
+            .parse()
+            .map_err(|_| Error::Crypto("noise params"))?;
         let secret = identity.link_secret();
         let builder = snow::Builder::new(params).local_private_key(&secret);
         let inner = if initiator {
@@ -57,7 +58,10 @@ impl LinkHandshake {
     /// an early-data `payload`).
     pub fn write(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; payload.len() + 128];
-        let n = self.inner.write_message(payload, &mut buf).map_err(noise_err)?;
+        let n = self
+            .inner
+            .write_message(payload, &mut buf)
+            .map_err(noise_err)?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -66,7 +70,10 @@ impl LinkHandshake {
     /// payload it carried.
     pub fn read(&mut self, message: &[u8]) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; message.len() + 64];
-        let n = self.inner.read_message(message, &mut buf).map_err(noise_err)?;
+        let n = self
+            .inner
+            .read_message(message, &mut buf)
+            .map_err(noise_err)?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -79,7 +86,9 @@ impl LinkHandshake {
     /// The peer's authenticated X25519 static key, once the handshake has revealed
     /// it. Map this to a node identity (see [`Identity::x_public`]).
     pub fn remote_static(&self) -> Option<XPubKeyBytes> {
-        self.inner.get_remote_static().and_then(|s| s.try_into().ok())
+        self.inner
+            .get_remote_static()
+            .and_then(|s| s.try_into().ok())
     }
 
     /// Promote a finished handshake into an encrypted transport [`LinkSession`].
@@ -100,7 +109,10 @@ impl LinkSession {
     /// Encrypt a plaintext frame for transmission to the peer.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; plaintext.len() + 16]; // + AEAD tag
-        let n = self.inner.write_message(plaintext, &mut buf).map_err(noise_err)?;
+        let n = self
+            .inner
+            .write_message(plaintext, &mut buf)
+            .map_err(noise_err)?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -108,14 +120,19 @@ impl LinkSession {
     /// Decrypt a ciphertext frame received from the peer.
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; ciphertext.len()];
-        let n = self.inner.read_message(ciphertext, &mut buf).map_err(noise_err)?;
+        let n = self
+            .inner
+            .read_message(ciphertext, &mut buf)
+            .map_err(noise_err)?;
         buf.truncate(n);
         Ok(buf)
     }
 
     /// The peer's authenticated X25519 static key.
     pub fn remote_static(&self) -> Option<XPubKeyBytes> {
-        self.inner.get_remote_static().and_then(|s| s.try_into().ok())
+        self.inner
+            .get_remote_static()
+            .and_then(|s| s.try_into().ok())
     }
 }
 
@@ -269,8 +286,14 @@ mod tests {
 
         // Each side authenticated the other's X25519 static key = its address-bound
         // sealing key.
-        assert_eq!(hi.remote_static().unwrap(), crate::crypto::address_to_x(&bob.address()).unwrap());
-        assert_eq!(hr.remote_static().unwrap(), crate::crypto::address_to_x(&alice.address()).unwrap());
+        assert_eq!(
+            hi.remote_static().unwrap(),
+            crate::crypto::address_to_x(&bob.address()).unwrap()
+        );
+        assert_eq!(
+            hr.remote_static().unwrap(),
+            crate::crypto::address_to_x(&alice.address()).unwrap()
+        );
 
         let mut si = hi.into_session().unwrap();
         let mut sr = hr.into_session().unwrap();

@@ -81,7 +81,11 @@ pub struct StreamBuffer {
 
 impl StreamBuffer {
     pub fn new(max_unacked: usize) -> Self {
-        Self { next_seq: 0, unacked: BTreeMap::new(), max_unacked }
+        Self {
+            next_seq: 0,
+            unacked: BTreeMap::new(),
+            max_unacked,
+        }
     }
 
     /// Assign the next sequence number to `bytes` and buffer it. Returns the seq,
@@ -104,7 +108,10 @@ impl StreamBuffer {
     /// Chunks still unacknowledged from `seq` onward, in order — to resend after a
     /// reconnect. (Pass the peer's last ACK + 1, or 0 to resend everything held.)
     pub fn resend_from(&self, seq: u64) -> Vec<(u64, Vec<u8>)> {
-        self.unacked.range(seq..).map(|(s, b)| (*s, b.clone())).collect()
+        self.unacked
+            .range(seq..)
+            .map(|(s, b)| (*s, b.clone()))
+            .collect()
     }
 
     /// Number of chunks still awaiting acknowledgement.
@@ -145,9 +152,15 @@ mod tests {
     fn ignores_duplicates() {
         let mut r = StreamReassembler::new();
         assert_eq!(r.accept(0, b"a".to_vec(), false), vec![b"a".to_vec()]);
-        assert!(r.accept(0, b"a".to_vec(), false).is_empty(), "already delivered");
+        assert!(
+            r.accept(0, b"a".to_vec(), false).is_empty(),
+            "already delivered"
+        );
         assert!(r.accept(2, b"c".to_vec(), false).is_empty());
-        assert!(r.accept(2, b"c".to_vec(), false).is_empty(), "buffered dup ignored");
+        assert!(
+            r.accept(2, b"c".to_vec(), false).is_empty(),
+            "buffered dup ignored"
+        );
     }
 
     #[test]

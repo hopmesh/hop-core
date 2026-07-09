@@ -45,6 +45,11 @@ pub enum Destination {
     /// Used by `hps://` publishes, which fan out to subscribers the publisher doesn't enumerate
     /// (DESIGN.md §32).
     Broadcast,
+    /// §39 delivery **vaccine**: floods `(delivered id, recognition token)`. A relay holding the
+    /// named bundle verifies `recognition_tag_from_shared(token, id)` against the tag it stores and
+    /// drops its copy (epidemic recovery on delivery). Carries NO src/dst/recipient — the token is
+    /// the recipient's revealed DH, which only it can produce and which doesn't identify it (CDH).
+    Vaccine(BundleId, [u8; 32]),
 }
 
 /// Per-bundle flags. Plain bools to avoid a bitflags dependency.
@@ -208,7 +213,10 @@ pub enum Payload {
     /// demonstrates the requester holds the host's app secret (DESIGN.md §32 app isolation). The
     /// host replies with [`Payload::HpsKeys`] for an Open topic, or queues the request for a
     /// RequestToJoin topic; ignored for Invite topics.
-    HpsJoinRequest { path: String, proof: [u8; 32] },
+    HpsJoinRequest {
+        path: String,
+        proof: [u8; 32],
+    },
     /// The keys for a subscribed topic, sealed back to the subscriber. `service_pubkey` is
     /// `Some` for a service (verify broadcasts against it) and `None` for a channel (verify
     /// each post against its sender's address). `epoch` is the rekey generation.
@@ -221,11 +229,21 @@ pub enum Payload {
     /// Host → destination: an invite to a topic (DESIGN.md §32 Invite mode). The destination
     /// accepts with [`Payload::HpsInviteAccept`] to receive the keys. `proof` carries the host's
     /// app-secret proof so the invitee knows it's a same-app invite.
-    HpsInvite { path: String, kind: crate::hps::ServiceKind, proof: [u8; 32] },
+    HpsInvite {
+        path: String,
+        kind: crate::hps::ServiceKind,
+        proof: [u8; 32],
+    },
     /// Destination → host: accept a pending invite; the host then seals [`Payload::HpsKeys`].
-    HpsInviteAccept { path: String, proof: [u8; 32] },
+    HpsInviteAccept {
+        path: String,
+        proof: [u8; 32],
+    },
     /// Member → host: leave a topic, so the host drops them from the retained set / reach tally.
-    HpsLeave { path: String, proof: [u8; 32] },
+    HpsLeave {
+        path: String,
+        proof: [u8; 32],
+    },
     /// Host → retained member: rotate to a new key generation (revocation, DESIGN.md §32).
     /// `new_path` equals `old_path` unless the topic was moved. Removed members never receive
     /// this and keep the dead key.
@@ -240,7 +258,10 @@ pub enum Payload {
     /// Member → host: confirms decrypting a broadcast, so the host can tally unique acking
     /// addresses as reach and build the retained-member set (DESIGN.md §32). `topic_tag` is the
     /// opaque per-topic tag; `epoch` is the generation the member is on.
-    HpsReachAck { topic_tag: [u8; 16], epoch: u32 },
+    HpsReachAck {
+        topic_tag: [u8; 16],
+        epoch: u32,
+    },
     /// A published message, flooded ([`Destination::Broadcast`]) to all subscribers. The body
     /// is content-key encrypted; `sig` is the sender's signature over `path‖nonce‖ciphertext`.
     /// `topic_tag` is the opaque per-topic tag (a foreign app that opens the public broadcast
@@ -423,7 +444,11 @@ impl Bundle {
             id,
             src: [0u8; 32],
             dst: Destination::Broadcast,
-            private: Some(PrivateHeader { tag, ephemeral, mailbox }),
+            private: Some(PrivateHeader {
+                tag,
+                ephemeral,
+                mailbox,
+            }),
             created_at: opts.created_at,
             lifetime_ms: opts.lifetime_ms,
             flags: opts.flags,
@@ -437,7 +462,11 @@ impl Bundle {
             hops: 0,
             trace: Vec::new(),
         };
-        Ok(Bundle { inner, env, sig: Vec::new() })
+        Ok(Bundle {
+            inner,
+            env,
+            sig: Vec::new(),
+        })
     }
 
     /// Is this a §39 private (untraceable) bundle?
@@ -445,12 +474,52 @@ impl Bundle {
         self.inner.private.is_some()
     }
 
+    /// §39 delivery vaccine anti-packet: an anonymous, unsigned bundle that floods the delivered
+    /// bundle's id + the recipient's revealed recognition token. No src, no recipient, empty seal —
+    /// everything a relay needs rides in the cleartext `Vaccine` destination. Self-verifying by id.
+    pub fn create_vaccine(delivered: BundleId, token: [u8; 32], opts: BundleOpts) -> Self {
+        let id = compute_vaccine_id(&delivered, &token);
+        let inner = SignedInner {
+            version: BUNDLE_VERSION,
+            app: opts.app,
+            id,
+            src: [0u8; 32],
+            dst: Destination::Vaccine(delivered, token),
+            private: None,
+            created_at: opts.created_at,
+            lifetime_ms: opts.lifetime_ms,
+            flags: BundleFlags {
+                is_ack: true,
+                ..opts.flags
+            },
+            priority: opts.priority,
+            payload: Sealed {
+                ephemeral_pub: [0u8; 32],
+                nonce: [0u8; 12],
+                ciphertext: Vec::new(),
+            },
+        };
+        let env = Envelope {
+            hop_limit: opts.hop_limit,
+            custody: None,
+            copies: opts.copies.max(1),
+            hops: 0,
+            trace: Vec::new(),
+        };
+        Bundle {
+            inner,
+            env,
+            sig: Vec::new(),
+        }
+    }
+
     /// §39 "is this mine?": true iff this is a private bundle whose recognition tag the
     /// holder of `spk_secret` recomputes. One DH + one hash; no payload decryption.
     pub fn recognized_by(&self, spk_secret: &[u8; 32]) -> bool {
         match &self.inner.private {
             Some(ph) => {
-                crypto::recognition_tag_recipient(spk_secret, &ph.ephemeral, &self.inner.id) == ph.tag
+                crypto::recognition_tag_recipient(spk_secret, &ph.ephemeral, &self.inner.id)
+                    == ph.tag
             }
             None => false,
         }
@@ -478,6 +547,15 @@ impl Bundle {
         // the recipient is found by the recognition tag, not a signature or a dst.
         if self.inner.private.is_some() {
             return if compute_private_id(&self.inner.payload) == self.inner.id {
+                Ok(())
+            } else {
+                Err(Error::BadSignature)
+            };
+        }
+        // §39 vaccine: anonymous + unsigned. Self-verifying — its id binds its own (delivered, token),
+        // so a tampered anti-packet is rejected. The token is checked against the held tag at drop time.
+        if let Destination::Vaccine(delivered, token) = &self.inner.dst {
+            return if compute_vaccine_id(delivered, token) == self.inner.id {
                 Ok(())
             } else {
                 Err(Error::BadSignature)
@@ -563,7 +641,10 @@ impl Bundle {
         match data.first() {
             None => return Err(Error::Codec(postcard::Error::DeserializeUnexpectedEnd)),
             Some(&v) if !is_supported_bundle_version(v) => {
-                return Err(Error::UnsupportedVersion { got: v, supported: BUNDLE_VERSION });
+                return Err(Error::UnsupportedVersion {
+                    got: v,
+                    supported: BUNDLE_VERSION,
+                });
             }
             _ => {}
         }
@@ -597,6 +678,17 @@ fn compute_private_id(sealed: &Sealed) -> BundleId {
     *hasher.finalize().as_bytes()
 }
 
+/// §39 vaccine id: `BLAKE3(domain ‖ delivered ‖ token)` — deterministic, so all vaccines for one
+/// delivery dedup to a single flood, and self-verifying (the id binds its own `(delivered, token)`,
+/// no signature needed — a tampered token yields a different id and is rejected by `verify()`).
+fn compute_vaccine_id(delivered: &BundleId, token: &[u8; 32]) -> BundleId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hop vaccine id v1");
+    hasher.update(delivered);
+    hasher.update(token);
+    *hasher.finalize().as_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,7 +704,10 @@ mod tests {
             },
             BundleOpts {
                 created_at: 1_000,
-                flags: BundleFlags { request_ack: true, ..Default::default() },
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -670,7 +765,10 @@ mod tests {
         Bundle::create_private(
             &to.address(),
             spk_pub,
-            &Payload::PeerMessage { content_type: "text/plain".into(), body: b"psst".to_vec() },
+            &Payload::PeerMessage {
+                content_type: "text/plain".into(),
+                body: b"psst".to_vec(),
+            },
             None,
             BundleOpts::default(),
         )
@@ -760,6 +858,10 @@ mod tests {
         let bcast = postcard::to_allocvec(&Destination::Broadcast).unwrap();
         assert_eq!(dev[0], 0, "Device must stay discriminant 0");
         assert_eq!(ack[0], 1, "AckTo must stay discriminant 1");
-        assert_eq!(bcast, vec![2], "Broadcast must stay discriminant 2 (and carry no data)");
+        assert_eq!(
+            bcast,
+            vec![2],
+            "Broadcast must stay discriminant 2 (and carry no data)"
+        );
     }
 }

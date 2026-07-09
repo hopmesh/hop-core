@@ -68,7 +68,10 @@ pub enum AdvertKind {
     /// session to it without a live round-trip. The advert signature already binds
     /// `spk_pub` to the publisher; `spk_sig` makes the reconstructed bundle
     /// self-verifying.
-    PreKey { spk_pub: XPubKeyBytes, spk_sig: Vec<u8> },
+    PreKey {
+        spk_pub: XPubKeyBytes,
+        spk_sig: Vec<u8>,
+    },
     /// Revokes a previously published advert (a sold item, a closed post).
     Tombstone { revokes: AdvertId },
     /// A discoverable `hps://` channel/service announcement (DESIGN.md §32). The descriptor
@@ -158,7 +161,12 @@ impl Advert {
         let bytes = postcard::to_allocvec(&body)?;
         let id = *blake3::hash(&bytes).as_bytes();
         let sig = publisher.sign(&bytes).to_vec();
-        Ok(Advert { id, body, sig, hops: 0 })
+        Ok(Advert {
+            id,
+            body,
+            sig,
+            hops: 0,
+        })
     }
 
     /// Verify the id matches the body and the publisher signature is valid.
@@ -167,7 +175,10 @@ impl Advert {
         // any of its fields. Like [`Bundle::from_bytes`], this turns a silent misdecode
         // after a discriminant shift into a loud [`Error::UnsupportedVersion`].
         if self.body.version != ADVERT_VERSION {
-            return Err(Error::UnsupportedVersion { got: self.body.version, supported: ADVERT_VERSION });
+            return Err(Error::UnsupportedVersion {
+                got: self.body.version,
+                supported: ADVERT_VERSION,
+            });
         }
         let bytes = postcard::to_allocvec(&self.body)?;
         if *blake3::hash(&bytes).as_bytes() != self.id {
@@ -208,7 +219,11 @@ struct RelayCache {
 
 impl RelayCache {
     fn new(cap: usize) -> Self {
-        Self { cap, order: VecDeque::new(), blobs: HashMap::new() }
+        Self {
+            cap,
+            order: VecDeque::new(),
+            blobs: HashMap::new(),
+        }
     }
 
     fn put(&mut self, advert: &Advert) -> Result<()> {
@@ -301,8 +316,11 @@ impl Directory {
     pub fn subscribe(&mut self, topic: impl Into<String>) {
         let topic = topic.into();
         // Promote anything already in the relay cache for this topic.
-        let promote: Vec<Advert> =
-            self.relay.adverts().filter(|a| a.topic() == topic).collect();
+        let promote: Vec<Advert> = self
+            .relay
+            .adverts()
+            .filter(|a| a.topic() == topic)
+            .collect();
         for a in promote {
             self.relay.remove(&a.id);
             self.subscribed.insert(a.id, a);
@@ -316,7 +334,10 @@ impl Directory {
     }
 
     fn is_subscribed(&self, topic: &str) -> bool {
-        topic == TOPIC_CONTROL || topic == TOPIC_KEYS || topic == TOPIC_HPS || topic == TOPIC_BEACON
+        topic == TOPIC_CONTROL
+            || topic == TOPIC_KEYS
+            || topic == TOPIC_HPS
+            || topic == TOPIC_BEACON
             || self.subscriptions.contains(topic)
     }
 
@@ -353,9 +374,16 @@ impl Directory {
         // alongside storing the advert for re-gossip.
         if let AdvertKind::PreKey { spk_pub, spk_sig } = &advert.body.kind {
             let pubk = advert.body.publisher;
-            let newer = self.prekeys.get(&pubk).is_none_or(|(at, _)| advert.body.created_at >= *at);
+            let newer = self
+                .prekeys
+                .get(&pubk)
+                .is_none_or(|(at, _)| advert.body.created_at >= *at);
             if newer {
-                let bundle = PreKeyBundle { address: pubk, spk_pub: *spk_pub, spk_sig: spk_sig.clone() };
+                let bundle = PreKeyBundle {
+                    address: pubk,
+                    spk_pub: *spk_pub,
+                    spk_sig: spk_sig.clone(),
+                };
                 self.prekeys.insert(pubk, (advert.body.created_at, bundle));
             }
         }
@@ -386,7 +414,10 @@ impl Directory {
 
     /// Every advert we currently hold, from both stores.
     fn all(&self) -> impl Iterator<Item = Advert> + '_ {
-        self.subscribed.values().cloned().chain(self.relay.adverts())
+        self.subscribed
+            .values()
+            .cloned()
+            .chain(self.relay.adverts())
     }
 
     /// Adverts a peer hasn't seen yet — the gossip offer set for this contact
@@ -400,7 +431,10 @@ impl Directory {
     /// so a peer that lost state (restart / data-wipe / cache-evict) can re-secure — WITHOUT
     /// re-flooding the foreign directory bulk, which stays per-peer-deduped.
     pub fn advert_ids_by_publisher(&self, pubk: &PubKeyBytes) -> Vec<AdvertId> {
-        self.all().filter(|a| a.body.publisher == *pubk).map(|a| a.id).collect()
+        self.all()
+            .filter(|a| a.body.publisher == *pubk)
+            .map(|a| a.id)
+            .collect()
     }
 
     /// Drop expired service adverts. Call periodically (DESIGN.md §8, §23).
@@ -424,9 +458,9 @@ impl Directory {
         self.all()
             .filter(|a| a.body.app == self.app || a.body.app == FABRIC_APP) // §17 app scoping
             .filter(|a| match &a.body.kind {
-                AdvertKind::Service { service: s, tags, .. } => {
-                    s == service && tag.is_none_or(|t| tags.iter().any(|x| x == t))
-                }
+                AdvertKind::Service {
+                    service: s, tags, ..
+                } => s == service && tag.is_none_or(|t| tags.iter().any(|x| x == t)),
                 _ => false,
             })
             .collect()
@@ -531,18 +565,47 @@ mod tests {
         dir.subscribe("market");
 
         // Same-app listing → browsable.
-        let mine = Advert::publish_in(app_x, &publisher,
-            AdvertKind::Service { service: "market".into(), title: "mine".into(), summary: "".into(), tags: vec![] },
-            0, 10_000, 1).unwrap();
+        let mine = Advert::publish_in(
+            app_x,
+            &publisher,
+            AdvertKind::Service {
+                service: "market".into(),
+                title: "mine".into(),
+                summary: "".into(),
+                tags: vec![],
+            },
+            0,
+            10_000,
+            1,
+        )
+        .unwrap();
         assert!(dir.ingest(mine, 0).unwrap());
         assert_eq!(dir.browse("market", None).len(), 1);
 
         // Foreign-app listing → still accepted for gossip/relay, but NOT surfaced to our app.
-        let theirs = Advert::publish_in(app_y, &publisher,
-            AdvertKind::Service { service: "market".into(), title: "theirs".into(), summary: "".into(), tags: vec![] },
-            0, 10_000, 2).unwrap();
-        assert!(dir.ingest(theirs, 0).unwrap(), "foreign advert still relayed");
-        assert_eq!(dir.browse("market", None).len(), 1, "foreign advert not browsable");
+        let theirs = Advert::publish_in(
+            app_y,
+            &publisher,
+            AdvertKind::Service {
+                service: "market".into(),
+                title: "theirs".into(),
+                summary: "".into(),
+                tags: vec![],
+            },
+            0,
+            10_000,
+            2,
+        )
+        .unwrap();
+        assert!(
+            dir.ingest(theirs, 0).unwrap(),
+            "foreign advert still relayed"
+        );
+        assert_eq!(
+            dir.browse("market", None).len(),
+            1,
+            "foreign advert not browsable"
+        );
         assert_eq!(dir.browse("market", None)[0].body.app, app_x);
     }
 
@@ -589,7 +652,9 @@ mod tests {
 
         let tomb = Advert::publish(
             &seller,
-            AdvertKind::Tombstone { revokes: listing.id },
+            AdvertKind::Tombstone {
+                revokes: listing.id,
+            },
             10,
             600_000,
             2,
@@ -621,7 +686,8 @@ mod tests {
         let seller = Identity::generate();
         let mut dir = Directory::with_relay_cap(3);
         for i in 0..10 {
-            dir.ingest(listing(&seller, &format!("bike {i}"), i), 1).unwrap();
+            dir.ingest(listing(&seller, &format!("bike {i}"), i), 1)
+                .unwrap();
         }
         // Only the cap's worth survive in the best-effort cache.
         assert_eq!(dir.browse("market", None).len(), 3);
@@ -633,7 +699,8 @@ mod tests {
         let mut dir = Directory::with_relay_cap(2);
         dir.subscribe("market");
         for i in 0..10 {
-            dir.ingest(listing(&seller, &format!("bike {i}"), i), 1).unwrap();
+            dir.ingest(listing(&seller, &format!("bike {i}"), i), 1)
+                .unwrap();
         }
         // Subscribed → not subject to the relay-cache bound.
         assert_eq!(dir.browse("market", None).len(), 10);

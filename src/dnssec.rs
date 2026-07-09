@@ -70,7 +70,11 @@ impl Dnskey {
         let rdata = self.rdata();
         let mut ac: u32 = 0;
         for (i, b) in rdata.iter().enumerate() {
-            ac += if i & 1 == 0 { (*b as u32) << 8 } else { *b as u32 };
+            ac += if i & 1 == 0 {
+                (*b as u32) << 8
+            } else {
+                *b as u32
+            };
         }
         ac += (ac >> 16) & 0xFFFF;
         (ac & 0xFFFF) as u16
@@ -189,7 +193,8 @@ pub fn verify_rrsig(rrset: &[Rr], rrsig: &Rrsig, key: &Dnskey) -> Result<(), Dns
                 .map_err(|_| DnssecError::Malformed("bad P-256 key"))?;
             let sig = Signature::from_slice(&rrsig.signature)
                 .map_err(|_| DnssecError::Malformed("bad P-256 signature"))?;
-            vk.verify(&data, &sig).map_err(|_| DnssecError::BadSignature)
+            vk.verify(&data, &sig)
+                .map_err(|_| DnssecError::BadSignature)
         }
         ALG_ED25519 => {
             // RFC 8080: DNSKEY carries the raw 32-byte Ed25519 public key; the RRSIG is a 64-byte
@@ -200,13 +205,15 @@ pub fn verify_rrsig(rrset: &[Rr], rrsig: &Rrsig, key: &Dnskey) -> Result<(), Dns
                 .as_slice()
                 .try_into()
                 .map_err(|_| DnssecError::Malformed("bad Ed25519 key length"))?;
-            let vk = VerifyingKey::from_bytes(&kb).map_err(|_| DnssecError::Malformed("bad Ed25519 key"))?;
+            let vk = VerifyingKey::from_bytes(&kb)
+                .map_err(|_| DnssecError::Malformed("bad Ed25519 key"))?;
             let sb: [u8; 64] = rrsig
                 .signature
                 .as_slice()
                 .try_into()
                 .map_err(|_| DnssecError::Malformed("bad Ed25519 signature length"))?;
-            vk.verify(&data, &Signature::from_bytes(&sb)).map_err(|_| DnssecError::BadSignature)
+            vk.verify(&data, &Signature::from_bytes(&sb))
+                .map_err(|_| DnssecError::BadSignature)
         }
         other => Err(DnssecError::Unsupported(other)),
     }
@@ -330,8 +337,15 @@ fn verify_with_keys<'a>(
 /// (unix seconds): the record is signed by the leaf zone, each zone's DNSKEY set is self-signed
 /// by its KSK, each KSK is vouched by a DS in its parent (and the DS set is signed by the
 /// parent), and the chain terminates at an anchor. Use [`root_anchors`] for the real anchors.
-pub fn validate_chain(chain: &DnssecChain, anchors: &[Dnskey], now: u32) -> Result<(), DnssecError> {
-    let leaf = chain.zones.first().ok_or(DnssecError::Malformed("no zones"))?;
+pub fn validate_chain(
+    chain: &DnssecChain,
+    anchors: &[Dnskey],
+    now: u32,
+) -> Result<(), DnssecError> {
+    let leaf = chain
+        .zones
+        .first()
+        .ok_or(DnssecError::Malformed("no zones"))?;
 
     // 1. The answer record is signed by the leaf zone's ZSK.
     verify_with_keys(&chain.record, &chain.record_rrsig, &leaf.dnskeys, now)?;
@@ -381,16 +395,15 @@ pub fn validate_chain(chain: &DnssecChain, anchors: &[Dnskey], now: u32) -> Resu
                 .ds_rrsig
                 .as_ref()
                 .ok_or(DnssecError::Malformed("missing DS RRSIG"))?;
-            let ds_rrset: Vec<Rr> = z
-                .ds
-                .iter()
-                .map(|d| Rr {
-                    owner: owner.clone(),
-                    rtype: TYPE_DS,
-                    class: 1,
-                    rdata: d.rdata(),
-                })
-                .collect();
+            let ds_rrset: Vec<Rr> =
+                z.ds.iter()
+                    .map(|d| Rr {
+                        owner: owner.clone(),
+                        rtype: TYPE_DS,
+                        class: 1,
+                        rdata: d.rdata(),
+                    })
+                    .collect();
             verify_with_keys(&ds_rrset, ds_rrsig, &parent.dnskeys, now)?;
         }
     }
@@ -431,12 +444,18 @@ pub fn validate_and_extract(
     let chain = assemble_chain(domain, dohs)?;
     validate_chain(&chain, anchors, now)?;
     // The validated TXT value: rdata is `<len><bytes>`.
-    let rd = &chain.record.first().ok_or(DnssecError::Malformed("no record"))?.rdata;
+    let rd = &chain
+        .record
+        .first()
+        .ok_or(DnssecError::Malformed("no record"))?
+        .rdata;
     if rd.is_empty() {
         return Err(DnssecError::Malformed("empty TXT"));
     }
     let len = rd[0] as usize;
-    let value = rd.get(1..1 + len).ok_or(DnssecError::Malformed("bad TXT len"))?;
+    let value = rd
+        .get(1..1 + len)
+        .ok_or(DnssecError::Malformed("bad TXT len"))?;
     let bytes = bs58::decode(value)
         .into_vec()
         .map_err(|_| DnssecError::Malformed("TXT not base58"))?;
@@ -470,7 +489,7 @@ pub struct DohAnswer {
     pub ad: bool,
     /// DNS response status (0 = NOERROR, 3 = NXDOMAIN).
     pub status: u32,
-    pub txt: Vec<(String, String)>,    // (owner, value)
+    pub txt: Vec<(String, String)>, // (owner, value)
     pub dnskeys: Vec<(String, Dnskey)>,
     pub ds: Vec<(String, Ds)>,
     pub rrsigs: Vec<(String, Rrsig)>,
@@ -516,7 +535,12 @@ fn parse_dnskey(data: &str) -> Option<Dnskey> {
     let protocol = p.next()?.parse().ok()?;
     let algorithm = p.next()?.parse().ok()?;
     let public_key = b64d(&p.collect::<Vec<_>>().join(""))?;
-    Some(Dnskey { flags, protocol, algorithm, public_key })
+    Some(Dnskey {
+        flags,
+        protocol,
+        algorithm,
+        public_key,
+    })
 }
 
 /// Parse a DS presentation rdata: `key_tag algorithm digest_type <hex digest>`.
@@ -526,7 +550,12 @@ fn parse_ds(data: &str) -> Option<Ds> {
     let algorithm = p.next()?.parse().ok()?;
     let digest_type = p.next()?.parse().ok()?;
     let digest = hexd(&p.collect::<Vec<_>>().join(""))?;
-    Some(Ds { key_tag, algorithm, digest_type, digest })
+    Some(Ds {
+        key_tag,
+        algorithm,
+        digest_type,
+        digest,
+    })
 }
 
 /// Parse an RRSIG presentation rdata:
@@ -614,7 +643,12 @@ pub fn assemble_chain(domain: &str, dohs: &[DohAnswer]) -> Result<DnssecChain, D
     let record: Vec<Rr> = txt
         .iter()
         .filter(|(o, _)| norm(o) == record_name)
-        .map(|(o, v)| Rr { owner: name_to_wire(o), rtype: 16, class: 1, rdata: txt_rdata(v) })
+        .map(|(o, v)| Rr {
+            owner: name_to_wire(o),
+            rtype: 16,
+            class: 1,
+            rdata: txt_rdata(v),
+        })
         .collect();
     if record.is_empty() {
         return Err(DnssecError::Malformed("no TXT record"));
@@ -631,8 +665,11 @@ pub fn assemble_chain(domain: &str, dohs: &[DohAnswer]) -> Result<DnssecChain, D
     let mut z = leaf;
     loop {
         let is_root = z.is_empty();
-        let zone_keys: Vec<Dnskey> =
-            dnskeys.iter().filter(|(o, _)| norm(o) == z).map(|(_, k)| k.clone()).collect();
+        let zone_keys: Vec<Dnskey> = dnskeys
+            .iter()
+            .filter(|(o, _)| norm(o) == z)
+            .map(|(_, k)| k.clone())
+            .collect();
         if zone_keys.is_empty() {
             return Err(DnssecError::Malformed("missing DNSKEY for a zone"));
         }
@@ -644,22 +681,35 @@ pub fn assemble_chain(domain: &str, dohs: &[DohAnswer]) -> Result<DnssecChain, D
         let (zone_ds, ds_rrsig) = if is_root {
             (Vec::new(), None)
         } else {
-            let zd: Vec<Ds> =
-                ds.iter().filter(|(o, _)| norm(o) == z).map(|(_, d)| d.clone()).collect();
+            let zd: Vec<Ds> = ds
+                .iter()
+                .filter(|(o, _)| norm(o) == z)
+                .map(|(_, d)| d.clone())
+                .collect();
             let dsr = rrsigs
                 .iter()
                 .find(|(o, r)| norm(o) == z && r.type_covered == TYPE_DS)
                 .map(|(_, r)| r.clone());
             (zd, dsr)
         };
-        zones.push(ZoneProof { name: z.clone(), dnskeys: zone_keys, dnskey_rrsig, ds: zone_ds, ds_rrsig });
+        zones.push(ZoneProof {
+            name: z.clone(),
+            dnskeys: zone_keys,
+            dnskey_rrsig,
+            ds: zone_ds,
+            ds_rrsig,
+        });
         if is_root {
             break;
         }
         z = parent_zone(&z);
     }
 
-    Ok(DnssecChain { record, record_rrsig, zones })
+    Ok(DnssecChain {
+        record,
+        record_rrsig,
+        zones,
+    })
 }
 
 /// Parse a DoH JSON response body into typed records. Tolerant: unparseable records are
@@ -679,7 +729,11 @@ pub fn parse_doh(json: &str) -> Result<DohAnswer, DnssecError> {
         };
         for rec in arr {
             let rtype = rec.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
-            let name = rec.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let name = rec
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
             let data = rec.get("data").and_then(|d| d.as_str()).unwrap_or("");
             match rtype {
                 16 => out.txt.push((name, data.trim_matches('"').to_string())),
@@ -722,12 +776,10 @@ mod tests {
             flags: 256,
             protocol: 3,
             algorithm: 8,
-            public_key: b64(
-                "AwEAAdZm1zOo0FSOc/5gbJtNPoNpLmk8i3BvAUmgM//nsFHO68cVopMr\
+            public_key: b64("AwEAAdZm1zOo0FSOc/5gbJtNPoNpLmk8i3BvAUmgM//nsFHO68cVopMr\
                  jTEjmD+tb89QrEpmmATDEE3IqnalP1gaSGC+OferlNmCPFbuttNLCRf+\
                  XnKXbz9CJ/FUKWhCipRds8lBDVU/iTQbC4y0VHRZkr759yNXRHU1i/bN\
-                 b3vptTKj",
-            ),
+                 b3vptTKj"),
         };
         // The signed key tag is 30700 — our independent computation must match.
         assert_eq!(zsk.key_tag(), 30700, "key tag from DNSKEY rdata");
@@ -741,12 +793,10 @@ mod tests {
             sig_inception: 1781934178,  // 20260620054258 UTC
             key_tag: 30700,
             signer_name: name_to_wire("hopme.sh"),
-            signature: b64(
-                "rOfIOdr7ooOk0JK7SZbt71avK+VisW7mWtLt8oi7pbTcHwe6Tq5+PZog\
+            signature: b64("rOfIOdr7ooOk0JK7SZbt71avK+VisW7mWtLt8oi7pbTcHwe6Tq5+PZog\
                  5ExVHe0EAqdXjGersLgue+z3hb75j/hNXvK/zKt2l2a+FFtwfVc9oUnx\
                  q5zh0c5Bz5CAjMeJ5lZvlRgiwbtTfGd0ezYDqgS8P0s1CyV9GCvbvElE\
-                 LUI=",
-            ),
+                 LUI="),
         };
 
         let txt = Rr {
@@ -766,12 +816,10 @@ mod tests {
             flags: 256,
             protocol: 3,
             algorithm: 8,
-            public_key: b64(
-                "AwEAAdZm1zOo0FSOc/5gbJtNPoNpLmk8i3BvAUmgM//nsFHO68cVopMr\
+            public_key: b64("AwEAAdZm1zOo0FSOc/5gbJtNPoNpLmk8i3BvAUmgM//nsFHO68cVopMr\
                  jTEjmD+tb89QrEpmmATDEE3IqnalP1gaSGC+OferlNmCPFbuttNLCRf+\
                  XnKXbz9CJ/FUKWhCipRds8lBDVU/iTQbC4y0VHRZkr759yNXRHU1i/bN\
-                 b3vptTKj",
-            ),
+                 b3vptTKj"),
         };
         let rrsig = Rrsig {
             type_covered: 16,
@@ -782,12 +830,10 @@ mod tests {
             sig_inception: 1781934178,
             key_tag: 30700,
             signer_name: name_to_wire("hopme.sh"),
-            signature: b64(
-                "rOfIOdr7ooOk0JK7SZbt71avK+VisW7mWtLt8oi7pbTcHwe6Tq5+PZog\
+            signature: b64("rOfIOdr7ooOk0JK7SZbt71avK+VisW7mWtLt8oi7pbTcHwe6Tq5+PZog\
                  5ExVHe0EAqdXjGersLgue+z3hb75j/hNXvK/zKt2l2a+FFtwfVc9oUnx\
                  q5zh0c5Bz5CAjMeJ5lZvlRgiwbtTfGd0ezYDqgS8P0s1CyV9GCvbvElE\
-                 LUI=",
-            ),
+                 LUI="),
         };
         let tampered = Rr {
             owner: name_to_wire("_hopaddress.example.hopme.sh"),
@@ -809,21 +855,21 @@ mod tests {
             flags: 257,
             protocol: 3,
             algorithm: 8,
-            public_key: b64(
-                "AwEAAc8K3U595+tS/OwpGZL4J4SSLymmg0BSLN5BWm1vzMtUDmP5eTjK\
+            public_key: b64("AwEAAc8K3U595+tS/OwpGZL4J4SSLymmg0BSLN5BWm1vzMtUDmP5eTjK\
                  KI8NbDl4H0sSIGf9KwU3EWPZ96YzVx4y2Z+BKOCuaPU5VI+kOjxjm8x6\
                  YUkFwonHibDfwppHg05yZ4wu9YqbmS6HNfJjdrx0aKPN4zpKc/FO1eec\
                  PrP4+kdasycd9TEPw6T9kQLBWaRSCi0seHaSWC19scYUFZdPXTySF+WJ\
                  8xJS6lJULo8e++FKNqwJGCjWxo1PGSUqQKTxejiuZEb2E59Rf9mrZBGT\
                  +I2Kq8/dOzrnf4RVCSzfHJSQWOyp7RG9YkrclwMxarwDD1ToDEciWIBD\
-                 DH3e9+Wllu8=",
-            ),
+                 DH3e9+Wllu8="),
         };
         assert_eq!(ksk.key_tag(), 5446);
         let digest = ds_digest(&name_to_wire("hopme.sh"), &ksk, DIGEST_SHA256).unwrap();
-        let want =
-            hex("6C6733A258D4FC31571FCEA1A657F188EE295EAB3ADC222EB807B5786048E0F9");
-        assert_eq!(digest, want, "DS digest must match the record published at .sh");
+        let want = hex("6C6733A258D4FC31571FCEA1A657F188EE295EAB3ADC222EB807B5786048E0F9");
+        assert_eq!(
+            digest, want,
+            "DS digest must match the record published at .sh"
+        );
     }
 
     // --- synthetic full-chain walk -----------------------------------------------------
@@ -850,10 +896,23 @@ mod tests {
         }
         public_key.extend_from_slice(&e);
         public_key.extend_from_slice(&n);
-        Dnskey { flags, protocol: 3, algorithm: 8, public_key }
+        Dnskey {
+            flags,
+            protocol: 3,
+            algorithm: 8,
+            public_key,
+        }
     }
 
-    fn sign(sk: &RsaPrivateKey, signer: &Dnskey, zone: &str, rrset: &[Rr], type_covered: u16, labels: u8, now: u32) -> Rrsig {
+    fn sign(
+        sk: &RsaPrivateKey,
+        signer: &Dnskey,
+        zone: &str,
+        rrset: &[Rr],
+        type_covered: u16,
+        labels: u8,
+        now: u32,
+    ) -> Rrsig {
         let mut rrsig = Rrsig {
             type_covered,
             algorithm: 8,
@@ -884,30 +943,97 @@ mod tests {
         let zone_zsk = dnskey_of(&zone_zsk_sk, 256);
 
         // Leaf record: the _hopaddress TXT, signed by the zone ZSK.
-        let rec = Rr { owner: name_to_wire("_hopaddress.example"), rtype: 16, class: 1, rdata: txt_rdata(value) };
-        let record_rrsig = sign(&zone_zsk_sk, &zone_zsk, "example", std::slice::from_ref(&rec), 16, 2, now);
+        let rec = Rr {
+            owner: name_to_wire("_hopaddress.example"),
+            rtype: 16,
+            class: 1,
+            rdata: txt_rdata(value),
+        };
+        let record_rrsig = sign(
+            &zone_zsk_sk,
+            &zone_zsk,
+            "example",
+            std::slice::from_ref(&rec),
+            16,
+            2,
+            now,
+        );
 
         // Zone DNSKEY set self-signed by the zone KSK.
         let zone_keys = vec![zone_ksk.clone(), zone_zsk.clone()];
-        let zone_dnskey_rrset: Vec<Rr> = zone_keys.iter().map(|k| Rr { owner: name_to_wire("example"), rtype: TYPE_DNSKEY, class: 1, rdata: k.rdata() }).collect();
-        let zone_dnskey_rrsig = sign(&zone_ksk_sk, &zone_ksk, "example", &zone_dnskey_rrset, TYPE_DNSKEY, 1, now);
+        let zone_dnskey_rrset: Vec<Rr> = zone_keys
+            .iter()
+            .map(|k| Rr {
+                owner: name_to_wire("example"),
+                rtype: TYPE_DNSKEY,
+                class: 1,
+                rdata: k.rdata(),
+            })
+            .collect();
+        let zone_dnskey_rrsig = sign(
+            &zone_ksk_sk,
+            &zone_ksk,
+            "example",
+            &zone_dnskey_rrset,
+            TYPE_DNSKEY,
+            1,
+            now,
+        );
 
         // DS for the zone (its KSK), published in root, signed by root ZSK.
-        let zone_ds = Ds { key_tag: zone_ksk.key_tag(), algorithm: 8, digest_type: 2, digest: ds_digest(&name_to_wire("example"), &zone_ksk, 2).unwrap() };
-        let ds_rrset = vec![Rr { owner: name_to_wire("example"), rtype: TYPE_DS, class: 1, rdata: zone_ds.rdata() }];
+        let zone_ds = Ds {
+            key_tag: zone_ksk.key_tag(),
+            algorithm: 8,
+            digest_type: 2,
+            digest: ds_digest(&name_to_wire("example"), &zone_ksk, 2).unwrap(),
+        };
+        let ds_rrset = vec![Rr {
+            owner: name_to_wire("example"),
+            rtype: TYPE_DS,
+            class: 1,
+            rdata: zone_ds.rdata(),
+        }];
         let ds_rrsig = sign(&root_zsk_sk, &root_zsk, "", &ds_rrset, TYPE_DS, 1, now);
 
         // Root DNSKEY set self-signed by the root KSK (the anchor).
         let root_keys = vec![root_ksk.clone(), root_zsk.clone()];
-        let root_dnskey_rrset: Vec<Rr> = root_keys.iter().map(|k| Rr { owner: name_to_wire(""), rtype: TYPE_DNSKEY, class: 1, rdata: k.rdata() }).collect();
-        let root_dnskey_rrsig = sign(&root_ksk_sk, &root_ksk, "", &root_dnskey_rrset, TYPE_DNSKEY, 0, now);
+        let root_dnskey_rrset: Vec<Rr> = root_keys
+            .iter()
+            .map(|k| Rr {
+                owner: name_to_wire(""),
+                rtype: TYPE_DNSKEY,
+                class: 1,
+                rdata: k.rdata(),
+            })
+            .collect();
+        let root_dnskey_rrsig = sign(
+            &root_ksk_sk,
+            &root_ksk,
+            "",
+            &root_dnskey_rrset,
+            TYPE_DNSKEY,
+            0,
+            now,
+        );
 
         let chain = DnssecChain {
             record: vec![rec],
             record_rrsig,
             zones: vec![
-                ZoneProof { name: "example".into(), dnskeys: zone_keys, dnskey_rrsig: zone_dnskey_rrsig, ds: vec![zone_ds], ds_rrsig: Some(ds_rrsig) },
-                ZoneProof { name: "".into(), dnskeys: root_keys, dnskey_rrsig: root_dnskey_rrsig, ds: vec![], ds_rrsig: None },
+                ZoneProof {
+                    name: "example".into(),
+                    dnskeys: zone_keys,
+                    dnskey_rrsig: zone_dnskey_rrsig,
+                    ds: vec![zone_ds],
+                    ds_rrsig: Some(ds_rrsig),
+                },
+                ZoneProof {
+                    name: "".into(),
+                    dnskeys: root_keys,
+                    dnskey_rrsig: root_dnskey_rrsig,
+                    ds: vec![],
+                    ds_rrsig: None,
+                },
             ],
         };
         (chain, vec![root_ksk], now)
@@ -921,7 +1047,10 @@ mod tests {
 
     /// Flatten a chain into the owner-tagged DoH form (as if returned by resolvers).
     fn flatten(chain: &DnssecChain) -> DohAnswer {
-        let mut d = DohAnswer { ad: true, ..Default::default() };
+        let mut d = DohAnswer {
+            ad: true,
+            ..Default::default()
+        };
         for rr in &chain.record {
             if rr.rtype == 16 {
                 let len = rr.rdata[0] as usize;
@@ -929,7 +1058,10 @@ mod tests {
                 d.txt.push((wire_to_name(&rr.owner), val));
             }
         }
-        d.rrsigs.push((wire_to_name(&chain.record[0].owner), chain.record_rrsig.clone()));
+        d.rrsigs.push((
+            wire_to_name(&chain.record[0].owner),
+            chain.record_rrsig.clone(),
+        ));
         for z in &chain.zones {
             for k in &z.dnskeys {
                 d.dnskeys.push((z.name.clone(), k.clone()));
@@ -983,14 +1115,20 @@ mod tests {
     fn rejects_chain_with_wrong_anchor() {
         let (chain, _anchors, now) = build_chain();
         let stranger = dnskey_of(&gen(), 257); // a root key we never put in the chain
-        assert_eq!(validate_chain(&chain, &[stranger], now), Err(DnssecError::NoTrustAnchor));
+        assert_eq!(
+            validate_chain(&chain, &[stranger], now),
+            Err(DnssecError::NoTrustAnchor)
+        );
     }
 
     #[test]
     fn rejects_chain_outside_validity_window() {
         let (chain, anchors, now) = build_chain();
         // now far past every signature's expiration.
-        assert_eq!(validate_chain(&chain, &anchors, now + 200_000), Err(DnssecError::Expired));
+        assert_eq!(
+            validate_chain(&chain, &anchors, now + 200_000),
+            Err(DnssecError::Expired)
+        );
     }
 
     #[test]
@@ -1017,14 +1155,28 @@ mod tests {
             signer_name: name_to_wire("example"),
             signature: Vec::new(),
         };
-        let rr = Rr { owner: name_to_wire("_x.example"), rtype: 16, class: 1, rdata: txt_rdata("hi") };
+        let rr = Rr {
+            owner: name_to_wire("_x.example"),
+            rtype: 16,
+            class: 1,
+            rdata: txt_rdata("hi"),
+        };
         let sig: Signature = sk.sign(&signed_data(&rrsig, std::slice::from_ref(&rr)));
         rrsig.signature = sig.to_bytes().to_vec();
 
-        verify_rrsig(std::slice::from_ref(&rr), &rrsig, &dnskey).expect("ECDSA P-256 RRSIG must verify");
+        verify_rrsig(std::slice::from_ref(&rr), &rrsig, &dnskey)
+            .expect("ECDSA P-256 RRSIG must verify");
 
-        let bad = Rr { owner: name_to_wire("_x.example"), rtype: 16, class: 1, rdata: txt_rdata("xx") };
-        assert_eq!(verify_rrsig(&[bad], &rrsig, &dnskey), Err(DnssecError::BadSignature));
+        let bad = Rr {
+            owner: name_to_wire("_x.example"),
+            rtype: 16,
+            class: 1,
+            rdata: txt_rdata("xx"),
+        };
+        assert_eq!(
+            verify_rrsig(&[bad], &rrsig, &dnskey),
+            Err(DnssecError::BadSignature)
+        );
     }
 
     #[test]
@@ -1050,12 +1202,29 @@ mod tests {
             signer_name: name_to_wire("example"),
             signature: Vec::new(),
         };
-        let rr = Rr { owner: name_to_wire("_x.example"), rtype: 16, class: 1, rdata: txt_rdata("hi") };
-        rrsig.signature = sk.sign(&signed_data(&rrsig, std::slice::from_ref(&rr))).to_bytes().to_vec();
-        verify_rrsig(std::slice::from_ref(&rr), &rrsig, &dnskey).expect("Ed25519 RRSIG must verify");
+        let rr = Rr {
+            owner: name_to_wire("_x.example"),
+            rtype: 16,
+            class: 1,
+            rdata: txt_rdata("hi"),
+        };
+        rrsig.signature = sk
+            .sign(&signed_data(&rrsig, std::slice::from_ref(&rr)))
+            .to_bytes()
+            .to_vec();
+        verify_rrsig(std::slice::from_ref(&rr), &rrsig, &dnskey)
+            .expect("Ed25519 RRSIG must verify");
 
-        let bad = Rr { owner: name_to_wire("_x.example"), rtype: 16, class: 1, rdata: txt_rdata("xx") };
-        assert_eq!(verify_rrsig(&[bad], &rrsig, &dnskey), Err(DnssecError::BadSignature));
+        let bad = Rr {
+            owner: name_to_wire("_x.example"),
+            rtype: 16,
+            class: 1,
+            rdata: txt_rdata("xx"),
+        };
+        assert_eq!(
+            verify_rrsig(&[bad], &rrsig, &dnskey),
+            Err(DnssecError::BadSignature)
+        );
     }
 
     #[test]
@@ -1067,7 +1236,10 @@ mod tests {
 
     /// Decode a hex string to bytes (test helper).
     fn hex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
@@ -1088,16 +1260,21 @@ mod tests {
         assert_eq!(parsed.rrsigs.len(), 1);
 
         let zsk = Dnskey {
-            flags: 256, protocol: 3, algorithm: 8,
-            public_key: b64(
-                "AwEAAdZm1zOo0FSOc/5gbJtNPoNpLmk8i3BvAUmgM//nsFHO68cVopMr\
+            flags: 256,
+            protocol: 3,
+            algorithm: 8,
+            public_key: b64("AwEAAdZm1zOo0FSOc/5gbJtNPoNpLmk8i3BvAUmgM//nsFHO68cVopMr\
                  jTEjmD+tb89QrEpmmATDEE3IqnalP1gaSGC+OferlNmCPFbuttNLCRf+\
                  XnKXbz9CJ/FUKWhCipRds8lBDVU/iTQbC4y0VHRZkr759yNXRHU1i/bN\
-                 b3vptTKj",
-            ),
+                 b3vptTKj"),
         };
         let (owner, value) = &parsed.txt[0];
-        let rr = Rr { owner: name_to_wire(owner), rtype: 16, class: 1, rdata: txt_rdata(value) };
+        let rr = Rr {
+            owner: name_to_wire(owner),
+            rtype: 16,
+            class: 1,
+            rdata: txt_rdata(value),
+        };
         let (_, rrsig) = &parsed.rrsigs[0];
         verify_rrsig(&[rr], rrsig, &zsk).expect("parsed-from-DoH RRSIG must verify");
     }
