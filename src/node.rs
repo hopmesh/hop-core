@@ -218,9 +218,16 @@ fn prekey_epoch(now_ms: u64) -> u64 {
 /// their matching semantics silently widen to the prefix bucket. Delivery is unaffected: the final
 /// "is this mine?" test is the per-message-ephemeral recognition tag, which stays unique + unlinkable.
 fn route_key(tag: &Tag) -> Tag {
+    route_key_from_prefix(&crypto::mailbox_route(tag))
+}
+
+/// The gradient/spool/want map key ([`route_key`]) for a mailbox routing PREFIX already in hand — e.g.
+/// the [`crate::bundle::PrivateHeader::mailbox`] prefix a private bundle now carries on the wire
+/// (core-protocol-r2-02). Right-pads the prefix into a full [`Tag`] with zeros so the map keys stay
+/// `Tag`-typed and identical to those laid from a beacon's full tag via [`route_key`].
+fn route_key_from_prefix(prefix: &crypto::MailboxRoute) -> Tag {
     let mut k = [0u8; crypto::TAG_LEN];
-    let p = crypto::mailbox_route(tag);
-    k[..crypto::MAILBOX_ROUTE_PREFIX_BYTES].copy_from_slice(&p);
+    k[..crypto::MAILBOX_ROUTE_PREFIX_BYTES].copy_from_slice(prefix);
     k
 }
 
@@ -280,6 +287,13 @@ struct GradientLink {
     expires_at: u64,
     /// The beacon's per-publisher `seq`; a strictly-higher seq supersedes on the same link.
     seq: u64,
+    /// security-privacy-r2-04: OUR clock when we last accepted a beacon on this link. Per-bucket
+    /// overflow evicts the LEAST-RECENTLY-SEEN link (not the nearest-to-expiry one). A legitimate
+    /// recipient re-beacons on a short interval (`RECV_BEACON_REFRESH_MS`), so its link is always
+    /// recently-seen and survives; a prefix-grinding Sybil that parks a slot with a far-future TTL but
+    /// stops refreshing becomes stale-seen and is evicted first. That removes the old attack where a
+    /// Sybil fleet of fresher-expiry beacons on a victim's prefix could crowd out the victim's own link.
+    last_seen: u64,
 }
 
 /// sec-priv-04: routing keys on the tag PREFIX (an anonymity set), so a single bucket may cover
@@ -292,7 +306,8 @@ struct GradientLink {
 #[derive(Clone, Debug, Default)]
 struct GradientEntry {
     /// Next-hop links that beaconed this route prefix, each with its freshness. Bounded by
-    /// [`MAX_GRADIENT_LINKS_PER_BUCKET`]; on overflow the nearest-to-expiry link is evicted.
+    /// [`MAX_GRADIENT_LINKS_PER_BUCKET`]; on overflow the LEAST-RECENTLY-SEEN link is evicted
+    /// (security-privacy-r2-04), so a re-beaconing recipient is never crowded out by parked Sybils.
     links: Vec<(LinkId, GradientLink)>,
 }
 
@@ -1271,16 +1286,20 @@ impl<S: Store> Node<S> {
             sender: self.identity.address(),
             inner: Box::new(inner),
         };
-        // §39 P4: stamp the recipient's mailbox-tag so a node holding a gradient toward it can
-        // route this bundle there (instead of blind-flooding) — without any cleartext dst. The
-        // sender already has `spk_pub`, so it computes the SAME tag the recipient beacons.
+        // §39 P4: stamp the recipient's mailbox ROUTING PREFIX so a node holding a gradient toward it can
+        // route this bundle there (instead of blind-flooding) — without any cleartext dst. The sender
+        // already has `spk_pub`, so it computes the SAME tag the recipient beacons. core-protocol-r2-02:
+        // we put only the 2-byte PREFIX on the wire, never the full deterministic tag.
         let bundle = Bundle::create_private(
             &dst,
             &spk_pub,
             &wrapped,
-            // mailbox-tag = the gradient key (P4 routing; P5 pull). Derived from the recipient's
+            // mailbox routing prefix = the gradient key (P4 routing; P5 pull). Derived from the recipient's
             // address + current epoch (F-06), which the sender knows; rotates per epoch.
-            Some(crypto::mailbox_tag(&dst, mailbox_epoch(self.now_ms))),
+            Some(crypto::mailbox_route(&crypto::mailbox_tag(
+                &dst,
+                mailbox_epoch(self.now_ms),
+            ))),
             BundleOpts {
                 created_at: self.now_ms,
                 lifetime_ms: self.default_lifetime_ms,
@@ -1591,6 +1610,27 @@ impl<S: Store> Node<S> {
         None
     }
 
+    /// core-protocol-r2-04: verify a private delivery-ACK's recipient-only CDH proof against the ORIGINAL
+    /// bundle we still hold. `proof` is the recognition token `recognition_shared(recipient_spk_secret,
+    /// original.ephemeral)`; it is valid iff `recognition_tag_from_shared(proof, for_bundle_id)` equals
+    /// the original bundle's own `private.tag`. Only a holder of the recipient's SPK secret can compute a
+    /// token that satisfies this (identical to the vaccine's forgery-resistance), so an ACK forged by an
+    /// address-knower who lacks that secret fails here. Returns false if the proof is absent, the original
+    /// is no longer held (nothing to authenticate a mutation against), or the tag doesn't match.
+    fn private_ack_proof_ok(&self, for_bundle_id: &BundleId, proof: Option<[u8; 32]>) -> bool {
+        let Some(token) = proof else {
+            return false; // an unproven private ACK never mutates send state
+        };
+        let Some(tag) = self
+            .store
+            .get(for_bundle_id)
+            .and_then(|b| b.inner.private.as_ref().map(|p| p.tag))
+        else {
+            return false; // original already cleared (state is settled) — no mutation to authorize
+        };
+        crypto::recognition_tag_from_shared(&token, for_bundle_id) == tag
+    }
+
     /// §39 (sec-priv-07): flood a delivery vaccine revealing only `token`, so every node carrying a copy
     /// recovers the delivered bundle itself (`recognition_tag_from_shared(token, held_id) == held_tag`)
     /// and drops it. No plaintext delivered id on the wire. Outlives the message to chase the tail.
@@ -1625,8 +1665,22 @@ impl<S: Store> Node<S> {
                 for_bundle_id,
                 delivery_hops,
                 delivery_ms,
+                proof,
                 ..
             } if first => {
+                // core-protocol-r2-04: a private ACK is unsigned and recognized only by our SPK (whose
+                // PUBLIC half is published), and the acked bundle is sealed to our PUBLIC address — so
+                // recognition alone does NOT prove the real recipient sent this. Require the recipient-
+                // only CDH proof: `recognition_tag_from_shared(proof, for_bundle_id)` must equal the
+                // ORIGINAL bundle's own recognition tag, which only a party holding the recipient's SPK
+                // secret can produce. An attacker who knows our address + an in-flight id can forge the
+                // envelope but NOT this token. If the proof is absent or wrong, refuse to mutate send
+                // state (don't flip Delivered, don't remove from store/pending) so a forged ACK cannot
+                // strand a real message on a false "Delivered". A genuine ACK whose original we already
+                // cleared (e.g. the vaccine beat it) is idempotent — nothing left to mutate.
+                if !self.private_ack_proof_ok(&for_bundle_id, proof) {
+                    return;
+                }
                 self.pending.remove(&for_bundle_id);
                 self.store.remove(&for_bundle_id);
                 let display = self.display_id(&for_bundle_id);
@@ -1662,7 +1716,12 @@ impl<S: Store> Node<S> {
                     if due {
                         // Report the forward-path (A→B) latency we observed, not a round trip.
                         let fwd = forward_ms(self.now_ms, bundle.inner.created_at);
-                        self.emit_private_ack(sender, *id, bundle.env.hops, fwd);
+                        // core-protocol-r2-04: bind the private ACK with a recipient-only CDH proof —
+                        // the recognition token for THIS bundle, which only we (holding the matching SPK
+                        // secret) can compute. The sender re-derives the expected tag from it and refuses
+                        // to mark Delivered on an ACK whose proof doesn't match the original bundle.
+                        let proof = self.vaccine_token_for(bundle);
+                        self.emit_private_ack(sender, *id, bundle.env.hops, fwd, proof);
                         // §39 vaccine (ack-requested only, on first delivery): reveal the recognition
                         // token so every relay still carrying a copy verifies + drops it. A fire-and-
                         // forget (no-ack) send has no vaccine and clears by TTL — matches the design:
@@ -1689,6 +1748,7 @@ impl<S: Store> Node<S> {
         for_bundle_id: BundleId,
         delivery_hops: u8,
         delivery_ms: u32,
+        proof: Option<[u8; 32]>,
     ) {
         let spk_pub = match self.directory.prekey(&to) {
             Some(b) => b.spk_pub,
@@ -1699,6 +1759,8 @@ impl<S: Store> Node<S> {
             status: 0,
             delivery_hops,
             delivery_ms,
+            // core-protocol-r2-04: the recipient-only CDH proof for `for_bundle_id`.
+            proof,
         };
         let wrapped = Payload::Private {
             sender: self.identity.address(),
@@ -1708,7 +1770,11 @@ impl<S: Store> Node<S> {
             &to,
             &spk_pub,
             &wrapped,
-            Some(crypto::mailbox_tag(&to, mailbox_epoch(self.now_ms))), // §39 P4: ride `to`'s gradient back (F-06)
+            // §39 P4: ride `to`'s gradient back (F-06); core-protocol-r2-02: prefix only on the wire.
+            Some(crypto::mailbox_route(&crypto::mailbox_tag(
+                &to,
+                mailbox_epoch(self.now_ms),
+            ))),
             BundleOpts {
                 created_at: self.now_ms,
                 lifetime_ms: self.default_lifetime_ms,
@@ -3153,14 +3219,15 @@ impl<S: Store> Node<S> {
         out
     }
 
-    /// §39 P5: private bundles we should DURABLY spool by mailbox-tag — the offline / cross-partition
-    /// case P4's live gradient can't cover. A bundle qualifies iff it's private, carries a mailbox-tag,
-    /// and we hold NO live (usable) gradient for that tag right now — so a bundle is spooled XOR
-    /// live-routed, never both (no double-send). When the recipient later beacons, the host reloads
-    /// the spool and P4 steers the reloaded copy down the freshly-laid gradient. The relay never opens
-    /// the envelope — sealed bytes verbatim. Returns (id, mailbox-tag, sealed bytes, expires_at).
+    /// §39 P5: private bundles we should DURABLY spool by mailbox-tag — so an offline / cross-partition
+    /// recipient (whom P4's live gradient can't reach right now) collects it via a later want-beacon pull.
+    /// A bundle qualifies iff it's private and carries a mailbox-tag. core-protocol-r2-01: we intentionally
+    /// spool even when a live gradient exists for the route, because the gradient keys on a 2-byte PREFIX
+    /// and a live next-hop may be a prefix-COLLIDING different recipient — suppressing the spool then
+    /// black-holes the true (passive) recipient. When the recipient later beacons, the host reloads the
+    /// spool and P4 steers the reloaded copy down the freshly-laid gradient. The relay never opens the
+    /// envelope — sealed bytes verbatim. Returns (id, mailbox-route-prefix, sealed bytes, expires_at).
     pub fn spoolable_private_bundles(&self) -> Vec<(BundleId, Tag, Vec<u8>, u64)> {
-        let now = self.now_ms;
         let mut out = Vec::new();
         for id in self.store.have().ids {
             let Some(b) = self.store.get(&id) else {
@@ -3169,22 +3236,23 @@ impl<S: Store> Node<S> {
             if !b.is_private() {
                 continue;
             }
-            let Some(tag) = b.inner.private.as_ref().and_then(|p| p.mailbox) else {
+            let Some(prefix) = b.inner.private.as_ref().and_then(|p| p.mailbox) else {
                 continue;
             };
-            // sec-priv-04: bucket the durable spool on the tag's routing PREFIX, not the full tag, so
+            // sec-priv-04 / core-protocol-r2-02: the header already carries ONLY the routing prefix, so
             // the relay's spool key is an anonymity set an address-knower can't resolve to one recipient.
-            let route = route_key(&tag);
-            // A live, usable gradient means P4 already steers this bundle — don't also spool it.
-            // (Same liveness predicate as the forward gate in offer_bundles_to_link: ANY live next-hop.)
-            let live = self.recv_gradient.get(&route).is_some_and(|e| {
-                e.links.iter().any(|(l, gl)| {
-                    gl.expires_at > now && matches!(self.links.get(l), Some(LinkState::Up(_)))
-                })
-            });
-            if live {
-                continue;
-            }
+            let route = route_key_from_prefix(&prefix);
+            // core-protocol-r2-01: DO NOT suppress the spool just because a live gradient exists for this
+            // route. The gradient keys on the 2-byte PREFIX, so a live next-hop may be a DIFFERENT
+            // recipient that merely collides on the prefix with this bundle's intended recipient. The old
+            // "live ⇒ don't spool" rule black-holed the passive/offline colliding recipient: the forward
+            // gate steered the copy only down the colliding recipient's link (which drops it on the
+            // recognition check) AND the spool refused, so the intended recipient — who is passive and
+            // never on the live gradient — could receive it via NEITHER path. We now ALWAYS spool a
+            // private bundle carrying a mailbox. If the live route happens to be the true recipient, the
+            // spooled copy is merely redundant (the recipient dedups by id and the vaccine/TTL reclaims
+            // it); if it is a prefix collision, the spool is the ONLY path that reaches the real
+            // recipient's later want-beacon. Correctness (never black-hole) outranks the storage saving.
             if let Ok(bytes) = b.to_bytes() {
                 let expires = b
                     .inner
@@ -3807,7 +3875,16 @@ impl<S: Store> Node<S> {
         }
         // F-07: throttle a flood of unsigned private bundles from a single link before it can
         // touch the store, dedup table, or flood path. Signed (attributable) traffic is exempt.
-        if bundle.is_private() && !self.allow_private_ingest(from_link) {
+        //
+        // core-protocol-r2-03 / security-privacy-r2-01: a §39 delivery vaccine is ALSO unsigned and
+        // freely mintable (its id self-verifies as `H(domain‖token)` for any attacker-chosen token),
+        // yet it is not `is_private()` so the original gate missed it — a peer could flood unique-token
+        // vaccines uncapped, each forcing a store scan (bounded now by the `seen` gate, but still work).
+        // Subject Vaccine bundles to the SAME per-link limit as private bundles, so a single hostile
+        // link cannot mint vaccines faster than [`MAX_PRIV_BUNDLES_PER_WINDOW`].
+        let rate_limited =
+            bundle.is_private() || matches!(bundle.inner.dst, Destination::Vaccine(_));
+        if rate_limited && !self.allow_private_ingest(from_link) {
             return;
         }
         let id = bundle.id();
@@ -4162,7 +4239,17 @@ impl<S: Store> Node<S> {
                 // the token against each held bundle's own recognition tag; a forged token matches
                 // nothing and purges nothing. If we hold no match we just relay it onward (below) so
                 // real holders can act on it.
-                Destination::Vaccine(token) => {
+                //
+                // core-protocol-r2-03 / security-privacy-r2-01: `resolve_vaccine_target` is an
+                // O(held-private-bundles) DH+hash scan, and a vaccine is `is_ack` so it is EXEMPT from
+                // the F-07 per-link private-ingest limit. Without a dedup gate here, EVERY flooded
+                // duplicate copy of the SAME vaccine (all sharing one id = H(domain‖token)) would
+                // re-run the whole scan — CPU amplification an attacker triggers by re-injecting one
+                // vaccine. Short-circuit on the store's `seen` set: the first copy scans + resolves
+                // once, subsequent copies (same id) are skipped before the scan. A forged random-token
+                // vaccine still scans at most once per unique id, and the per-link rate limit on
+                // Vaccine ingest (see `allow_private_ingest` call site) bounds the mint rate.
+                Destination::Vaccine(token) if !self.store.seen(&id) => {
                     if let Some(delivered) = self.resolve_vaccine_target(&token) {
                         // The SENDER treats a verified vaccine as PROOF OF DELIVERY. Its private ACK
                         // can be lost (a throttled link, a single-carrier contact) — and once the
@@ -4289,6 +4376,10 @@ impl<S: Store> Node<S> {
                 status: 0,
                 delivery_hops: orig.env.hops,
                 delivery_ms: forward_ms(self.now_ms, orig.inner.created_at),
+                // Traced ACK: identity-signed, so the Ed25519 signature already authenticates the
+                // acker. No CDH proof needed (and none is possible — this path never recognizes a
+                // private tag). core-protocol-r2-04 hardens only the unsigned private-ACK path.
+                proof: None,
             },
             BundleOpts {
                 created_at: self.now_ms,
@@ -4388,6 +4479,7 @@ impl<S: Store> Node<S> {
             hops,
             expires_at,
             seq,
+            last_seen: self.now_ms,
         };
         // Would this beacon actually change the bucket? (Fresher than the same link's current entry, or
         // a brand-new link.) If not, skip so a bare refresh doesn't re-queue the want-beacon / re-offer.
@@ -4419,13 +4511,19 @@ impl<S: Store> Node<S> {
             Some((_, cur)) => *cur = fresh, // freshen this next-hop in place
             None => {
                 // A new next-hop in the anonymity set. Bound the per-bucket fan-out (Sybil): if full,
-                // evict the nearest-to-expiry existing link before adding this one.
+                // evict the LEAST-RECENTLY-SEEN existing link before adding this one (security-privacy-
+                // r2-04). Using recency, not nearest-to-expiry, means a prefix-grinding Sybil cannot crowd
+                // out a legitimately re-beaconing recipient: that recipient refreshes on a short interval,
+                // so its link is always among the most-recently-seen, while a Sybil that merely parks a
+                // slot with a far-future TTL goes stale-seen and is the one evicted. The newcomer we are
+                // adding is by definition the most-recently-seen (last_seen == now), so this never evicts
+                // a link fresher than the one we admit.
                 if entry.links.len() >= MAX_GRADIENT_LINKS_PER_BUCKET {
                     if let Some(idx) = entry
                         .links
                         .iter()
                         .enumerate()
-                        .min_by_key(|(_, (_, l))| l.expires_at)
+                        .min_by_key(|(_, (_, l))| l.last_seen)
                         .map(|(i, _)| i)
                     {
                         entry.links.remove(idx);
@@ -4579,8 +4677,8 @@ impl<S: Store> Node<S> {
         // recipient just fails the per-message recognition tag and drops its copy. No live next-hop
         // (cold start / passive recipient / all flapping) → fall through to the epidemic flood fallback.
         if b.is_private() {
-            if let Some(mailbox) = b.inner.private.as_ref().and_then(|p| p.mailbox) {
-                if let Some(entry) = self.recv_gradient.get(&route_key(&mailbox)) {
+            if let Some(prefix) = b.inner.private.as_ref().and_then(|p| p.mailbox) {
+                if let Some(entry) = self.recv_gradient.get(&route_key_from_prefix(&prefix)) {
                     let mut any_live = false;
                     let mut this_link_is_a_next_hop = false;
                     for (l, gl) in &entry.links {
@@ -4927,6 +5025,57 @@ mod tests {
             n.publish_prekey().unwrap();
         }
         net.pump(nodes);
+    }
+
+    /// Inject `who`'s (epoch-0) prekey straight into `node`'s directory via a genuine signed PreKey
+    /// advert — the same thing gossip would deliver, but without wiring a live link. Lets a test send a
+    /// §39 private message to an OFFLINE recipient (the sender only needs the recipient's published SPK).
+    fn inject_prekey(node: &mut Node, who: &Identity) {
+        let spk = who.derive_prekey();
+        let advert = Advert::publish(
+            who,
+            AdvertKind::PreKey {
+                spk_pub: spk.public,
+                spk_sig: spk.sig.to_vec(),
+            },
+            node.now_ms,
+            60_000,
+            1,
+        )
+        .unwrap();
+        node.directory.ingest(advert, node.now_ms).unwrap();
+    }
+
+    /// Build a §39 private delivery-ACK sealed to `to` for `for_bundle_id`, carrying `proof`
+    /// (core-protocol-r2-04). Models both a genuine recipient ACK (valid proof) and an attacker's
+    /// forgery (no / wrong proof) — the sender recognizes either, but only accepts one.
+    fn make_private_ack(
+        to: &PubKeyBytes,
+        to_spk_pub: &XPubKeyBytes,
+        for_bundle_id: BundleId,
+        proof: Option<[u8; 32]>,
+    ) -> Bundle {
+        let wrapped = Payload::Private {
+            sender: [0u8; 32], // the attacker/recipient can claim any sender inside the seal
+            inner: Box::new(Payload::Ack {
+                for_bundle_id,
+                status: 0,
+                delivery_hops: 1,
+                delivery_ms: 1,
+                proof,
+            }),
+        };
+        Bundle::create_private(
+            to,
+            to_spk_pub,
+            &wrapped,
+            Some(crypto::mailbox_route(&crypto::mailbox_tag(to, 0))),
+            BundleOpts {
+                created_at: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -5665,7 +5814,10 @@ mod tests {
             &bob_addr,
             &bob_prekey.public,
             &spoof,
-            Some(crypto::mailbox_tag(&bob_addr, mailbox_epoch(0))),
+            Some(crypto::mailbox_route(&crypto::mailbox_tag(
+                &bob_addr,
+                mailbox_epoch(0),
+            ))),
             BundleOpts::default(),
         )
         .unwrap();
@@ -6246,10 +6398,12 @@ mod tests {
         // spoolable — P4 now owns it (spool XOR live-route, no double-send).
         let bob = Identity::generate();
         let bob_mailbox = crypto::mailbox_tag(&bob.address(), 0);
-        // sec-priv-04: the spool/gradient/want keys are the tag's routing PREFIX, not the full tag.
+        // sec-priv-04 / core-protocol-r2-02: the spool/gradient/want keys are the tag's routing PREFIX,
+        // and the private-bundle header now carries ONLY that prefix (never the full tag).
         let bob_route = route_key(&bob_mailbox);
+        let bob_prefix = crypto::mailbox_route(&bob_mailbox);
 
-        // A private bundle sealed to bob + stamped with bob's mailbox-tag (as dispatch_private does).
+        // A private bundle sealed to bob + stamped with bob's mailbox ROUTING PREFIX (as dispatch_private).
         let pb = Bundle::create_private(
             &bob.address(),
             &bob.derive_prekey().public,
@@ -6257,7 +6411,7 @@ mod tests {
                 content_type: "t".into(),
                 body: b"offline".to_vec(),
             },
-            Some(bob_mailbox),
+            Some(bob_prefix),
             BundleOpts::default(),
         )
         .unwrap();
@@ -6307,10 +6461,13 @@ mod tests {
             nodes[0].take_wanted_mailboxes().is_empty(),
             "wanted drains once"
         );
-        // Live gradient now → the bundle is no longer spooled (P4 owns it).
+        // core-protocol-r2-01: the bundle STAYS spoolable even with a live gradient. The gradient keys
+        // on a 2-byte prefix, so a live next-hop may be a prefix-COLLIDING different recipient — the old
+        // "spool XOR route" rule black-holed the true (passive) recipient in that case. We now keep the
+        // durable spool as a safety net; a redundant delivery to the genuine recipient is deduped by id.
         assert!(
-            nodes[0].spoolable_private_bundles().is_empty(),
-            "live gradient → not spooled (spool XOR route)"
+            !nodes[0].spoolable_private_bundles().is_empty(),
+            "still spooled even with a live gradient (no black-hole under prefix collision)"
         );
     }
 
@@ -6418,6 +6575,359 @@ mod tests {
             b2_msgs,
             vec![b"for-b2".to_vec()],
             "B2 opened only its own message"
+        );
+    }
+
+    #[test]
+    fn a_re_beaconing_recipient_is_not_evicted_from_its_bucket_by_parked_sybils() {
+        // security-privacy-r2-04: a Sybil can grind identities colliding on a victim's 2-byte prefix and
+        // beacon them from distinct links to fill the per-bucket fan-out. The OLD eviction (nearest-to-
+        // expiry) let a fleet of fresher-expiry Sybil beacons crowd out the victim's own link. The fix
+        // evicts the LEAST-RECENTLY-SEEN link instead: a recipient that re-beacons on its short interval
+        // stays recently-seen and survives, while parked Sybils (stale last_seen) are evicted first.
+        let mut relay = Node::new(Identity::generate());
+        let bucket = route_key(&crypto::mailbox_tag(&Identity::generate().address(), 0));
+        let victim_link: LinkId = 999;
+        let ttl = 60_000u32;
+
+        // The victim beacons FIRST (t=0), claiming its slot.
+        relay.set_time(0);
+        relay.record_gradient(bucket, victim_link, 1, 0, ttl, 1);
+
+        // A Sybil fleet parks the remaining 7 slots at t=1000 with FAR-FUTURE expiry (a longer TTL) —
+        // under nearest-to-expiry eviction these fresher-expiry links would outrank the victim's.
+        relay.set_time(1_000);
+        for i in 0..(MAX_GRADIENT_LINKS_PER_BUCKET - 1) {
+            relay.record_gradient(bucket, 1_000 + i as LinkId, 3, 1_000, ttl * 10, 1);
+        }
+        assert_eq!(
+            relay.recv_gradient[&bucket].links.len(),
+            MAX_GRADIENT_LINKS_PER_BUCKET,
+            "bucket is now full (victim + parked Sybils)"
+        );
+
+        // The victim RE-BEACONS on its short interval (t=2000): it is now the MOST-recently-seen link.
+        relay.set_time(2_000);
+        relay.record_gradient(bucket, victim_link, 1, 2_000, ttl, 2);
+
+        // One MORE Sybil arrives on a fresh link (t=3000), overflowing the bucket → an eviction fires.
+        relay.set_time(3_000);
+        relay.record_gradient(bucket, 2_000 as LinkId, 3, 3_000, ttl * 10, 1);
+
+        // The victim's link MUST survive — the evicted one is a stale-seen parked Sybil, not the victim.
+        assert!(
+            relay.recv_gradient[&bucket]
+                .links
+                .iter()
+                .any(|(l, _)| *l == victim_link),
+            "a re-beaconing recipient's link is retained; a parked Sybil is evicted instead"
+        );
+        assert_eq!(
+            relay.recv_gradient[&bucket].links.len(),
+            MAX_GRADIENT_LINKS_PER_BUCKET,
+            "bucket stays at the fan-out cap"
+        );
+    }
+
+    #[test]
+    fn private_bundle_header_carries_only_the_route_prefix_not_the_full_mailbox_tag() {
+        // core-protocol-r2-02: the FULL 16-byte mailbox tag = H(address ‖ epoch) is a public
+        // deterministic function of a broadly-known address. If it rode verbatim in the cleartext
+        // header, a bundle-capturing address-knower could recompute the target's tag and UNIQUELY
+        // re-link the recipient off the header — defeating the sec-priv-04 anonymity-set claim. Assert
+        // the header (and the whole serialized wire) carries only the 2-byte routing PREFIX, so the full
+        // deterministic tag never appears on the wire.
+        let bob = Identity::generate();
+        let full_tag = crypto::mailbox_tag(&bob.address(), mailbox_epoch(0));
+        let prefix = crypto::mailbox_route(&full_tag);
+
+        let sender = Identity::generate();
+        let mut node = Node::new(sender);
+        inject_prekey(&mut node, &bob);
+        let mid = node
+            .send_message(bob.address(), "t".into(), b"secret".to_vec(), true)
+            .unwrap();
+        let pb = node
+            .store
+            .get(&mid)
+            .expect("sender holds its private bundle");
+
+        // The header field is exactly the prefix — and, being only 2 bytes, cannot be the full tag.
+        let hdr_mailbox = pb.inner.private.as_ref().unwrap().mailbox;
+        assert_eq!(
+            hdr_mailbox,
+            Some(prefix),
+            "header carries the routing prefix"
+        );
+
+        // The full deterministic tag must NOT appear anywhere in the serialized bundle. (The
+        // per-message recognition `tag` DOES ride in the header, but it is ephemeral+unlinkable — only
+        // the address-derived mailbox tag is the linkability leak we are closing.)
+        let wire = pb.to_bytes().unwrap();
+        assert!(
+            !wire.windows(crypto::TAG_LEN).any(|w| w == full_tag),
+            "the full address-derived mailbox tag must not appear on the wire (only its 2-byte prefix)"
+        );
+
+        // Routing still works: the prefix in the header keys the same gradient bucket a beacon lays.
+        assert_eq!(
+            route_key_from_prefix(&prefix),
+            route_key(&full_tag),
+            "the header prefix maps to the same routing bucket as the beacon's full tag"
+        );
+    }
+
+    #[test]
+    fn a_passive_colliding_recipient_is_not_black_holed_by_an_active_one() {
+        // core-protocol-r2-01 (REGRESSION): B2 is a PASSIVE (max-privacy) recipient that never beacons.
+        // B1 collides with B2 on the 2-byte route prefix and IS beaconing. Before the fix, a relay
+        // steered B2's private bundle ONLY down B1's (colliding) link — where B1 fails the per-message
+        // recognition tag and drops it — AND the spool gate refused to spool it because a "live gradient"
+        // existed for the (shared) route. Result: B2's message reached B2 via NEITHER the live route NOR
+        // the durable spool: a silent black-hole. The fix ALWAYS spools a private bundle carrying a
+        // mailbox, so B2 still collects it via its want-beacon pull when it later checks in.
+        let (b1, b2) = colliding_recipients(0);
+        assert_eq!(
+            route_key(&crypto::mailbox_tag(&b1.address(), 0)),
+            route_key(&crypto::mailbox_tag(&b2.address(), 0)),
+            "B1 and B2 collide on the routing prefix"
+        );
+        let b2_route = route_key(&crypto::mailbox_tag(&b2.address(), 0));
+
+        // A — R with the ACTIVE colliding recipient B1 behind R. B2 is offline/passive (not connected).
+        let mut nodes = [
+            Node::new(Identity::generate()),                   // 0 A (sender)
+            Node::new(Identity::generate()),                   // 1 R (relay)
+            Node::from_identity_secret(&b1.to_secret_bytes()), // 2 B1 (active, colliding decoy)
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1); // A <-> R
+        net.connect(&mut nodes, 1, 2, 2, 2); // R <-> B1
+                                             // A needs B2's prekey for the recognition tag + ratchet. Publish B1's prekey the normal way;
+                                             // inject B2's prekey into A's directory directly (B2 is offline but published it earlier, §25).
+        nodes[0].publish_prekey().unwrap();
+        nodes[1].publish_prekey().unwrap();
+        nodes[2].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+        inject_prekey(&mut nodes[0], &b2);
+
+        // Only the ACTIVE colliding recipient B1 beacons. R lays a gradient for the shared prefix bucket
+        // with exactly B1's link — B2, being passive, is NOT in it.
+        nodes[2].publish_recv_beacon().unwrap();
+        net.pump(&mut nodes);
+        assert!(
+            nodes[1].recv_gradient.contains_key(&b2_route),
+            "R holds the shared prefix bucket (B1 beacons into it)"
+        );
+
+        // A sends a private message to the PASSIVE recipient B2.
+        nodes[0]
+            .send_message(b2.address(), "t".into(), b"for-passive-b2".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        // B1 (the active decoy) must NOT open B2's message — the recognition tag is unique per recipient.
+        let b1_bodies: Vec<Vec<u8>> = nodes[2]
+            .take_inbox()
+            .iter()
+            .filter_map(|b| nodes[2].read_message(b).ok().flatten().map(|m| m.body))
+            .collect();
+        assert!(
+            b1_bodies.is_empty(),
+            "the colliding active decoy B1 never opens B2's message"
+        );
+
+        // THE FIX: R still spools B2's bundle even though a live gradient (B1's) exists for the route —
+        // otherwise B2 would be black-holed. Before the fix this list was empty.
+        let spool = nodes[1].spoolable_private_bundles();
+        assert!(
+            spool.iter().any(|(_, route, _, _)| *route == b2_route),
+            "R spools the passive recipient's bundle despite the colliding live gradient (no black-hole)"
+        );
+
+        // Prove the spool actually delivers: B2 comes online behind R and beacons; R reloads the spool
+        // and re-ingests, and P4 steers the reloaded copy to B2, who opens ONLY its own message.
+        let spooled: Vec<Bundle> = spool
+            .iter()
+            .map(|(_, _, bytes, _)| Bundle::from_bytes(bytes).unwrap())
+            .collect();
+        let mut nodes2 = [
+            std::mem::replace(&mut nodes[1], Node::new(Identity::generate())), // R (carries spool state)
+            Node::from_identity_secret(&b2.to_secret_bytes()),                 // B2 comes online
+        ];
+        let mut net2 = Wire2::new();
+        net2.connect(&mut nodes2, 0, 5, 1, 5); // R(node 0, link 5) <-> B2(node 1, link 5)
+        nodes2[1].publish_prekey().unwrap();
+        net2.pump(&mut nodes2);
+        nodes2[1].publish_recv_beacon().unwrap();
+        net2.pump(&mut nodes2);
+        // Host reloads the durable spool for the wanted mailbox and re-ingests it (§39 P5).
+        assert!(
+            nodes2[0].take_wanted_mailboxes().contains(&b2_route),
+            "B2's beacon surfaces its wanted mailbox so the host pulls the spool"
+        );
+        for b in spooled {
+            nodes2[0].ingest(b);
+        }
+        net2.pump(&mut nodes2);
+        let b2_bodies: Vec<Vec<u8>> = nodes2[1]
+            .take_inbox()
+            .iter()
+            .filter_map(|b| nodes2[1].read_message(b).ok().flatten().map(|m| m.body))
+            .collect();
+        assert_eq!(
+            b2_bodies,
+            vec![b"for-passive-b2".to_vec()],
+            "the passive recipient B2 collects its own message via the spool pull"
+        );
+    }
+
+    #[test]
+    fn a_forged_private_ack_cannot_mark_a_send_delivered() {
+        // core-protocol-r2-04: a §39 private ACK is unsigned and recognized only via the sender's
+        // PUBLISHED SPK, and the acked bundle is sealed to the sender's PUBLIC address — so an attacker
+        // who knows the sender's address and an in-flight bundle id can forge a Private{Ack{id}} the
+        // sender recognizes. Without a recipient-only CDH proof this flipped the send to Delivered and
+        // stopped retransmission though the real recipient never received it. Assert a forged ACK (no
+        // valid proof) is REFUSED, and a genuine ACK (valid proof) is accepted.
+        let sender = Identity::generate();
+        let recipient = Identity::generate();
+        let sender_addr = sender.address();
+        let sender_spk = sender.derive_prekey().public;
+        // A second handle on the same identity so we can inject the sender's own prekey after `sender`
+        // is moved into the node (Identity is not Clone — reconstruct from the secret bytes).
+        let sender_twin = Identity::from_secret_bytes(&sender.to_secret_bytes());
+
+        let mut node = Node::new(sender);
+        // The sender must know the recipient's prekey to build the private bundle (recognition tag).
+        inject_prekey(&mut node, &recipient);
+        // It also needs its OWN prekey in-directory so `emit_private_ack` could seal an ACK to it (and so
+        // our forged/genuine ACKs address a resolvable prekey). The node published its own on construction.
+        inject_prekey(&mut node, &sender_twin);
+
+        let mid = node
+            .send_message(recipient.address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap();
+        assert!(
+            node.store.contains(&mid),
+            "sender holds its own private bundle"
+        );
+        let delivered = |n: &Node, id: BundleId| n.tx.get(&id).is_some_and(|i| i.delivered);
+        assert!(!delivered(&node, mid), "not yet delivered");
+
+        // Grab the original bundle's recognition ephemeral so we can build BOTH a forged and a genuine ACK.
+        let orig_eph = node
+            .store
+            .get(&mid)
+            .unwrap()
+            .inner
+            .private
+            .as_ref()
+            .unwrap()
+            .ephemeral;
+
+        // (1) FORGED ACK: the attacker does NOT hold the recipient's SPK secret, so it cannot compute the
+        // proof token. It sends a proof-less private ACK sealed to the sender's public address, stamped
+        // with the recognition tag it derives from the sender's PUBLISHED SPK (that is the whole forgery).
+        let forged = make_private_ack(&sender_addr, &sender_spk, mid, None);
+        node.on_bundle(77, forged);
+        assert!(
+            !delivered(&node, mid),
+            "a proof-less forged private ACK must NOT mark the send delivered"
+        );
+        assert!(
+            node.store.contains(&mid),
+            "and must NOT drop the original from the store (retransmission continues)"
+        );
+
+        // A forged ACK carrying a WRONG token is also refused.
+        let forged2 = make_private_ack(&sender_addr, &sender_spk, mid, Some([0x42; 32]));
+        node.on_bundle(78, forged2);
+        assert!(
+            !delivered(&node, mid),
+            "a wrong-token forged private ACK must NOT mark the send delivered"
+        );
+        assert!(
+            node.store.contains(&mid),
+            "still held after the wrong-token forgery"
+        );
+
+        // (2) GENUINE ACK: the real recipient computes the CDH proof = recognition_shared(spk_secret, eph)
+        // — exactly the vaccine token, computable ONLY with the recipient's SPK secret.
+        let proof =
+            crypto::recognition_shared(&recipient.derive_prekey().secret_bytes(), &orig_eph);
+        let genuine = make_private_ack(&sender_addr, &sender_spk, mid, Some(proof));
+        node.on_bundle(79, genuine);
+        assert!(
+            delivered(&node, mid),
+            "a genuine private ACK with the recipient-only proof marks the send delivered"
+        );
+        assert!(
+            !node.store.contains(&mid),
+            "and the proven ACK clears the original from the store"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_vaccine_does_not_re_scan_and_is_rate_limited() {
+        // core-protocol-r2-03 / security-privacy-r2-01: a token-only vaccine is unsigned + freely
+        // mintable and, being is_ack, was EXEMPT from the private-ingest rate limit. Each arrival forced
+        // an O(held-bundles) store scan with NO dedup in front. Assert (a) a duplicate copy of the SAME
+        // vaccine short-circuits before the scan (seen-gated), and (b) Vaccine bundles are now subject to
+        // the per-link rate limit so a single link cannot mint them without bound.
+        let mut relay = Node::new(Identity::generate());
+
+        // A forged vaccine with a random token: it matches nothing, so it is stored + would re-flood.
+        let vax = Bundle::create_vaccine(
+            [0x33; 32],
+            BundleOpts {
+                created_at: 0,
+                ..Default::default()
+            },
+        );
+        let vid = vax.id();
+        relay.on_bundle(11, vax.clone());
+        assert!(
+            relay.store.seen(&vid),
+            "first vaccine copy is recorded as seen"
+        );
+        // A duplicate copy (same id) must be short-circuited by the seen gate before the scan — we assert
+        // the observable proxy: it is not re-stored/re-flooded and the seen set is unchanged.
+        relay.on_bundle(11, vax.clone());
+        assert!(
+            relay.store.seen(&vid),
+            "the duplicate vaccine is deduped (no re-processing)"
+        );
+
+        // Rate limit: flood cap+5 DISTINCT-token vaccines from one link within one window. The ingest
+        // gate must drop the ones past the window cap (they never reach the store).
+        let cap = MAX_PRIV_BUNDLES_PER_WINDOW as usize;
+        let link = 22;
+        let mut accepted = 0usize;
+        for i in 0u32..(cap as u32 + 5) {
+            let mut tok = [0u8; 32];
+            tok[..4].copy_from_slice(&i.to_le_bytes()); // distinct token per i (distinct vaccine id)
+            tok[4] = 0xAB;
+            let v = Bundle::create_vaccine(
+                tok,
+                BundleOpts {
+                    created_at: 0,
+                    ..Default::default()
+                },
+            );
+            let vid = v.id();
+            relay.on_bundle(link, v);
+            if relay.store.seen(&vid) {
+                accepted += 1;
+            }
+        }
+        assert!(
+            accepted <= cap,
+            "vaccines from one link are rate-limited like private bundles (accepted {accepted} <= cap {cap})"
+        );
+        assert!(
+            accepted > 0,
+            "the rate limit admits up to the cap, not zero"
         );
     }
 

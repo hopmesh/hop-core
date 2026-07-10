@@ -31,7 +31,15 @@ pub struct TraceHop {
 //     boundary. Bumping forces the mismatch to surface at `verify()` instead.
 //   * sec-priv-07: the delivery Vaccine no longer carries the plaintext delivered id; it floods only a
 //     blinded token. An old node can't act on the new anti-packet (different variant shape).
-pub const BUNDLE_VERSION: u8 = 3;
+// v4: core-protocol-r2-04 added a recipient-only CDH `proof` field to `Payload::Ack` (the private-ACK
+// forgery fix). `Ack` rides INSIDE the seal, so a reorder would be version-gated only if the version
+// also bumped — and this IS a struct-layout change (a trailing `Option` field), so a v3 decoder would
+// fail to parse a v4 Ack and vice-versa. The gate must reject a mixed v3/v4 fleet: a v3 sender's
+// unproven private ACK would otherwise be silently trusted by a v4 recipient, and a v4 proof would be
+// unparseable by a v3 sender. No v3-decode window is offered because the Ack layout genuinely differs
+// (accepting v3 bytes and decoding as v4 would misread the trailing bytes) — mixed-fleet rollout is an
+// infra/version-negotiation concern, not a safe in-core transcode.
+pub const BUNDLE_VERSION: u8 = 4;
 
 /// Globally-unique bundle id: `BLAKE3(src || nonce || payload_hash)`.
 pub type BundleId = [u8; 32];
@@ -169,6 +177,17 @@ pub enum Payload {
         /// otherwise measure from the ACK's arrival. Relies on rough clock agreement between
         /// devices (NTP-synced phones are close); `delivery_hops` is the clock-free measure.
         delivery_ms: u32,
+        /// **core-protocol-r2-04 recipient-only delivery proof.** On a §39 **private** ACK this is
+        /// `Some(token)` where `token = recognition_shared(recipient_spk_secret, original.ephemeral)` —
+        /// the SAME CDH value the delivery vaccine reveals, computable ONLY by the bundle's true
+        /// recipient (it needs the SPK secret). The sender, still holding the original private bundle,
+        /// verifies `recognition_tag_from_shared(token, for_bundle_id) == original.private.tag` before
+        /// flipping the send to Delivered. Without this, a private ACK was accepted on recognition
+        /// alone — but a private bundle is sealed to the sender's *public* address and its recognition
+        /// tag keys on the sender's *published* SPK public, so anyone who learned the sender's address
+        /// and guessed an in-flight `for_bundle_id` could forge a Delivered. `None` on the identity-
+        /// signed **traced** ACK path (there the Ed25519 signature already authenticates the acker).
+        proof: Option<[u8; 32]>,
     },
     /// Open a gateway-held streaming connection (SSE/WebSocket). See DESIGN.md §20.
     StreamOpen {
@@ -306,8 +325,17 @@ pub struct PrivateHeader {
     pub tag: Tag,
     /// The recognition ephemeral public (the recipient DHs it against its prekey).
     pub ephemeral: XPubKeyBytes,
-    /// Optional rotatable mailbox pseudonym, so a relay can spool by it for pull (§39).
-    pub mailbox: Option<Tag>,
+    /// core-protocol-r2-02: the recipient's mailbox **routing prefix** (`crypto::MailboxRoute`, the
+    /// leading [`crypto::MAILBOX_ROUTE_PREFIX_BYTES`] of `H(address ‖ epoch)`), so a relay can steer/
+    /// spool this bundle toward the recipient's want-beacon bucket. We carry ONLY the prefix, never the
+    /// full 16-byte tag. The full tag is a public deterministic function of a (broadly-known) address:
+    /// carrying it verbatim let a bundle-capturing address-knower recompute the target's tag and
+    /// uniquely re-link the recipient off the header — defeating the sec-priv-04 anonymity-set claim
+    /// (which only routing DECISIONS honored). With just the prefix on the wire, a capturer learns only
+    /// the same anonymity-set membership the routing layer already exposed: "some address colliding on
+    /// this prefix", never a unique confirmation. Routing is unaffected (every decision already keyed on
+    /// exactly this prefix); the final "is this mine?" is still the per-message-ephemeral `tag`.
+    pub mailbox: Option<crate::crypto::MailboxRoute>,
 }
 
 /// The signed portion of a bundle. For a **traced** bundle the source signature covers
@@ -446,7 +474,8 @@ impl Bundle {
         seal_to: &PubKeyBytes,
         recipient_spk_pub: &XPubKeyBytes,
         payload: &Payload,
-        mailbox: Option<Tag>,
+        // core-protocol-r2-02: the recipient's mailbox ROUTING PREFIX only, never the full tag.
+        mailbox: Option<crate::crypto::MailboxRoute>,
         opts: BundleOpts,
     ) -> Result<Self> {
         let plaintext = postcard::to_allocvec(payload)?;
@@ -891,6 +920,242 @@ mod tests {
             vacc.len(),
             1 + 32,
             "Vaccine carries only the 32-byte token (sec-priv-07: no plaintext delivered id)"
+        );
+    }
+
+    #[test]
+    fn payload_and_streamkind_discriminants_are_stable() {
+        // core-protocol-r2-05: `Payload` rides INSIDE the seal and postcard encodes it by variant
+        // INDEX. A reorder within the same BUNDLE_VERSION would silently misdecode sealed content across
+        // the fleet with no version-gate failure. Lock every variant's leading discriminant here (mirror
+        // of `destination_discriminants_are_stable`) so an accidental reorder fails CI loudly. To ADD a
+        // variant, append it at the END with the next index and extend this list — never reorder.
+        use crate::session::{Header, RatchetMessage};
+        let ratchet = RatchetMessage {
+            header: Header {
+                dh: [0u8; 32],
+                pn: 0,
+                n: 0,
+            },
+            ciphertext: Vec::new(),
+        };
+        // (expected discriminant, a constructed instance). Order MUST match the enum declaration.
+        let variants: Vec<(usize, Payload)> = vec![
+            (
+                0,
+                Payload::HttpRequest {
+                    host: String::new(),
+                    method: String::new(),
+                    url: String::new(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    max_resp_bytes: 0,
+                },
+            ),
+            (
+                1,
+                Payload::HttpResponse {
+                    status: 0,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    for_bundle_id: [0u8; 32],
+                },
+            ),
+            (
+                2,
+                Payload::HnsQuery {
+                    domain: String::new(),
+                },
+            ),
+            (
+                3,
+                Payload::HnsAnswer {
+                    domain: String::new(),
+                    proof: Vec::new(),
+                    for_query: [0u8; 32],
+                },
+            ),
+            (
+                4,
+                Payload::PeerMessage {
+                    content_type: String::new(),
+                    body: Vec::new(),
+                },
+            ),
+            (
+                5,
+                Payload::SessionInit {
+                    ek_pub: [0u8; 32],
+                    spk_pub: [0u8; 32],
+                    msg: ratchet.clone(),
+                },
+            ),
+            (
+                6,
+                Payload::SessionMessage {
+                    msg: ratchet.clone(),
+                },
+            ),
+            (
+                7,
+                Payload::Private {
+                    sender: [0u8; 32],
+                    inner: Box::new(Payload::PeerMessage {
+                        content_type: String::new(),
+                        body: Vec::new(),
+                    }),
+                },
+            ),
+            (
+                8,
+                Payload::Ack {
+                    for_bundle_id: [0u8; 32],
+                    status: 0,
+                    delivery_hops: 0,
+                    delivery_ms: 0,
+                    proof: None,
+                },
+            ),
+            (
+                9,
+                Payload::StreamOpen {
+                    stream_id: [0u8; 16],
+                    kind: StreamKind::Sse,
+                    method: String::new(),
+                    url: String::new(),
+                    headers: Vec::new(),
+                },
+            ),
+            (
+                10,
+                Payload::StreamData {
+                    stream_id: [0u8; 16],
+                    seq: 0,
+                    bytes: Vec::new(),
+                    fin: false,
+                },
+            ),
+            (
+                11,
+                Payload::StreamAck {
+                    stream_id: [0u8; 16],
+                    ack: 0,
+                },
+            ),
+            (
+                12,
+                Payload::StreamClose {
+                    stream_id: [0u8; 16],
+                    reason: 0,
+                },
+            ),
+            (
+                13,
+                Payload::ServiceRequest {
+                    service: String::new(),
+                    method: String::new(),
+                    args: Vec::new(),
+                },
+            ),
+            (
+                14,
+                Payload::ServiceResponse {
+                    for_bundle_id: [0u8; 32],
+                    status: 0,
+                    body: Vec::new(),
+                },
+            ),
+            (
+                15,
+                Payload::Carrier {
+                    stream_id: [0u8; 16],
+                    seq: 0,
+                    bytes: Vec::new(),
+                    fin: false,
+                },
+            ),
+            (
+                16,
+                Payload::HpsJoinRequest {
+                    path: String::new(),
+                    proof: [0u8; 32],
+                },
+            ),
+            (
+                17,
+                Payload::HpsKeys {
+                    path: String::new(),
+                    content_key: [0u8; 32],
+                    service_pubkey: None,
+                    epoch: 0,
+                },
+            ),
+            (
+                18,
+                Payload::HpsInvite {
+                    path: String::new(),
+                    kind: crate::hps::ServiceKind::Channel,
+                    proof: [0u8; 32],
+                },
+            ),
+            (
+                19,
+                Payload::HpsInviteAccept {
+                    path: String::new(),
+                    proof: [0u8; 32],
+                },
+            ),
+            (
+                20,
+                Payload::HpsLeave {
+                    path: String::new(),
+                    proof: [0u8; 32],
+                },
+            ),
+            (
+                21,
+                Payload::HpsRekey {
+                    old_path: String::new(),
+                    new_path: String::new(),
+                    epoch: 0,
+                    content_key: [0u8; 32],
+                    service_pubkey: None,
+                    proof: [0u8; 32],
+                },
+            ),
+            (
+                22,
+                Payload::HpsReachAck {
+                    topic_tag: [0u8; 16],
+                    epoch: 0,
+                },
+            ),
+            (
+                23,
+                Payload::HpsPublish {
+                    topic_tag: [0u8; 16],
+                    epoch: 0,
+                    nonce: Vec::new(),
+                    ciphertext: Vec::new(),
+                    sig: Vec::new(),
+                },
+            ),
+            (24, Payload::SessionReset),
+        ];
+        for (want, p) in &variants {
+            let enc = postcard::to_allocvec(p).unwrap();
+            assert_eq!(
+                enc[0] as usize, *want,
+                "Payload::{p:?} must keep discriminant {want} (append-only wire discipline)"
+            );
+        }
+        assert_eq!(variants.len(), 25, "all 25 Payload variants are pinned");
+
+        // StreamKind also rides inside sealed StreamOpen; pin it too.
+        assert_eq!(postcard::to_allocvec(&StreamKind::Sse).unwrap(), vec![0]);
+        assert_eq!(
+            postcard::to_allocvec(&StreamKind::WebSocket).unwrap(),
+            vec![1]
         );
     }
 }

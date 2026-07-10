@@ -434,15 +434,31 @@ pub fn mailbox_tag(address: &PubKeyBytes, epoch: u64) -> Tag {
 /// "some recipient whose tag shares this prefix is active", i.e. an **anonymity set** of every address
 /// (known or unknown) that collides on the prefix, not a unique match. The full tag still travels in
 /// the beacon (so `owns_mailbox` binding still authenticates the beacon against the publisher's signed
-/// address) and in the bundle header (so a just-in-window sender/recipient still agree on the exact
-/// tag), but no routing *decision* is ever made on more than this prefix.
+/// address), but core-protocol-r2-02: the **bundle header now carries ONLY this prefix, never the full
+/// tag** — so a bundle-capturing address-knower can no longer read the full deterministic tag off a
+/// flooded copy and uniquely re-link the recipient; a capturer learns only the same anonymity-set
+/// membership the routing layer exposes. No routing *decision* is ever made on more than this prefix.
 ///
-/// Two bytes (16 bits) is the deliberate balance: small enough that a real anonymity set forms even in
-/// a modest region (an address-knower confirming "the target is reachable here" faces a 1-in-2^16
-/// chance any other single address it tests also lands in the bucket, and across a fleet the buckets
-/// genuinely collide), yet wide enough that unrelated recipients rarely share a bucket, so the routing
-/// gradient/spool stays useful (bundles for a colliding recipient just also flow toward the bucket and
-/// are dropped there by the final recognition-tag check, which is per-message-ephemeral and unlinkable).
+/// Two bytes (16 bits) is the deliberate balance: wide enough that unrelated recipients rarely share a
+/// bucket (so the routing gradient/spool stays useful — a colliding recipient's bundle just also flows
+/// toward the bucket and is dropped there by the final per-message-ephemeral recognition-tag check),
+/// yet small enough that a real anonymity set forms **once the deployment is large relative to 2^16**.
+///
+/// **security-privacy-r2-03 — honest scope of the anonymity set.** The anonymity-set argument is a
+/// large-N argument: a target's prefix bucket holds ~N/2^16 addresses, which only exceeds 1 when N
+/// approaches or exceeds 2^16 (~65k) reachable addresses in the observed region. This prefix width is a
+/// COMPILE-TIME constant, NOT adaptive to observed N. So in any **sparse** deployment where N ≪ 2^16
+/// (the current fleet is single-digit devices; even a few hundred is far below 2^16), a target's bucket
+/// is almost always occupied by the target ALONE. Against an address-knower who computes the target's
+/// route and observes that bucket active in a region, the "anonymity set" is then effectively empty:
+/// seeing the bucket active is, with near-certainty, a per-address reachability disclosure ("this
+/// specific target is reachable here this epoch"). This is on top of the intrinsic §39 cost that being
+/// pull-reachable via a signed beacon already reveals reachability. Do NOT rely on the fixed 2-byte
+/// prefix for meaningful anonymity below ~2^16 reachable addresses; at that scale its only role is to
+/// keep routing buckets from being unique KEYS on the wire, not to hide the recipient from an
+/// address-knower. Widening `k` adaptively as N grows (so ~N/2^k stays ≥ a target set size) is the real
+/// fix and is tracked as future work; it is a wire-affecting change (the header carries this prefix, so
+/// its width is part of the format) and so is deliberately out of scope for this in-core hardening pass.
 pub const MAILBOX_ROUTE_PREFIX_BYTES: usize = 2;
 
 /// The routing/spool/want-beacon key for a mailbox-tag: its [`MAILBOX_ROUTE_PREFIX_BYTES`]-byte prefix
@@ -671,23 +687,30 @@ mod tests {
             "the route is the tag's leading prefix, nothing more"
         );
 
-        // With a 2-byte prefix there are only 2^16 buckets, so across enough random identities we WILL
-        // find a second address whose current mailbox-tag lands in bob's bucket — a real collision, the
-        // anonymity set. (A birthday search over a few thousand keys makes this overwhelmingly likely.)
-        let target = mailbox_route(&mailbox_tag(&bob.address(), 3));
+        // With a 2-byte prefix there are only 2^16 buckets, so distinct addresses genuinely collide onto
+        // one route — the anonymity set. A BIRTHDAY search finds SOME colliding pair with overwhelming
+        // probability in a few hundred keys (√2^16 ≈ 256), which is deterministically reliable (unlike
+        // waiting for a hit in one SPECIFIC pre-chosen bucket, ~1/65536 per try, which is flaky). We use
+        // a large bound purely as a can't-hang guard; a collision is found almost immediately.
+        let _ = &bob;
+        let mut seen: std::collections::HashMap<[u8; MAILBOX_ROUTE_PREFIX_BYTES], PubKeyBytes> =
+            std::collections::HashMap::new();
         let mut found_collision = false;
         for _ in 0..200_000 {
             let other = Identity::generate();
-            if mailbox_route(&mailbox_tag(&other.address(), 3)) == target
-                && other.address() != bob.address()
-            {
-                found_collision = true;
-                break;
+            let addr = other.address();
+            let route = mailbox_route(&mailbox_tag(&addr, 3));
+            if let Some(prev) = seen.get(&route) {
+                if *prev != addr {
+                    found_collision = true;
+                    break;
+                }
             }
+            seen.insert(route, addr);
         }
         assert!(
             found_collision,
-            "a different address must be able to share bob's route bucket (the anonymity set)"
+            "two distinct addresses must share a route bucket (the anonymity set)"
         );
     }
 }

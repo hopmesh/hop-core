@@ -131,7 +131,12 @@ impl Store for Box<dyn Store> {
 /// bundle, unauthenticated, so a flood of long-lived ids could pin the dedup set open for weeks.
 /// Mirrors hop-store-sqlite's clamp: retain at most a week; a duplicate past that is re-accepted
 /// (harmless: it re-floods and is re-deduped) but the map cannot be held open indefinitely.
-const MAX_SEEN_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+///
+/// Exported (stores-r2-03) so a durable backend (Firestore) can clamp the `expires_at` it writes and
+/// rehydrates with the SAME bound the in-memory clamp uses, instead of duplicating the constant and
+/// letting it drift. A hostile ~49-day `lifetime_ms` that survives a scale-to-zero must not reinstate
+/// a 49-day dedup window on cold start; it gets bounded to this exactly like a fresh `put()`.
+pub const MAX_SEEN_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Row cap on the in-memory `seen` dedup set (F-07). Past this we evict nearest-to-expiry ids so a
 /// bundle flood can't grow it without bound. Matches hop-store-sqlite's MAX_SEEN_ROWS.
@@ -167,6 +172,15 @@ impl MemoryStore {
         self.held.insert(id, bundle);
         self.enforce_seen_cap();
         true
+    }
+
+    /// The receiver-anchored dedup expiry (epoch-ms) recorded for `id` at `put`/`put_with_expiry`
+    /// time, if still tracked. A durable backend (stores-r2-01) reuses this as the authoritative
+    /// `expires_at` for any re-mirror of an already-held bundle (spray-and-wait split, retransmit
+    /// set_copies), instead of recomputing from the sender's advisory `created_at`, which can be
+    /// skewed-behind or 0 and would rewrite the durable TTL into the past.
+    pub fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
+        self.seen.get(id).copied()
     }
 
     /// Keep the `seen` set under [`MAX_SEEN_ROWS`] by evicting nearest-to-expiry ids (F-07). We drop
