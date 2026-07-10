@@ -422,6 +422,41 @@ pub fn mailbox_tag(address: &PubKeyBytes, epoch: u64) -> Tag {
     tag16("hop mailbox tag v2", &material)
 }
 
+/// How many leading bytes of a mailbox-tag routing decisions key on (sec-priv-04).
+///
+/// The full 16-byte mailbox-tag is a *public deterministic* function of a broadly-known address, so
+/// anyone who has ever learned a target's address can compute its full tag for every epoch and, if
+/// routing keyed on the full tag, uniquely confirm "this exact recipient's private traffic is here".
+/// Epoch rotation does nothing against such an address-knower (they just recompute the tag per epoch).
+///
+/// To break that unique linkage we route, spool, and match want-beacons on a short **prefix** of the
+/// tag instead of the whole thing. An address-knower observing a routing/spool bucket then only learns
+/// "some recipient whose tag shares this prefix is active", i.e. an **anonymity set** of every address
+/// (known or unknown) that collides on the prefix, not a unique match. The full tag still travels in
+/// the beacon (so `owns_mailbox` binding still authenticates the beacon against the publisher's signed
+/// address) and in the bundle header (so a just-in-window sender/recipient still agree on the exact
+/// tag), but no routing *decision* is ever made on more than this prefix.
+///
+/// Two bytes (16 bits) is the deliberate balance: small enough that a real anonymity set forms even in
+/// a modest region (an address-knower confirming "the target is reachable here" faces a 1-in-2^16
+/// chance any other single address it tests also lands in the bucket, and across a fleet the buckets
+/// genuinely collide), yet wide enough that unrelated recipients rarely share a bucket, so the routing
+/// gradient/spool stays useful (bundles for a colliding recipient just also flow toward the bucket and
+/// are dropped there by the final recognition-tag check, which is per-message-ephemeral and unlinkable).
+pub const MAILBOX_ROUTE_PREFIX_BYTES: usize = 2;
+
+/// The routing/spool/want-beacon key for a mailbox-tag: its [`MAILBOX_ROUTE_PREFIX_BYTES`]-byte prefix
+/// (sec-priv-04). All gradient, blind-spool, and want-beacon buckets key on this, never on the full
+/// tag, so an address-knower gets an anonymity set rather than a unique per-recipient confirmation.
+pub type MailboxRoute = [u8; MAILBOX_ROUTE_PREFIX_BYTES];
+
+/// Project a mailbox-tag onto its routing prefix (sec-priv-04). See [`MAILBOX_ROUTE_PREFIX_BYTES`].
+pub fn mailbox_route(tag: &Tag) -> MailboxRoute {
+    let mut r = [0u8; MAILBOX_ROUTE_PREFIX_BYTES];
+    r.copy_from_slice(&tag[..MAILBOX_ROUTE_PREFIX_BYTES]);
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +654,40 @@ mod tests {
         assert_ne!(
             mailbox_tag(&bob.address(), 0),
             mailbox_tag(&alice.address(), 0)
+        );
+    }
+
+    #[test]
+    fn mailbox_route_is_a_prefix_and_forms_an_anonymity_set() {
+        // sec-priv-04: routing keys on a short PREFIX of the mailbox-tag so an address-knower gets an
+        // anonymity set instead of a unique confirmation. Prove (1) the route is exactly the prefix,
+        // and (2) many distinct addresses genuinely collide onto the same route — i.e. an observer who
+        // computes a target's route and sees that bucket active cannot tell WHICH address it belongs to.
+        let bob = Identity::generate();
+        let tag = mailbox_tag(&bob.address(), 3);
+        assert_eq!(
+            mailbox_route(&tag),
+            tag[..MAILBOX_ROUTE_PREFIX_BYTES],
+            "the route is the tag's leading prefix, nothing more"
+        );
+
+        // With a 2-byte prefix there are only 2^16 buckets, so across enough random identities we WILL
+        // find a second address whose current mailbox-tag lands in bob's bucket — a real collision, the
+        // anonymity set. (A birthday search over a few thousand keys makes this overwhelmingly likely.)
+        let target = mailbox_route(&mailbox_tag(&bob.address(), 3));
+        let mut found_collision = false;
+        for _ in 0..200_000 {
+            let other = Identity::generate();
+            if mailbox_route(&mailbox_tag(&other.address(), 3)) == target
+                && other.address() != bob.address()
+            {
+                found_collision = true;
+                break;
+            }
+        }
+        assert!(
+            found_collision,
+            "a different address must be able to share bob's route bucket (the anonymity set)"
         );
     }
 }

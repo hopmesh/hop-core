@@ -23,7 +23,15 @@ pub struct TraceHop {
 // v2: §39 mailbox-tag derivation changed to H(address ‖ epoch) (F-06), a semantic wire change on the
 // private path. Bumped so a mixed old/new fleet fails loudly at the version gate rather than silently
 // mis-addressing private bundles. (Struct layouts are unchanged; the break is in tag semantics.)
-pub const BUNDLE_VERSION: u8 = 2;
+// v3: two coupled §39 semantic changes, both invisible in struct layout but breaking cross-version
+// interop, so the version gate must reject a mixed fleet:
+//   * sec-priv-04: routing/spool/want-beacon now key on the mailbox-tag's 2-byte PREFIX, not the full
+//     tag. An old node keys the gradient on the full tag, so it would never match a new node's
+//     prefix-bucketed spool/want — private delivery would silently degrade to flood-only across the
+//     boundary. Bumping forces the mismatch to surface at `verify()` instead.
+//   * sec-priv-07: the delivery Vaccine no longer carries the plaintext delivered id; it floods only a
+//     blinded token. An old node can't act on the new anti-packet (different variant shape).
+pub const BUNDLE_VERSION: u8 = 3;
 
 /// Globally-unique bundle id: `BLAKE3(src || nonce || payload_hash)`.
 pub type BundleId = [u8; 32];
@@ -45,11 +53,19 @@ pub enum Destination {
     /// Used by `hps://` publishes, which fan out to subscribers the publisher doesn't enumerate
     /// (DESIGN.md §32).
     Broadcast,
-    /// §39 delivery **vaccine**: floods `(delivered id, recognition token)`. A relay holding the
-    /// named bundle verifies `recognition_tag_from_shared(token, id)` against the tag it stores and
-    /// drops its copy (epidemic recovery on delivery). Carries NO src/dst/recipient — the token is
-    /// the recipient's revealed DH, which only it can produce and which doesn't identify it (CDH).
-    Vaccine(BundleId, [u8; 32]),
+    /// §39 delivery **vaccine** (sec-priv-07): floods ONLY the recipient's revealed recognition
+    /// **token** (the ephemeral·SPK DH `shared`) — deliberately NO plaintext delivered id. A node
+    /// holding the delivered bundle recovers the match itself: for each held private bundle it checks
+    /// `recognition_tag_from_shared(token, held_id) == held_tag` and drops the one that matches
+    /// (epidemic recovery on delivery). Omitting the id is the privacy win: a passive observer that
+    /// did NOT capture the specific flood can no longer read a bundle id off the anti-packet and learn
+    /// a delivery event, and even a global log sees only an opaque 32-byte token with no id to bind it
+    /// to. (The residual — an observer that DID capture the flood retains that bundle's own public
+    /// `(id, tag)` and can still confirm delivery via the public recognition function — is intrinsic
+    /// to any self-verifying epidemic anti-packet and is the documented §39 cost; see the module docs
+    /// and `vaccine_hides_delivered_id_from_non_capturing_observer`.) The token is CDH-safe: it reveals
+    /// nothing that identifies the recipient. Carries NO src/dst/recipient.
+    Vaccine([u8; 32]),
 }
 
 /// Per-bundle flags. Plain bools to avoid a bitflags dependency.
@@ -474,17 +490,19 @@ impl Bundle {
         self.inner.private.is_some()
     }
 
-    /// §39 delivery vaccine anti-packet: an anonymous, unsigned bundle that floods the delivered
-    /// bundle's id + the recipient's revealed recognition token. No src, no recipient, empty seal —
-    /// everything a relay needs rides in the cleartext `Vaccine` destination. Self-verifying by id.
-    pub fn create_vaccine(delivered: BundleId, token: [u8; 32], opts: BundleOpts) -> Self {
-        let id = compute_vaccine_id(&delivered, &token);
+    /// §39 delivery vaccine anti-packet (sec-priv-07): an anonymous, unsigned bundle that floods ONLY
+    /// the recipient's revealed recognition token — no plaintext delivered id. No src, no recipient,
+    /// empty seal. Self-verifying by id (`id = H(domain ‖ token)`), and since the token is effectively
+    /// unique per delivered bundle (a fresh ephemeral per message), all copies of one delivery's
+    /// vaccine still dedup to a single flood.
+    pub fn create_vaccine(token: [u8; 32], opts: BundleOpts) -> Self {
+        let id = compute_vaccine_id(&token);
         let inner = SignedInner {
             version: BUNDLE_VERSION,
             app: opts.app,
             id,
             src: [0u8; 32],
-            dst: Destination::Vaccine(delivered, token),
+            dst: Destination::Vaccine(token),
             private: None,
             created_at: opts.created_at,
             lifetime_ms: opts.lifetime_ms,
@@ -552,10 +570,11 @@ impl Bundle {
                 Err(Error::BadSignature)
             };
         }
-        // §39 vaccine: anonymous + unsigned. Self-verifying — its id binds its own (delivered, token),
-        // so a tampered anti-packet is rejected. The token is checked against the held tag at drop time.
-        if let Destination::Vaccine(delivered, token) = &self.inner.dst {
-            return if compute_vaccine_id(delivered, token) == self.inner.id {
+        // §39 vaccine (sec-priv-07): anonymous + unsigned. Self-verifying — its id binds its own token,
+        // so a tampered anti-packet is rejected. The token is matched against each held bundle's tag at
+        // drop time; no plaintext delivered id rides in the clear.
+        if let Destination::Vaccine(token) = &self.inner.dst {
+            return if compute_vaccine_id(token) == self.inner.id {
                 Ok(())
             } else {
                 Err(Error::BadSignature)
@@ -678,13 +697,14 @@ fn compute_private_id(sealed: &Sealed) -> BundleId {
     *hasher.finalize().as_bytes()
 }
 
-/// §39 vaccine id: `BLAKE3(domain ‖ delivered ‖ token)` — deterministic, so all vaccines for one
-/// delivery dedup to a single flood, and self-verifying (the id binds its own `(delivered, token)`,
-/// no signature needed — a tampered token yields a different id and is rejected by `verify()`).
-fn compute_vaccine_id(delivered: &BundleId, token: &[u8; 32]) -> BundleId {
+/// §39 vaccine id (sec-priv-07): `BLAKE3(domain ‖ token)` — deterministic, so all vaccines for one
+/// delivery dedup to a single flood (the token is unique per delivered bundle), and self-verifying
+/// (the id binds its own token, no signature needed — a tampered token yields a different id and is
+/// rejected by `verify()`). The `v2` domain shift also hard-forks the id off the old `(delivered,
+/// token)` layout so a stale-wire anti-packet can't be mistaken for a valid one.
+fn compute_vaccine_id(token: &[u8; 32]) -> BundleId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"hop vaccine id v1");
-    hasher.update(delivered);
+    hasher.update(b"hop vaccine id v2");
     hasher.update(token);
     *hasher.finalize().as_bytes()
 }
@@ -856,7 +876,7 @@ mod tests {
         let dev = postcard::to_allocvec(&Destination::Device([9u8; 32])).unwrap();
         let ack = postcard::to_allocvec(&Destination::AckTo([9u8; 32], [1u8; 32])).unwrap();
         let bcast = postcard::to_allocvec(&Destination::Broadcast).unwrap();
-        let vacc = postcard::to_allocvec(&Destination::Vaccine([9u8; 32], [1u8; 32])).unwrap();
+        let vacc = postcard::to_allocvec(&Destination::Vaccine([1u8; 32])).unwrap();
         assert_eq!(dev[0], 0, "Device must stay discriminant 0");
         assert_eq!(ack[0], 1, "AckTo must stay discriminant 1");
         assert_eq!(
@@ -869,8 +889,8 @@ mod tests {
         assert_eq!(vacc[0], 3, "Vaccine must stay discriminant 3");
         assert_eq!(
             vacc.len(),
-            1 + 32 + 32,
-            "Vaccine carries (delivered, token)"
+            1 + 32,
+            "Vaccine carries only the 32-byte token (sec-priv-07: no plaintext delivered id)"
         );
     }
 }
