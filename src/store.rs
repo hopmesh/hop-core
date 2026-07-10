@@ -48,6 +48,16 @@ pub trait Store {
     fn split_copies(&mut self, id: &BundleId) -> u16;
     /// Set the stored bundle's copy budget (e.g. a retransmit reset). No-op if absent.
     fn set_copies(&mut self, id: &BundleId, copies: u16);
+    /// The receiver-anchored dedup expiry (epoch-ms) recorded for `id` when it was stored, if still
+    /// tracked. stores-r2-01 anchors this to the RECEIVER's clock (clamped), so it is the
+    /// authoritative durable TTL for any re-mirror or handoff/spool of an already-held bundle —
+    /// instead of recomputing from the sender's advisory `created_at`, which can be 0 (the wire
+    /// default) or skewed-behind and would rewrite the durable `expireAt` into the past
+    /// (stores-r3-01). Default: `None` (a backend that doesn't track dedup expiry; caller falls
+    /// back to now+lifetime).
+    fn seen_expiry(&self, _id: &BundleId) -> Option<u64> {
+        None
+    }
 
     // --- key/value persistence (DESIGN.md §25) --------------------------------------------
     // A small durable key→bytes surface alongside bundles, for state that must survive a
@@ -105,6 +115,9 @@ impl Store for Box<dyn Store> {
     }
     fn set_copies(&mut self, id: &BundleId, copies: u16) {
         (**self).set_copies(id, copies)
+    }
+    fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
+        (**self).seen_expiry(id)
     }
     fn put_kv(&mut self, key: &str, value: Vec<u8>) {
         (**self).put_kv(key, value)
@@ -261,6 +274,12 @@ impl Store for MemoryStore {
         if let Some(b) = self.held.get_mut(id) {
             b.env.copies = copies;
         }
+    }
+
+    fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
+        // Delegate to the inherent method (stores-r2-01) so the trait exposes the same
+        // receiver-anchored deadline durable backends and the handoff/spool path rely on.
+        MemoryStore::seen_expiry(self, id)
     }
 
     fn put_kv(&mut self, key: &str, value: Vec<u8>) {

@@ -246,6 +246,12 @@ const MAX_PRIV_BUNDLES_PER_WINDOW: u32 = 256;
 /// beacons stop *hijack*, this stops *bloat*). On overflow the nearest-to-expiry entry is evicted.
 pub const MAX_RECV_GRADIENT: usize = 4_096;
 
+/// core-protocol-r3-02: cap on remembered vaccine tokens whose target hadn't arrived yet (see
+/// `seen_vaccine_tokens`). Bounds the memory a distinct-token vaccine flood can pin; on overflow the
+/// oldest token is dropped (its target, if it ever arrives, then just falls back to TTL reclamation
+/// (the pre-fix behavior), never a black-hole). Same order as the private-bundle store cap.
+pub const MAX_SEEN_VACCINE_TOKENS: usize = 4_096;
+
 /// TTL for an `hps://` discoverable-topic advert (7 days). Re-publish before it lapses so
 /// same-app peers keep seeing the topic (DESIGN.md §32).
 pub const HPS_TOPIC_TTL_MS: u32 = 604_800_000;
@@ -551,6 +557,15 @@ pub struct Node<S: Store = MemoryStore> {
     /// drop them on sight so a delivered message stops propagating (epidemic
     /// recovery, DESIGN.md §6). Pruned by age in [`Node::tick`].
     immune: HashMap<BundleId, u64>,
+    /// core-protocol-r3-02: delivery-vaccine tokens we saw BEFORE the target bundle they clear
+    /// arrived here (the vaccine's `resolve_vaccine_target` scan found no held match at the time).
+    /// Kept so that a later-arriving target private bundle is purged on FIRST STORE by the vaccine
+    /// that raced ahead of it, instead of lingering until its (clamped) TTL. A token is a recipient's
+    /// CDH value; a forged/foreign token matches no real bundle, so remembering it is harmless. Value
+    /// is the insert time (ms); pruned by age in [`Node::tick`] on the same 1h horizon as `immune`,
+    /// and capped at [`MAX_SEEN_VACCINE_TOKENS`] (oldest-evicted) so a distinct-token flood can't grow
+    /// it without bound.
+    seen_vaccine_tokens: HashMap<[u8; 32], u64>,
     /// Observability for the sim/debug wrapper: when `observe` is on, each bundle sent over a link
     /// is recorded as (link, bundle_id, is_final_delivery), drained via [`Node::drain_transfers`].
     /// Never enabled in production; zero cost when off.
@@ -811,6 +826,7 @@ impl<S: Store> Node<S> {
             sessions: HashMap::new(),
             session_touch: HashMap::new(),
             immune: HashMap::new(),
+            seen_vaccine_tokens: HashMap::new(),
             observe: false,
             transfers: Vec::new(),
             sends_delivered: Vec::new(),
@@ -1608,6 +1624,45 @@ impl<S: Store> Node<S> {
             }
         }
         None
+    }
+
+    /// core-protocol-r3-02: remember a delivery-vaccine token whose target we don't hold yet, so a
+    /// later-arriving target is purged on first store. Capped at [`MAX_SEEN_VACCINE_TOKENS`]
+    /// (oldest-evicted on overflow) and TTL-pruned in [`Node::tick`], so a distinct-token flood can
+    /// neither grow it without bound nor pin it forever. Storing a forged/foreign token is harmless: it
+    /// clears no real bundle, so `already_vaccinated_by_token` will never match it.
+    fn remember_vaccine_token(&mut self, token: [u8; 32]) {
+        if self.seen_vaccine_tokens.len() >= MAX_SEEN_VACCINE_TOKENS
+            && !self.seen_vaccine_tokens.contains_key(&token)
+        {
+            if let Some(oldest) = self
+                .seen_vaccine_tokens
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(k, _)| *k)
+            {
+                self.seen_vaccine_tokens.remove(&oldest);
+            }
+        }
+        self.seen_vaccine_tokens.insert(token, self.now_ms);
+    }
+
+    /// core-protocol-r3-02: true iff a remembered vaccine token (one that raced ahead of its target)
+    /// clears this private bundle (i.e. the bundle is already delivered and should be dropped on first
+    /// store instead of re-flooded to TTL. Only a real recipient's CDH token satisfies
+    /// `recognition_tag_from_shared(token, id) == tag`, so this can only fire for a genuinely-delivered
+    /// bundle (identical forgery-resistance to the live vaccine path).
+    fn already_vaccinated_by_token(&self, bundle: &Bundle) -> bool {
+        if self.seen_vaccine_tokens.is_empty() {
+            return false;
+        }
+        let Some(tag) = bundle.inner.private.as_ref().map(|p| p.tag) else {
+            return false;
+        };
+        let id = bundle.id();
+        self.seen_vaccine_tokens
+            .keys()
+            .any(|token| crypto::recognition_tag_from_shared(token, &id) == tag)
     }
 
     /// core-protocol-r2-04: verify a private delivery-ACK's recipient-only CDH proof against the ORIGINAL
@@ -3191,6 +3246,20 @@ impl<S: Store> Node<S> {
     /// these into the destination region's Firestore mailbox so an offline device
     /// collects them when it next checks in (or that region cold-starts). Returns the
     /// sealed wire bytes untouched — the relay never opens what it forwards.
+    /// stores-r3-01: the durable `expireAt` a relay must stamp when it hands off or spools a bundle
+    /// into another region's Firestore mailbox. Anchor it to the store's RECEIVER-clamped dedup
+    /// deadline (`seen_expiry`, from stores-r2-01) — the same clock the durable mirror uses — NOT to
+    /// the sender's advisory `created_at`. A hostile or non-node sender (or the wire/BundleOpts
+    /// default) can stamp `created_at = 0`, which would make `created_at + lifetime` land in ~1970,
+    /// so the TTL policy would sweep a still-live handed-off/spooled message and an offline recipient
+    /// would silently lose it. Fall back to `now + lifetime` only when the store doesn't track the
+    /// id (e.g. a backend without dedup-expiry), so every durable write is receiver-anchored.
+    fn durable_expiry(&self, id: &BundleId, b: &Bundle) -> u64 {
+        self.store
+            .seen_expiry(id)
+            .unwrap_or_else(|| self.now_ms.saturating_add(b.inner.lifetime_ms as u64))
+    }
+
     pub fn undeliverable_device_bundles(&self) -> Vec<(BundleId, PubKeyBytes, Vec<u8>, u64)> {
         let connected: HashSet<PubKeyBytes> = self.peers().into_iter().collect();
         let mut out = Vec::new();
@@ -3209,10 +3278,7 @@ impl<S: Store> Node<S> {
                 continue; // deliverable directly on this node — no handoff needed
             }
             if let Ok(bytes) = b.to_bytes() {
-                let expires = b
-                    .inner
-                    .created_at
-                    .saturating_add(b.inner.lifetime_ms as u64);
+                let expires = self.durable_expiry(&id, &b);
                 out.push((id, dst, bytes, expires));
             }
         }
@@ -3227,6 +3293,18 @@ impl<S: Store> Node<S> {
     /// black-holes the true (passive) recipient. When the recipient later beacons, the host reloads the
     /// spool and P4 steers the reloaded copy down the freshly-laid gradient. The relay never opens the
     /// envelope — sealed bytes verbatim. Returns (id, mailbox-route-prefix, sealed bytes, expires_at).
+    ///
+    /// core-protocol-r3-01: ACK spooling is INTENTIONAL, not a leak. A private delivery-ACK
+    /// (`emit_private_ack`) is itself a private bundle carrying a mailbox toward the ORIGINAL sender
+    /// (§39 P4 return path), so it qualifies here and is durably spooled just like forward content.
+    /// This is deliberate: the ACK makes the SAME dormant round-trip as the message, so an offline or
+    /// cross-partition sender collects its delivery confirmation via a later want-beacon pull instead
+    /// of stranding on "Sending…". It is also the ONLY safe choice: the relay never opens the seal, so
+    /// forward-content and ACK payloads are byte-indistinguishable to it, so trying to spool one but not
+    /// the other would require peeking inside the seal (defeating §39) or trusting an in-the-clear
+    /// type hint (a metadata leak). The extra storage is bounded by the same eviction cap + TTL as any
+    /// spooled bundle (and ACKs clamp to `MAX_ACK_LIFETIME_MS`), so this is a small, bounded
+    /// storage-efficiency cost that buys delivery-confirmation resilience, never a correctness defect.
     pub fn spoolable_private_bundles(&self) -> Vec<(BundleId, Tag, Vec<u8>, u64)> {
         let mut out = Vec::new();
         for id in self.store.have().ids {
@@ -3254,10 +3332,7 @@ impl<S: Store> Node<S> {
             // it); if it is a prefix collision, the spool is the ONLY path that reaches the real
             // recipient's later want-beacon. Correctness (never black-hole) outranks the storage saving.
             if let Ok(bytes) = b.to_bytes() {
-                let expires = b
-                    .inner
-                    .created_at
-                    .saturating_add(b.inner.lifetime_ms as u64);
+                let expires = self.durable_expiry(&id, &b);
                 out.push((id, route, bytes, expires));
             }
         }
@@ -3380,6 +3455,11 @@ impl<S: Store> Node<S> {
         self.relay_fwd.retain(|id, _| self.store.contains(id));
         // Expire vaccine immunity after a bundle could no longer be live (1h).
         self.immune
+            .retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
+        // core-protocol-r3-02: forget raced-ahead vaccine tokens on the same 1h horizon (a target
+        // that hasn't arrived within an hour is past any live window; if it arrives later it just
+        // falls back to TTL reclamation, never a black-hole).
+        self.seen_vaccine_tokens
             .retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
         // D6: GC forward-secret sessions idle past SESSION_MAX_IDLE_MS (memory + persisted store).
         self.gc_idle_sessions();
@@ -4272,6 +4352,12 @@ impl<S: Store> Node<S> {
                         self.store.remove(&delivered);
                         self.relay_order.retain(|x| *x != delivered);
                         self.immune.insert(delivered, self.now_ms);
+                    } else {
+                        // core-protocol-r3-02: we hold no bundle this vaccine clears YET. It may be
+                        // racing ahead of its target (a relay that saw the vaccine first). Remember the
+                        // token so that when the target private bundle is first stored (below), the
+                        // vaccine purges it immediately instead of it lingering to TTL. Bounded + TTL'd.
+                        self.remember_vaccine_token(token);
                     }
                 }
                 _ => {}
@@ -4280,6 +4366,17 @@ impl<S: Store> Node<S> {
             return; // already delivered elsewhere — don't re-store or re-flood it
         }
 
+        // core-protocol-r3-02: a delivery vaccine may have raced ahead of this private bundle and
+        // already passed through us (its `resolve_vaccine_target` scan found nothing to clear because
+        // the target (this bundle) hadn't arrived yet). If a remembered token clears THIS bundle,
+        // it is already delivered elsewhere: drop it now (mark immune so a re-flood is refused too)
+        // rather than storing + re-flooding it until its clamped TTL. `already_vaccinated_by_token`
+        // is O(seen-tokens) only for private bundles and only over the small, TTL'd token set, run
+        // once per unique bundle id at first store, not a hot path.
+        if bundle.is_private() && self.already_vaccinated_by_token(&bundle) {
+            self.immune.insert(id, self.now_ms);
+            return;
+        }
         // Not ours: store for onward relay, then offer to every other live link.
         let relay_src = bundle.inner.src;
         let relay_dst = match bundle.inner.dst {
@@ -4676,6 +4773,21 @@ impl<S: Store> Node<S> {
         // directed copy rides ALL of them and NO other link. A far end that isn't the intended
         // recipient just fails the per-message recognition tag and drops its copy. No live next-hop
         // (cold start / passive recipient / all flapping) → fall through to the epidemic flood fallback.
+        //
+        // security-privacy-r3-02 (documented scope): the bucket is a PREFIX anonymity set that may hold
+        // >1 recipient, so a live next-hop can be a prefix-COLLIDING DECOY (an ACTIVE recipient B1) while
+        // the TRUE recipient is a PASSIVE B2 that never beacons and so is in NO gradient. Suppressing the
+        // flood here steers B2's copy only down B1's link (dropped on the recognition check). Recovery is
+        // the durable want-beacon SPOOL (`spoolable_private_bundles` + `take_wanted_mailboxes` + `ingest`,
+        // all public `Node` APIs): when B2 later beacons, its carrier reloads the spool and P4 steers the
+        // reloaded copy to B2. Those core APIs are transport-agnostic, so a PURE-P2P carrier can run the
+        // same reload loop as `hop-relayd`, but a partition with NO node running that loop cannot recover
+        // a passive colliding recipient off-relay. We deliberately do NOT drop the P4 anti-flood guarantee
+        // (never flooding a private bundle to non-recipient leaf links, which the decoy-privacy test
+        // pins) to paper over that: the node cannot distinguish a passive RECIPIENT leaf from a passive
+        // DECOY leaf without opening the seal, so flooding "just in case" would leak the very traffic P4
+        // hides. The fix is a driver one (run the spool-reload loop on P2P carriers, not only relays); the
+        // relay-dependency of the black-hole recovery is called out in DESIGN.md §39.
         if b.is_private() {
             if let Some(prefix) = b.inner.private.as_ref().and_then(|p| p.mailbox) {
                 if let Some(entry) = self.recv_gradient.get(&route_key_from_prefix(&prefix)) {
@@ -4692,7 +4804,7 @@ impl<S: Store> Node<S> {
                         }
                     }
                     // If the bucket has ANY live next-hop but THIS link isn't one of them, skip it: the
-                    // directed copy rides only the anonymity-set's links, never the decoy's.
+                    // directed copy rides only the anonymity-set's links, never a leaf's.
                     if any_live && !this_link_is_a_next_hop {
                         return;
                     }
@@ -5114,6 +5226,88 @@ mod tests {
         // Re-ingesting the same bundle is a no-op (dedup), not a duplicate.
         relay.ingest(b);
         assert_eq!(relay.undeliverable_device_bundles().len(), 1);
+    }
+
+    #[test]
+    fn handoff_and_spool_expiry_are_receiver_anchored_not_sender_created_at() {
+        // stores-r3-01: a relay's durable handoff/spool `expireAt` must be anchored to the store's
+        // RECEIVER-clamped dedup deadline (seen_expiry, stores-r2-01), NOT recomputed from the
+        // sender's advisory created_at. The wire/BundleOpts default is created_at=0 (and a hostile
+        // or non-node sender can stamp it), so the OLD `created_at + lifetime` landed at ~1970 —
+        // a durable expireAt in the PAST, which the TTL policy sweeps, silently losing a still-live
+        // handed-off/spooled message to an offline recipient. Assert both paths now use now+lifetime.
+        let now_ms = 1_700_000_000_000u64; // a real 2023 wall clock, far past created_at=0
+        let lifetime_ms = 86_400_000u64; // 24h default
+
+        // --- handoff (device-addressed) ---
+        let mut relay = Node::new(Identity::generate());
+        relay.set_time(now_ms);
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let dev = Bundle::create(
+            &alice,
+            Destination::Device(bob.address()),
+            &bob.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"hi".to_vec(),
+            },
+            BundleOpts::default(), // created_at = 0 (the wire default a hostile sender can also set)
+        )
+        .unwrap();
+        assert_eq!(
+            dev.inner.created_at, 0,
+            "precondition: sender created_at is 0"
+        );
+        relay.ingest(dev);
+        let u = relay.undeliverable_device_bundles();
+        assert_eq!(u.len(), 1);
+        let handoff_expiry = u[0].3;
+        assert_eq!(
+            handoff_expiry,
+            now_ms + lifetime_ms,
+            "handoff expireAt is receiver-anchored (now+lifetime), not created_at(0)+lifetime"
+        );
+        assert!(
+            handoff_expiry > now_ms,
+            "the durable expiry is in the FUTURE, so the TTL sweep can't reap a live message"
+        );
+
+        // --- spool (private, mailbox-tagged) ---
+        let mut relay2 = Node::new(Identity::generate());
+        relay2.set_time(now_ms);
+        let recipient = Identity::generate();
+        let mailbox = crypto::mailbox_tag(&recipient.address(), 0);
+        let prefix = crypto::mailbox_route(&mailbox);
+        let pb = Bundle::create_private(
+            &recipient.address(),
+            &recipient.derive_prekey().public,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"secret".to_vec(),
+            },
+            Some(prefix),
+            BundleOpts::default(), // created_at = 0
+        )
+        .unwrap();
+        assert_eq!(
+            pb.inner.created_at, 0,
+            "precondition: private created_at is 0"
+        );
+        assert!(pb.is_private());
+        relay2.ingest(pb);
+        let s = relay2.spoolable_private_bundles();
+        assert_eq!(s.len(), 1, "the private mailbox bundle is spoolable");
+        let spool_expiry = s[0].3;
+        assert_eq!(
+            spool_expiry,
+            now_ms + lifetime_ms,
+            "spool expireAt is receiver-anchored (now+lifetime), not created_at(0)+lifetime"
+        );
+        assert!(
+            spool_expiry > now_ms,
+            "the durable spool expiry is in the FUTURE (not swept immediately)"
+        );
     }
 
     #[test]
@@ -6353,6 +6547,120 @@ mod tests {
     }
 
     #[test]
+    fn vaccine_arriving_before_its_target_purges_it_on_first_store() {
+        // core-protocol-r3-02: a delivery vaccine can race AHEAD of the target bundle it clears,
+        // reaching a relay before that relay ever sees the bundle. Before the fix, the vaccine's
+        // resolve scan found nothing (bundle not held), and the later-arriving target was stored +
+        // re-flooded, lingering until its clamped TTL. The fix remembers the raced-ahead token and
+        // purges the target on FIRST STORE. This proves it: deliver the vaccine, THEN the bundle, to
+        // a fresh relay that has never seen either. Revert-proof: without `remember_vaccine_token` +
+        // `already_vaccinated_by_token`, the relay stores + floods the bundle here.
+        let (mut nodes, mut net) = gradient_topology();
+
+        // Produce a real relayable private bundle to B (ack=false ⇒ B emits no vaccine, so R keeps a
+        // verbatim copy we can lift the bytes + ephemeral from).
+        let bob = nodes[2].address();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"racer".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+        let held = nodes[1].store.get(&id).expect("R relayed a copy");
+        let eph = held.inner.private.as_ref().unwrap().ephemeral;
+        let bytes = held.to_bytes().unwrap();
+        // The real recognition token only B can compute.
+        let token = crypto::recognition_shared(&nodes[2].prekey.secret_bytes(), &eph);
+
+        // A FRESH relay that has seen NEITHER the bundle nor the vaccine.
+        let mut fresh = Node::new(Identity::generate());
+        let vax = Bundle::create_vaccine(
+            token,
+            BundleOpts {
+                created_at: 0,
+                ..Default::default()
+            },
+        );
+        // 1) Vaccine arrives FIRST, resolves nothing (target not held), token remembered.
+        fresh.on_bundle(7, vax);
+        assert!(
+            !fresh.store.contains(&id),
+            "fresh relay holds nothing yet (only the token is remembered)"
+        );
+
+        // 2) The target bundle arrives SECOND.
+        let target = Bundle::from_bytes(&bytes).unwrap();
+        fresh.on_bundle(8, target);
+
+        // It must be purged on first store, not stored + re-flooded.
+        assert!(
+            !fresh.store.contains(&id),
+            "the raced-ahead vaccine purges the target on first store"
+        );
+        assert!(
+            fresh.immune.contains_key(&id),
+            "and marks it immune so a re-flood is refused too"
+        );
+    }
+
+    #[test]
+    fn forged_vaccine_token_does_not_purge_a_later_arriving_bundle() {
+        // core-protocol-r3-02 adversarial self-check: the remembered-token path must NOT let a forged
+        // token black-hole a legitimate bundle. A random token (an attacker who saw the flood knows
+        // the id but not B's CDH) is remembered, but when the real target arrives it must be stored +
+        // relayed normally, because the forged token clears no real bundle.
+        let (mut nodes, mut net) = gradient_topology();
+        let bob = nodes[2].address();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"legit".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+        let bytes = nodes[1].store.get(&id).unwrap().to_bytes().unwrap();
+
+        let mut fresh = Node::new(Identity::generate());
+        let forged = Bundle::create_vaccine(
+            [0x5A; 32],
+            BundleOpts {
+                created_at: 0,
+                ..Default::default()
+            },
+        );
+        fresh.on_bundle(7, forged); // remembered, but clears nothing real
+        let target = Bundle::from_bytes(&bytes).unwrap();
+        fresh.on_bundle(8, target);
+
+        assert!(
+            fresh.store.contains(&id),
+            "a forged raced-ahead token must NOT black-hole the real bundle; it is stored + relayed"
+        );
+        assert!(
+            !fresh.immune.contains_key(&id),
+            "and it is not falsely marked delivered"
+        );
+    }
+
+    #[test]
+    fn seen_vaccine_tokens_are_pruned_and_capped() {
+        // core-protocol-r3-02 DoS self-check: the remembered-token set is bounded (cap) and TTL'd, so
+        // a distinct-token vaccine flood can neither grow it without bound nor pin it forever.
+        let mut n = Node::new(Identity::generate());
+        n.tick(1);
+        for i in 0..(MAX_SEEN_VACCINE_TOKENS + 500) {
+            let mut tok = [0u8; 32];
+            tok[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            n.remember_vaccine_token(tok);
+        }
+        assert!(
+            n.seen_vaccine_tokens.len() <= MAX_SEEN_VACCINE_TOKENS,
+            "cap bounds the remembered-token set under a distinct-token flood"
+        );
+        // Past the 1h horizon everything is forgotten (falls back to pre-fix TTL reclamation).
+        n.tick(3_600_001);
+        assert!(
+            n.seen_vaccine_tokens.is_empty(),
+            "remembered tokens expire on the immune horizon"
+        );
+    }
+
+    #[test]
     fn gradient_expires_and_falls_back_to_flood_no_black_hole() {
         // Soft state: once B stops beaconing, its gradient entry expires (no permanent black-hole).
         // A subsequent private send then falls back to flood rather than dead-ending on a stale path.
@@ -6468,6 +6776,70 @@ mod tests {
         assert!(
             !nodes[0].spoolable_private_bundles().is_empty(),
             "still spooled even with a live gradient (no black-hole under prefix collision)"
+        );
+    }
+
+    #[test]
+    fn a_private_ack_is_spoolable_just_like_forward_content() {
+        // core-protocol-r3-01: an ACK is itself a private bundle carrying a mailbox toward the ORIGINAL
+        // sender (§39 P4 return path), so it is durably spooled exactly like forward content. This is
+        // intentional and is also the only safe choice: the relay never opens the seal, so an ACK and
+        // a message are byte-indistinguishable to it. This test pins BOTH halves: (a) a forward message
+        // still spools (no black-hole regression), and (b) an ACK spools too (return-path resilience).
+        let sender = Identity::generate();
+        let sender_prefix = crypto::mailbox_route(&crypto::mailbox_tag(&sender.address(), 0));
+
+        // (a) A forward message to the sender's mailbox: must be spoolable.
+        let fwd = Bundle::create_private(
+            &sender.address(),
+            &sender.derive_prekey().public,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"forward".to_vec(),
+            },
+            Some(sender_prefix),
+            BundleOpts::default(),
+        )
+        .unwrap();
+
+        // (b) An ACK shaped exactly as `emit_private_ack` builds it: a Private-wrapped Ack, addressed
+        // to the sender's mailbox (the return path).
+        let ack_inner = Payload::Private {
+            sender: Identity::generate().address(),
+            inner: Box::new(Payload::Ack {
+                for_bundle_id: fwd.id(),
+                status: 0,
+                delivery_hops: 1,
+                delivery_ms: 10,
+                proof: Some([0x11; 32]),
+            }),
+        };
+        let ack = Bundle::create_private(
+            &sender.address(),
+            &sender.derive_prekey().public,
+            &ack_inner,
+            Some(sender_prefix),
+            BundleOpts::default(),
+        )
+        .unwrap();
+
+        let mut relay = Node::new(Identity::generate());
+        relay.ingest(fwd.clone());
+        assert!(
+            relay
+                .spoolable_private_bundles()
+                .iter()
+                .any(|(bid, ..)| *bid == fwd.id()),
+            "a forward message with a mailbox is spoolable (no black-hole)"
+        );
+
+        relay.ingest(ack.clone());
+        assert!(
+            relay
+                .spoolable_private_bundles()
+                .iter()
+                .any(|(bid, ..)| *bid == ack.id()),
+            "an ACK is spoolable too; the return path survives the same dormant round-trip"
         );
     }
 
@@ -6779,6 +7151,82 @@ mod tests {
             b2_bodies,
             vec![b"for-passive-b2".to_vec()],
             "the passive recipient B2 collects its own message via the spool pull"
+        );
+    }
+
+    #[test]
+    fn a_plain_p2p_carrier_recovers_a_passive_colliding_recipient_off_relay() {
+        // security-privacy-r3-02: the collision black-hole recovery (spool + want-beacon reload) is
+        // TRANSPORT-AGNOSTIC: it lives on plain `Node`, not `hop-relayd`. This proves a pure-P2P
+        // carrier (a bare Node, no relay service) running the same reload loop delivers a passive
+        // colliding recipient B2. It isolates the r3-02 point: recovery needs a carrier RUNNING the
+        // loop, and any Node CAN run it. C is that non-relay carrier.
+        let (b1, b2) = colliding_recipients(0);
+        let b2_route = route_key(&crypto::mailbox_tag(&b2.address(), 0));
+
+        // A --- C(plain P2P carrier) --- B1(active colliding decoy). B2 offline/passive.
+        let mut nodes = [
+            Node::new(Identity::generate()),                   // 0 A sender
+            Node::new(Identity::generate()),                   // 1 C carrier (NOT a relay service)
+            Node::from_identity_secret(&b1.to_secret_bytes()), // 2 B1 active decoy
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        net.connect(&mut nodes, 1, 2, 2, 2);
+        nodes[0].publish_prekey().unwrap();
+        nodes[1].publish_prekey().unwrap();
+        nodes[2].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+        inject_prekey(&mut nodes[0], &b2);
+        nodes[2].publish_recv_beacon().unwrap(); // only the active decoy beacons
+        net.pump(&mut nodes);
+
+        nodes[0]
+            .send_message(b2.address(), "t".into(), b"p2p-passive".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        // The plain carrier C spooled B2's bundle despite B1's colliding live gradient.
+        let spool = nodes[1].spoolable_private_bundles();
+        let spooled: Vec<Bundle> = spool
+            .iter()
+            .filter(|(_, route, _, _)| *route == b2_route)
+            .map(|(_, _, bytes, _)| Bundle::from_bytes(bytes).unwrap())
+            .collect();
+        assert!(
+            !spooled.is_empty(),
+            "the plain P2P carrier holds B2's bundle in its spool (no relay involved)"
+        );
+
+        // B2 comes online behind the SAME plain carrier C and beacons; C surfaces the wanted mailbox
+        // and (running the reload loop itself) re-ingests the spool: no relay in the loop at any point.
+        let mut nodes2 = [
+            std::mem::replace(&mut nodes[1], Node::new(Identity::generate())),
+            Node::from_identity_secret(&b2.to_secret_bytes()),
+        ];
+        let mut net2 = Wire2::new();
+        net2.connect(&mut nodes2, 0, 5, 1, 5);
+        nodes2[1].publish_prekey().unwrap();
+        net2.pump(&mut nodes2);
+        nodes2[1].publish_recv_beacon().unwrap();
+        net2.pump(&mut nodes2);
+        assert!(
+            nodes2[0].take_wanted_mailboxes().contains(&b2_route),
+            "the plain carrier surfaces B2's wanted mailbox (the P2P pull trigger)"
+        );
+        for b in spooled {
+            nodes2[0].ingest(b);
+        }
+        net2.pump(&mut nodes2);
+        let bodies: Vec<Vec<u8>> = nodes2[1]
+            .take_inbox()
+            .iter()
+            .filter_map(|b| nodes2[1].read_message(b).ok().flatten().map(|m| m.body))
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![b"p2p-passive".to_vec()],
+            "a plain non-relay carrier recovers the passive colliding recipient off-relay"
         );
     }
 
