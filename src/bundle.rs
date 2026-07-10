@@ -856,12 +856,21 @@ mod tests {
         let dev = postcard::to_allocvec(&Destination::Device([9u8; 32])).unwrap();
         let ack = postcard::to_allocvec(&Destination::AckTo([9u8; 32], [1u8; 32])).unwrap();
         let bcast = postcard::to_allocvec(&Destination::Broadcast).unwrap();
+        let vacc = postcard::to_allocvec(&Destination::Vaccine([9u8; 32], [1u8; 32])).unwrap();
         assert_eq!(dev[0], 0, "Device must stay discriminant 0");
         assert_eq!(ack[0], 1, "AckTo must stay discriminant 1");
         assert_eq!(
             bcast,
             vec![2],
             "Broadcast must stay discriminant 2 (and carry no data)"
+        );
+        // core-04: pin the appended Vaccine variant too, so a future reorder can't silently
+        // shift its discriminant and break delivery-vaccine decode across the fleet.
+        assert_eq!(vacc[0], 3, "Vaccine must stay discriminant 3");
+        assert_eq!(
+            vacc.len(),
+            1 + 32 + 32,
+            "Vaccine carries (delivered, token)"
         );
     }
 }

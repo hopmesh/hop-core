@@ -47,6 +47,14 @@ const TOPIC_BEACON: &str = "_beacon";
 /// Default bound on the best-effort relay cache (number of adverts).
 pub const DEFAULT_RELAY_CACHE_CAP: usize = 256;
 
+/// Hop cap on a §39 receiver-beacon (core-02). A beacon lays the routing gradient for the few nodes
+/// near the recipient, but past this many hops it is neither re-gossiped nor stored, so a recipient's
+/// cleartext-carrying beacon does NOT flood the whole connected component every refresh, honoring the
+/// "propagates a few hops" claim above rather than laying the recipient's reachability network-wide.
+/// A node still records the gradient for a beacon it hears within this radius; it just stops carrying
+/// it onward. Beyond the cap, a private bundle falls back to blind-flood (the §39 privacy floor).
+pub const MAX_RECV_BEACON_HOPS: u8 = 3;
+
 /// Stable id of an advert: `BLAKE3(canonical body)`.
 pub type AdvertId = [u8; 32];
 
@@ -349,6 +357,17 @@ impl Directory {
         if advert.is_expired(now_ms) {
             return Ok(false);
         }
+        // core-02: cap how far a receiver-beacon travels. Within the cap it lays the local gradient
+        // and re-gossips one more hop; past the cap we record it as seen (so a later copy is deduped)
+        // but neither store nor re-gossip it, and signal "not accepted" so the node doesn't carry it
+        // onward. This stops the recipient's cleartext-carrying beacon flooding the whole component.
+        if matches!(advert.body.kind, AdvertKind::RecvBeacon { .. })
+            && advert.hops > MAX_RECV_BEACON_HOPS
+        {
+            self.seen.insert(advert.id);
+            return Ok(false);
+        }
+
         if !self.seen.insert(advert.id) {
             // Already seen — but a copy that travelled fewer hops means we found a
             // shorter path (e.g. a direct link after first hearing it via a relay).
@@ -662,6 +681,46 @@ mod tests {
         .unwrap();
         dir.ingest(tomb, 11).unwrap();
         assert!(dir.browse("market", None).is_empty()); // sold → gone
+    }
+
+    #[test]
+    fn recv_beacon_past_hop_cap_is_not_regossiped() {
+        // core-02: a receiver-beacon lays the gradient within a few hops but must stop being
+        // re-gossiped/stored past the cap, so a recipient's cleartext-carrying beacon does not
+        // flood the whole connected component.
+        let recipient = Identity::generate();
+        let mut beacon = Advert::publish(
+            &recipient,
+            AdvertKind::RecvBeacon {
+                mailbox: crypto::mailbox_tag(&recipient.address(), 7),
+            },
+            0,
+            90_000,
+            1,
+        )
+        .unwrap();
+
+        // Within the cap: accepted (worth re-gossiping) and carried.
+        beacon.hops = MAX_RECV_BEACON_HOPS;
+        let mut near = Directory::new();
+        assert!(
+            near.ingest(beacon.clone(), 1).unwrap(),
+            "a beacon within the cap is accepted + re-gossiped"
+        );
+
+        // Past the cap: recorded as seen for dedup, but NOT accepted (not re-gossiped/stored).
+        let mut far = Directory::new();
+        beacon.hops = MAX_RECV_BEACON_HOPS + 1;
+        assert!(
+            !far.ingest(beacon.clone(), 1).unwrap(),
+            "a beacon past the cap is not re-gossiped"
+        );
+        assert!(
+            far.seen(&beacon.id),
+            "still deduped so a later copy is dropped"
+        );
+        // Nothing was stored for onward gossip.
+        assert!(far.gossip_offer(&HashSet::new()).is_empty());
     }
 
     fn listing(seller: &Identity, title: &str, seq: u64) -> Advert {

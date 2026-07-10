@@ -107,12 +107,33 @@ impl Identity {
     }
 
     /// Derive a **deterministic** signed prekey from the identity seed, so the same
-    /// prekey is reconstructed every launch with no persistence. This matters for
-    /// correctness: a peer may cache your prekey advert (long TTL) across your
-    /// restart, and must still be able to open a session — which only works if the
-    /// secret is stable. (Rotation, when added, will key off an epoch input.)
+    /// prekey is reconstructed every launch with no persistence. Epoch 0 is the base
+    /// (non-rotating) prekey; [`Identity::derive_prekey_epoch`] rotates it per epoch.
+    /// Determinism matters for correctness: a peer may cache your prekey advert (long
+    /// TTL) across your restart, and must still be able to open a session, which only
+    /// works if the secret for that epoch is stably re-derivable.
     pub fn derive_prekey(&self) -> SignedPreKey {
-        let mut s = blake3::derive_key("hop prekey v1", &self.signing.to_bytes());
+        self.derive_prekey_epoch(0)
+    }
+
+    /// Derive the deterministic signed prekey for a given `epoch` (core-03). Keying the SPK on an
+    /// epoch is what bounds compromise: a leaked SPK secret only exposes the X3DH first-message
+    /// roots (and recognition tags) of sessions bootstrapped **in that epoch**, not for the life of
+    /// the identity. The owner publishes the current epoch's prekey and retains a bounded window of
+    /// past epochs' secrets so a message minted against a just-rotated prekey still resolves. Because
+    /// this is a pure function of (seed, epoch), any past epoch's secret is re-derivable after a
+    /// restart with no persistence: the same property `derive_prekey` relies on.
+    pub fn derive_prekey_epoch(&self, epoch: u64) -> SignedPreKey {
+        // Domain-separate per epoch so each epoch's secret is independent. Epoch 0 reproduces the
+        // original "hop prekey v1" context byte-for-byte, so pre-rotation adverts/sessions are
+        // unaffected (the base prekey is unchanged).
+        let mut s = if epoch == 0 {
+            blake3::derive_key("hop prekey v1", &self.signing.to_bytes())
+        } else {
+            let mut ikm = self.signing.to_bytes().to_vec();
+            ikm.extend_from_slice(&epoch.to_le_bytes());
+            blake3::derive_key("hop prekey epoch v1", &ikm)
+        };
         s[0] &= 248; // clamp to a valid X25519 scalar
         s[31] &= 127;
         s[31] |= 64;
@@ -427,6 +448,28 @@ mod tests {
             from_secret, from_edwards,
             "derived X25519 key must match address"
         );
+    }
+
+    #[test]
+    fn prekey_epochs_are_deterministic_and_distinct() {
+        // core-03: each epoch's prekey must be re-derivable (deterministic, so a restart resolves a
+        // cached advert) yet independent across epochs (so a leaked secret is bounded to its window).
+        let id = Identity::generate();
+        assert_eq!(
+            id.derive_prekey_epoch(5).public,
+            id.derive_prekey_epoch(5).public,
+            "same epoch re-derives the same prekey"
+        );
+        assert_ne!(
+            id.derive_prekey_epoch(5).public,
+            id.derive_prekey_epoch(6).public,
+            "different epochs derive independent prekeys"
+        );
+        // Epoch 0 reproduces the original base prekey byte-for-byte (no regression for pre-rotation).
+        assert_eq!(id.derive_prekey().public, id.derive_prekey_epoch(0).public);
+        // Each epoch's SPK is self-verifying under the identity.
+        let pk = id.derive_prekey_epoch(9);
+        assert!(verify(&id.address(), &pk.public, &pk.sig));
     }
 
     #[test]

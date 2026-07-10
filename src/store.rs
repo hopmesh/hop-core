@@ -118,7 +118,24 @@ impl Store for Box<dyn Store> {
     fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
         (**self).list_kv(prefix)
     }
+    fn flush(&self, timeout: std::time::Duration) -> bool {
+        // Must forward: without this the trait default (`true`) wins by method resolution and a
+        // boxed FirestoreStore's SIGTERM drain is a silent no-op (F-21 regression). Any method that
+        // gains a non-default body on a backend has to be forwarded here too.
+        (**self).flush(timeout)
+    }
 }
+
+/// Hard cap on how long a `seen` dedup entry is retained, regardless of a bundle's claimed
+/// `lifetime_ms` (F-07). `lifetime_ms` is a `u32` (~49 days) and, for an unsigned §39 private
+/// bundle, unauthenticated, so a flood of long-lived ids could pin the dedup set open for weeks.
+/// Mirrors hop-store-sqlite's clamp: retain at most a week; a duplicate past that is re-accepted
+/// (harmless: it re-floods and is re-deduped) but the map cannot be held open indefinitely.
+const MAX_SEEN_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Row cap on the in-memory `seen` dedup set (F-07). Past this we evict nearest-to-expiry ids so a
+/// bundle flood can't grow it without bound. Matches hop-store-sqlite's MAX_SEEN_ROWS.
+const MAX_SEEN_ROWS: usize = 200_000;
 
 /// Simple in-memory store for tests and the simulator.
 #[derive(Default, Clone)]
@@ -135,6 +152,40 @@ impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Rehydrate a held bundle with an EXPLICIT absolute dedup expiry (epoch-ms), rather than
+    /// re-deriving it from `now + lifetime` (stores-02). A durable backend (Firestore) stores each
+    /// bundle's real deadline; on cold start it must be reinstated as-is, or a `put(_, 0)` would
+    /// anchor the seen window at epoch 0 and the first real-clock prune would wipe every rehydrated
+    /// bundle. A duplicate id keeps its existing (earlier) expiry. Returns false if already seen.
+    pub fn put_with_expiry(&mut self, bundle: Bundle, expiry_ms: u64) -> bool {
+        let id = bundle.id();
+        if self.seen.contains_key(&id) {
+            return false;
+        }
+        self.seen.insert(id, expiry_ms);
+        self.held.insert(id, bundle);
+        self.enforce_seen_cap();
+        true
+    }
+
+    /// Keep the `seen` set under [`MAX_SEEN_ROWS`] by evicting nearest-to-expiry ids (F-07). We drop
+    /// any held bundle for an evicted id too, so an evicted id never orphans a held bundle from
+    /// lifetime prune (prune walks `seen`). Only runs the sort/scan when actually over the cap.
+    fn enforce_seen_cap(&mut self) {
+        if self.seen.len() <= MAX_SEEN_ROWS {
+            return;
+        }
+        let mut by_expiry: Vec<(u64, BundleId)> =
+            self.seen.iter().map(|(id, &exp)| (exp, *id)).collect();
+        let excess = self.seen.len() - MAX_SEEN_ROWS;
+        // Partial-sort the `excess` nearest-to-expiry to the front, then evict them.
+        by_expiry.select_nth_unstable(excess.saturating_sub(1));
+        for (_, id) in by_expiry.into_iter().take(excess) {
+            self.seen.remove(&id);
+            self.held.remove(&id);
+        }
+    }
 }
 
 impl Store for MemoryStore {
@@ -143,9 +194,13 @@ impl Store for MemoryStore {
         if self.seen.contains_key(&id) {
             return false; // dedup: already seen within its window
         }
-        let expiry = now_ms.saturating_add(bundle.inner.lifetime_ms as u64);
+        // Clamp the retained dedup window so an attacker-set (and, for private bundles,
+        // unauthenticated) lifetime_ms can't pin a `seen` entry open for weeks (F-07).
+        let lifetime = (bundle.inner.lifetime_ms as u64).min(MAX_SEEN_LIFETIME_MS);
+        let expiry = now_ms.saturating_add(lifetime);
         self.seen.insert(id, expiry);
         self.held.insert(id, bundle);
+        self.enforce_seen_cap();
         true
     }
 
@@ -264,5 +319,123 @@ mod tests {
         // A copy arriving after the window is treated as new (but by now relays
         // would have dropped the expired bundle too).
         assert!(store.put(b, 2_000));
+    }
+
+    #[test]
+    fn seen_lifetime_is_clamped_against_a_hostile_lifetime_ms() {
+        // F-07 (stores-08): a bundle claiming a ~49-day lifetime must not pin its `seen` entry open
+        // that long; the retained window is clamped to MAX_SEEN_LIFETIME_MS (one week), matching
+        // hop-store-sqlite.
+        let b = bundle(u32::MAX); // hostile: ~49 days
+        let mut store = MemoryStore::new();
+        assert!(store.put(b.clone(), 0));
+        store.prune(MAX_SEEN_LIFETIME_MS + 1);
+        assert!(
+            !store.seen(&b.id()),
+            "seen entry must be clamped to the max window, not the claimed lifetime"
+        );
+    }
+
+    #[test]
+    fn seen_set_is_capped_and_never_orphans_held_bundles() {
+        // F-07 (stores-08): the in-memory dedup set is bounded; over the cap we evict the
+        // nearest-to-expiry ids AND their held bundles (so an evicted id can't orphan a held bundle
+        // from lifetime prune). We drive this with a tiny local override of the cap semantics by
+        // inserting synthetic seen rows directly.
+        let mut store = MemoryStore::new();
+        // Fill exactly to the cap with far-future expiries (held mirrors seen for these ids).
+        // Use synthetic ids so we don't have to mint 200k real bundles.
+        for i in 0..MAX_SEEN_ROWS {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            store.seen.insert(id, 1_000_000_000);
+        }
+        assert_eq!(store.seen.len(), MAX_SEEN_ROWS);
+        // A real put past the cap with a near expiry: the cap evicts the nearest-to-expiry id.
+        let near = bundle(1_000); // expiry now+1000 = the nearest, evicted immediately
+        assert!(store.put(near.clone(), 0));
+        assert!(
+            store.seen.len() <= MAX_SEEN_ROWS,
+            "seen set stays bounded under flood"
+        );
+        // The just-inserted near-expiry bundle was the eviction target, so both its seen and held
+        // rows are gone together (no orphan).
+        assert!(!store.contains(&near.id()));
+        assert!(!store.seen(&near.id()));
+    }
+
+    #[test]
+    fn put_with_expiry_survives_a_real_clock_prune() {
+        // stores-02: a rehydrated bundle stamped with its real absolute deadline must NOT be wiped
+        // by the first real-clock prune. Contrast: put(_, 0) would anchor expiry at ~lifetime and a
+        // prune at epoch-now would delete it.
+        let b = bundle(3_600_000);
+        let real_deadline = 1_700_000_000_000; // ~2023, an absolute epoch-ms deadline
+        let mut store = MemoryStore::new();
+        assert!(store.put_with_expiry(b.clone(), real_deadline));
+        // Prune at a realistic "now" earlier than the deadline: bundle survives.
+        store.prune(1_699_000_000_000);
+        assert!(
+            store.contains(&b.id()),
+            "rehydrated bundle survives real-clock prune"
+        );
+        assert!(store.seen(&b.id()));
+        // Past the deadline it is finally reaped.
+        store.prune(real_deadline + 1);
+        assert!(!store.contains(&b.id()));
+    }
+
+    #[test]
+    fn boxed_store_forwards_flush() {
+        // stores-01: a Box<dyn Store> must forward flush() rather than falling back to the trait
+        // default, or a durable backend's SIGTERM drain silently no-ops. We assert forwarding
+        // reaches the concrete impl via a flush-counting store.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct CountingStore {
+            flushes: Arc<AtomicUsize>,
+        }
+        impl Store for CountingStore {
+            fn put(&mut self, _b: Bundle, _n: u64) -> bool {
+                false
+            }
+            fn get(&self, _id: &BundleId) -> Option<Bundle> {
+                None
+            }
+            fn remove(&mut self, _id: &BundleId) -> Option<Bundle> {
+                None
+            }
+            fn seen(&self, _id: &BundleId) -> bool {
+                false
+            }
+            fn contains(&self, _id: &BundleId) -> bool {
+                false
+            }
+            fn have(&self) -> HaveSet {
+                HaveSet::default()
+            }
+            fn prune(&mut self, _n: u64) {}
+            fn split_copies(&mut self, _id: &BundleId) -> u16 {
+                0
+            }
+            fn set_copies(&mut self, _id: &BundleId, _c: u16) {}
+            fn flush(&self, _timeout: std::time::Duration) -> bool {
+                self.flushes.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }
+
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let boxed: Box<dyn Store> = Box::new(CountingStore {
+            flushes: flushes.clone(),
+        });
+        assert!(boxed.flush(std::time::Duration::from_secs(1)));
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "Box<dyn Store>::flush must forward to the concrete impl"
+        );
     }
 }

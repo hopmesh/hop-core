@@ -193,6 +193,28 @@ fn mailbox_epoch(now_ms: u64) -> u64 {
     now_ms / MAILBOX_EPOCH_MS
 }
 
+/// Signed-prekey rotation period (core-03). The published SPK rotates each epoch so a compromised
+/// prekey secret only exposes the X3DH first-message roots (and recognition tags) of sessions
+/// bootstrapped in that window, not for the identity's whole life. One week balances that bound
+/// against churn: peers cache the prekey advert, so rotating too fast would strand cached openers.
+const PREKEY_EPOCH_MS: u64 = 7 * 86_400_000;
+
+/// How many PAST prekey epochs' secrets we retain (core-03). A session first-message minted against
+/// the prior epoch's SPK (in flight across our rotation, or from a peer holding a slightly stale
+/// advert) must still resolve, so we keep this many previous epochs' secrets before wiping them.
+const PREKEY_EPOCH_WINDOW: u64 = 1;
+
+/// The current prekey epoch for a clock reading.
+fn prekey_epoch(now_ms: u64) -> u64 {
+    now_ms / PREKEY_EPOCH_MS
+}
+
+/// Reserved [`LinkId`] for our own local re-injection path (rehydrate, stream reassembly) and the
+/// "no link to skip" argument to the offer helpers (core-05). It is exempt from the F-07
+/// private-ingest rate limit, so a real bearer must NEVER assign it to a transport connection;
+/// [`Node::on_connected`] refuses a link with this id defensively.
+const LOCAL_LINK: LinkId = 0;
+
 /// Per-link inbound rate limit for §39 **private** bundles (F-07). Private bundles are unsigned
 /// and unlimited-mintable, so a hostile/buggy peer could flood them; a legitimate peer never
 /// approaches this. Traced (signed, attributable) bundles and stream carriers are NOT limited.
@@ -454,7 +476,11 @@ pub struct Node<S: Store = MemoryStore> {
     relay_fwd: HashMap<BundleId, u64>,
     /// Our current signed prekey (published so peers can open sessions to us).
     prekey: SignedPreKey,
-    /// Retained prekey secrets by public, so late session inits still resolve.
+    /// The epoch our current `prekey` was derived for (core-03). Rotated in `tick` when the clock
+    /// crosses into a new [`PREKEY_EPOCH_MS`] window.
+    prekey_epoch: u64,
+    /// Retained prekey secrets by public, so late session inits still resolve, including a bounded
+    /// window of PAST epochs' secrets across a rotation (core-03).
     spk_secrets: HashMap<XPubKeyBytes, zeroize::Zeroizing<[u8; 32]>>,
     /// Per-link fixed-window counter for inbound §39 private-bundle rate limiting (F-07):
     /// `link → (window_start_ms, count)`. Bounds an unsigned-bundle flood per peer.
@@ -687,6 +713,18 @@ impl Node<MemoryStore> {
     fn clone_store(&self) -> MemoryStore {
         self.store.clone()
     }
+
+    /// Test-only: the currently-published prekey public (core-03 rotation observability).
+    #[cfg(test)]
+    fn current_prekey_public(&self) -> XPubKeyBytes {
+        self.prekey.public
+    }
+
+    /// Test-only: do we still hold the secret for prekey public `pk`? (core-03 retention window.)
+    #[cfg(test)]
+    fn holds_prekey_secret(&self, pk: &XPubKeyBytes) -> bool {
+        self.spk_secrets.contains_key(pk)
+    }
 }
 
 impl<S: Store> Node<S> {
@@ -720,6 +758,7 @@ impl<S: Store> Node<S> {
             max_relayed: DEFAULT_MAX_RELAYED,
             relay_fwd: HashMap::new(),
             prekey,
+            prekey_epoch: 0,
             spk_secrets,
             recv_gradient: HashMap::new(),
             wanted_mailboxes: Vec::new(),
@@ -920,7 +959,7 @@ impl<S: Store> Node<S> {
             for (seq, fin, bytes) in chunks {
                 if let Some(inner_bytes) = self.accept_stream_chunk(from, sid, seq, bytes, fin) {
                     if let Ok(inner) = Bundle::from_bytes(&inner_bytes) {
-                        self.on_bundle(0, inner); // completed while we were away → deliver
+                        self.on_bundle(LOCAL_LINK, inner); // completed while we were away → deliver
                     }
                 }
             }
@@ -1035,7 +1074,8 @@ impl<S: Store> Node<S> {
                 self.pending.insert(id, pend);
             }
             // F-09: offer just this newly-submitted bundle to all links, not the whole store.
-            self.offer_bundle_to_all_except(id, 0);
+            // LOCAL_LINK means "no real link to skip" (submit came from us, not a bearer).
+            self.offer_bundle_to_all_except(id, LOCAL_LINK);
         }
     }
 
@@ -1394,6 +1434,41 @@ impl<S: Store> Node<S> {
         Ok(id)
     }
 
+    /// core-03: rotate the signed prekey when the clock crosses into a new epoch. The new epoch's
+    /// deterministic SPK becomes the published one; its secret is added to `spk_secrets` and the
+    /// current epoch's is retained. Secrets older than [`PREKEY_EPOCH_WINDOW`] past epochs are wiped,
+    /// so a leaked SPK secret only decrypts sessions bootstrapped within a bounded recent window
+    /// instead of for the identity's life. Re-publishes the new prekey advert so peers adopt it.
+    /// Deterministic derivation means a restart re-derives the same per-epoch secrets, so a peer that
+    /// cached an in-window advert can still open a session. No-op until the epoch actually advances.
+    fn rotate_prekey_if_due(&mut self) {
+        let cur = prekey_epoch(self.now_ms);
+        if cur == self.prekey_epoch {
+            return;
+        }
+        // Adopt the current epoch's prekey and retain its secret alongside the old one.
+        let fresh = self.identity.derive_prekey_epoch(cur);
+        self.spk_secrets
+            .insert(fresh.public, zeroize::Zeroizing::new(fresh.secret_bytes()));
+        self.prekey = fresh;
+        self.prekey_epoch = cur;
+        // Rebuild the retained set from exactly the in-window epochs, dropping anything older so a
+        // compromised past secret can't decrypt sessions indefinitely. Re-deriving is cheap and keeps
+        // the map an exact function of the current epoch (no unbounded growth across many rotations).
+        let mut keep: HashMap<XPubKeyBytes, zeroize::Zeroizing<[u8; 32]>> = HashMap::new();
+        // Always retain epoch 0 (the base prekey) so pre-rotation cached adverts still resolve.
+        for back in 0..=PREKEY_EPOCH_WINDOW {
+            let e = cur.saturating_sub(back);
+            let pk = self.identity.derive_prekey_epoch(e);
+            keep.insert(pk.public, zeroize::Zeroizing::new(pk.secret_bytes()));
+        }
+        let base = self.identity.derive_prekey_epoch(0);
+        keep.insert(base.public, zeroize::Zeroizing::new(base.secret_bytes()));
+        self.spk_secrets = keep;
+        // Peers must learn the new SPK to open fresh sessions to us.
+        let _ = self.publish_prekey();
+    }
+
     /// §39 P4: publish (and gossip) this node's signed **receiver-beacon** so peers lay a
     /// gradient toward our mailbox-tag and route private bundles to us instead of blind-flooding.
     /// Call this when in "route-to-me" mode (a recipient that wants to be reachable deep in the
@@ -1514,8 +1589,13 @@ impl<S: Store> Node<S> {
                 }
             }
             Payload::Ack { .. } => {} // a duplicate ACK — already handled
-            // User content addressed to us: deliver once (read_message re-opens + ratchets,
-            // keyed off the in-seal sender), then ACK back if requested.
+            // sec-priv-01/core-01: a bare PeerMessage inside an unsigned Private seal is a sender
+            // spoof (no ratchet proves `sender`). Drop it here so we neither inbox nor ACK it —
+            // read_message would refuse to surface it anyway, but not inboxing avoids emitting a
+            // private ACK to the impersonated address.
+            Payload::PeerMessage { .. } => {}
+            // Ratcheted user content addressed to us (SessionInit/SessionMessage authenticate the
+            // sender): deliver once (read_message re-opens + ratchets), then ACK back if requested.
             _ => {
                 if first {
                     self.inbox.push(bundle.clone());
@@ -1593,26 +1673,45 @@ impl<S: Store> Node<S> {
     pub fn read_message(&mut self, bundle: &Bundle) -> Result<Option<ReadMessage>> {
         match bundle.open(&self.identity)? {
             // §39 untraceable: the *real* sender rode inside the seal (the envelope src is
-            // zeroed). Use it — the inner ratchet authenticates that it's genuinely them.
-            Payload::Private { sender, inner } => self.read_inner_message(sender, *inner),
-            other => self.read_inner_message(bundle.inner.src, other),
+            // zeroed). The seal is NOT identity-signed, so `sender` is an unauthenticated claim
+            // here — only a ratcheted inner (SessionInit/SessionMessage, which X3DH/Double-Ratchet
+            // authenticate) may attribute a message to it. `authenticated=false` enforces that.
+            Payload::Private { sender, inner } => self.read_inner_message(sender, *inner, false),
+            // Normal path: the envelope is Ed25519-signed and verify() checked `src`, so a bare
+            // PeerMessage attributed to `src` is authenticated.
+            other => self.read_inner_message(bundle.inner.src, other, true),
         }
     }
 
     /// Decrypt a user-message payload attributed to `from` — shared by the normal path (where
-    /// `from` is the cleartext envelope src) and the §39 private path (where it came from
-    /// inside the seal). Establishes the responder side of a session on first `SessionInit`.
+    /// `from` is the cleartext, envelope-signed src) and the §39 private path (where it came from
+    /// inside the *unsigned* seal). `authenticated` is true only when `from` is proven by the
+    /// envelope signature; when false, a bare `PeerMessage` carries NO proof of `from` and must
+    /// not be surfaced (sender spoofing, sec-priv-01/core-01) — only ratcheted payloads, which
+    /// authenticate the sender cryptographically, may attribute a message on the private path.
+    /// Establishes the responder side of a session on first `SessionInit`.
     fn read_inner_message(
         &mut self,
         from: PubKeyBytes,
         payload: Payload,
+        authenticated: bool,
     ) -> Result<Option<ReadMessage>> {
         match payload {
-            Payload::PeerMessage { content_type, body } => Ok(Some(ReadMessage {
-                from,
-                content_type,
-                body,
-            })),
+            Payload::PeerMessage { content_type, body } => {
+                if !authenticated {
+                    // A bare PeerMessage inside an unsigned Private seal: anyone knowing the
+                    // recipient's public address + published prekey could forge this "from
+                    // <victim>". Device-to-device content is always forward-secret (a send
+                    // without a ratchet is an error), so a private static PeerMessage is never
+                    // legitimate — drop it rather than attribute it.
+                    return Ok(None);
+                }
+                Ok(Some(ReadMessage {
+                    from,
+                    content_type,
+                    body,
+                }))
+            }
             Payload::SessionInit {
                 ek_pub,
                 spk_pub,
@@ -3203,6 +3302,9 @@ impl<S: Store> Node<S> {
                 self.offer_adverts_to_all();
             }
         }
+        // core-03: rotate our signed prekey on epoch boundaries so a compromised SPK secret only
+        // exposes a bounded recent window of sessions, then re-publish the new one.
+        self.rotate_prekey_if_due();
         // §39 P4: keep our receiver-beacon fresh (short interval ≪ its TTL) so the gradient toward
         // us stays alive and re-points if we move. Passive (max-privacy) recipients skip this.
         if self.route_to_me
@@ -3410,6 +3512,16 @@ impl<S: Store> Node<S> {
     }
 
     fn on_connected(&mut self, link: LinkId, role: Role) {
+        // core-05: LinkId 0 is the RESERVED local/no-link sentinel. It marks our own re-injection
+        // path (rehydrate, stream reassembly) and the "no link to skip" arg to offer helpers, and it
+        // is exempt from the F-07 private-ingest rate limit. A real bearer must never assign it, or an
+        // attacker on that connection would bypass the unsigned-private flood cap. Refuse to admit a
+        // link 0 rather than trust bearer id allocation.
+        if link == LOCAL_LINK {
+            // A real bearer must never assign the reserved sentinel; refuse to admit it as a
+            // connection rather than let its traffic inherit the LOCAL_LINK rate-limit exemption.
+            return;
+        }
         // Idempotent: a spurious Connected for a link we already hold must not tear down its live
         // Noise session (a re-handshake would reset dedup + re-flood). Real reconnects are preceded
         // by Disconnected (bearer contract), which removes the entry and snapshots its dedup per-peer.
@@ -3601,9 +3713,11 @@ impl<S: Store> Node<S> {
 
     /// F-07: fixed-window per-link rate limit for unsigned §39 private bundles. Returns false
     /// (drop) when this link has exceeded [`MAX_PRIV_BUNDLES_PER_WINDOW`] in the current window.
-    /// `from_link == 0` is our own re-injection path (rehydrate / stream reassembly) — never limited.
+    /// `from_link == LOCAL_LINK` is our own re-injection path (rehydrate / stream reassembly), never
+    /// limited. A real bearer never assigns [`LOCAL_LINK`] ([`Node::on_connected`] enforces this), so
+    /// this exemption cannot be reached from a remote connection (core-05).
     fn allow_private_ingest(&mut self, from_link: LinkId) -> bool {
-        if from_link == 0 {
+        if from_link == LOCAL_LINK {
             return true;
         }
         let now = self.now_ms;
@@ -5413,6 +5527,45 @@ mod tests {
         );
         assert_eq!(m.content_type, "text/plain");
         assert_eq!(m.body, b"meet at dawn");
+    }
+
+    #[test]
+    fn spoofed_private_peer_message_is_not_attributed_to_the_claimed_sender() {
+        // sec-priv-01/core-01: a Private seal is NOT identity-signed, so the in-seal `sender` is an
+        // unauthenticated claim. An attacker who knows only the recipient's public address + their
+        // published prekey (both flood in adverts) crafts Private{ sender: <victim>, inner: bare
+        // PeerMessage } sealed to the recipient. The recipient must recognize it (well-formed) but
+        // must NOT surface it as a message "from <victim>" — only ratcheted inners authenticate a sender.
+        let victim = Identity::generate(); // whom the attacker wants to impersonate
+        let bob_id = Identity::generate(); // the recipient
+        let bob_prekey = bob_id.derive_prekey(); // public: an attacker harvests this from Bob's advert
+        let bob_addr = bob_id.address();
+
+        let spoof = Payload::Private {
+            sender: victim.address(),
+            inner: Box::new(Payload::PeerMessage {
+                content_type: "text/plain".into(),
+                body: b"transfer the funds; I never said this".to_vec(),
+            }),
+        };
+        let bundle = Bundle::create_private(
+            &bob_addr,
+            &bob_prekey.public,
+            &spoof,
+            Some(crypto::mailbox_tag(&bob_addr, mailbox_epoch(0))),
+            BundleOpts::default(),
+        )
+        .unwrap();
+
+        let mut bob = Node::new(bob_id);
+        assert!(
+            bob.recognizes(&bundle),
+            "the seal is well-formed and addressed to Bob — he recognizes it"
+        );
+        assert!(
+            bob.read_message(&bundle).unwrap().is_none(),
+            "a bare PeerMessage inside an unsigned Private seal must not be attributed to the claimed sender"
+        );
     }
 
     #[test]
@@ -7571,6 +7724,55 @@ mod tests {
         assert!(
             nodes[2].take_hps_messages().is_empty(),
             "removed m2 can't read v2"
+        );
+    }
+
+    #[test]
+    fn reserved_link_zero_is_never_admitted_as_a_connection() {
+        // core-05: LinkId 0 is the local re-injection sentinel and is exempt from the F-07
+        // private-ingest rate limit. A bearer that (buggily or maliciously) hands us Connected(0)
+        // must be refused, so its traffic can never inherit that exemption. A refused link emits no
+        // handshake; a real link (id 1) does.
+        let mut node = Node::new(Identity::generate());
+        node.handle(BearerEvent::Connected(LOCAL_LINK, Role::Initiator));
+        assert!(
+            node.drain_outgoing().is_empty(),
+            "link 0 must be refused (no handshake sent)"
+        );
+        node.handle(BearerEvent::Connected(1, Role::Initiator));
+        assert!(
+            !node.drain_outgoing().is_empty(),
+            "a real link handshakes normally"
+        );
+    }
+
+    #[test]
+    fn prekey_rotates_on_epoch_and_retains_a_bounded_window() {
+        // core-03: crossing a prekey epoch publishes a new SPK, keeps the prior epoch's secret (so a
+        // late session init still resolves), and eventually wipes secrets older than the window.
+        let mut node = Node::new(Identity::generate());
+        let e0 = node.current_prekey_public();
+        assert!(node.holds_prekey_secret(&e0));
+
+        // Advance one epoch: a new prekey is published; both epochs' secrets are retained.
+        node.tick(PREKEY_EPOCH_MS);
+        let e1 = node.current_prekey_public();
+        assert_ne!(e0, e1, "prekey rotated on the epoch boundary");
+        assert!(node.holds_prekey_secret(&e1), "current epoch secret held");
+        assert!(
+            node.holds_prekey_secret(&e0),
+            "prior epoch secret retained within the window"
+        );
+
+        // Advance far past the window: the original (base) epoch-0 secret is always kept, but an
+        // out-of-window intermediate epoch's secret is wiped so compromise stays bounded.
+        let intermediate = node.identity.derive_prekey_epoch(2).public;
+        node.tick(PREKEY_EPOCH_MS * 5);
+        let e5 = node.current_prekey_public();
+        assert!(node.holds_prekey_secret(&e5), "newest epoch secret held");
+        assert!(
+            !node.holds_prekey_secret(&intermediate),
+            "an out-of-window past epoch secret is wiped"
         );
     }
 }

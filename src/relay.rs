@@ -18,6 +18,15 @@ use std::collections::HashMap;
 
 use crate::routing::PeerId;
 
+/// Cap on the number of distinct topics either table tracks (sec-priv-06). A Sybil set advertising
+/// endless distinct topics would otherwise grow these maps without bound (weight is only decayed
+/// lazily, never dropped). On overflow the lowest-recency topic is evicted.
+const MAX_SCORED_TOPICS: usize = 4_096;
+
+/// Cap on distinct peers tracked per topic (sec-priv-06). Bounds a Sybil set claiming interest in one
+/// topic from a flood of distinct peer ids. On overflow the least-recently-seen peer is evicted.
+const MAX_PEERS_PER_TOPIC: usize = 1_024;
+
 /// Recency/frequency weight for one peer on one topic.
 #[derive(Clone, Copy, Debug)]
 struct Seen {
@@ -61,14 +70,33 @@ impl RelayScorer {
         now: u64,
         hl: u64,
     ) {
-        let entry = map
-            .entry(topic.to_string())
-            .or_default()
-            .entry(peer)
-            .or_insert(Seen {
-                last_ms: now,
-                weight: 0.0,
-            });
+        // sec-priv-06: bound the number of distinct topics before inserting a new one, so a Sybil
+        // set advertising endless topics can't grow the map without bound. Evict the topic whose
+        // most-recent encounter is oldest (a fresh topic just met is more useful than a stale one).
+        if !map.contains_key(topic) && map.len() >= MAX_SCORED_TOPICS {
+            if let Some(victim) = map
+                .iter()
+                .min_by_key(|(_, peers)| peers.values().map(|s| s.last_ms).max().unwrap_or(0))
+                .map(|(t, _)| t.clone())
+            {
+                map.remove(&victim);
+            }
+        }
+        let peers = map.entry(topic.to_string()).or_default();
+        // sec-priv-06: bound distinct peers per topic the same way (Sybil peer-id flood on one topic).
+        if !peers.contains_key(&peer) && peers.len() >= MAX_PEERS_PER_TOPIC {
+            if let Some(victim) = peers
+                .iter()
+                .min_by(|a, b| a.1.last_ms.cmp(&b.1.last_ms))
+                .map(|(p, _)| *p)
+            {
+                peers.remove(&victim);
+            }
+        }
+        let entry = peers.entry(peer).or_insert(Seen {
+            last_ms: now,
+            weight: 0.0,
+        });
         // Decay the existing weight to `now`, then add this fresh encounter.
         entry.weight = entry.decayed(now, hl) + 1.0;
         entry.last_ms = now;
@@ -149,6 +177,31 @@ mod tests {
         assert!(s.score("jobs:companyX", now) > s.score("jobs:companyY", now));
         let hot = s.hot_topics(now);
         assert_eq!(hot[0].0, "jobs:companyX");
+    }
+
+    #[test]
+    fn tables_are_bounded_against_a_sybil_flood() {
+        // sec-priv-06: neither the topic map nor a topic's peer map may grow without bound under a
+        // flood of distinct topics / peer ids.
+        let mut s = RelayScorer::new(86_400_000);
+        // Flood distinct topics well past the cap.
+        for i in 0..(MAX_SCORED_TOPICS + 500) {
+            s.observe_interest(&format!("topic:{i}"), peer(1), i as u64);
+        }
+        assert!(
+            s.demand.len() <= MAX_SCORED_TOPICS,
+            "topic table stays bounded"
+        );
+        // Flood distinct peers on one topic well past the per-topic cap.
+        for i in 0..(MAX_PEERS_PER_TOPIC + 500) {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            s.observe_supply("hot", id, i as u64);
+        }
+        assert!(
+            s.supply.get("hot").unwrap().len() <= MAX_PEERS_PER_TOPIC,
+            "per-topic peer table stays bounded"
+        );
     }
 
     #[test]
