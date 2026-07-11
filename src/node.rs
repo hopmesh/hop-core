@@ -4011,18 +4011,33 @@ impl<S: Store> Node<S> {
                     ..
                 }) = bundle.open(&self.identity)
                 {
-                    self.pending.remove(&for_bundle_id);
-                    self.store.remove(&for_bundle_id);
-                    // Mark the UI-facing message delivered (resolve carrier/deferral aliases).
-                    let display = self.display_id(&for_bundle_id);
-                    if let Some(info) = self.tx.get_mut(&display) {
-                        info.delivered = true;
-                        info.delivered_hops = delivery_hops;
-                        info.delivered_ms = delivery_ms;
-                    }
-                    // Our message reached its destination: learn the route (§27).
-                    if let Some((s, d, _)) = self.forwarded.remove(&for_bundle_id) {
-                        self.routes.learn(&s, &d, self.now_ms);
+                    // core-protocol-r7-01: AUTHORIZE the acker, do not merely authenticate it. verify()
+                    // proved WHO signed this ack, not that they are the acked bundle's destination. An
+                    // observer of a traced (cleartext-id) bundle could otherwise forge an ack and flip
+                    // delivered=true + stop our retransmit, suppressing the real delivery. We still hold
+                    // the original in our store (we remove it just below); its PLAINTEXT Device(dst)
+                    // names the intended recipient, so honor the ack only when the signer IS that dst.
+                    // The analogous private-path forgery was closed by the CDH proof (r2-04); this closes
+                    // the traced path. A re-ack after we already delivered + dropped the original has no
+                    // stored dst to check and is left unhonored (delivered is already set, so harmless).
+                    let authorized = !matches!(
+                        self.store.get(&for_bundle_id).map(|b| b.inner.dst),
+                        Some(Destination::Device(d)) if d != bundle.inner.src
+                    );
+                    if authorized {
+                        self.pending.remove(&for_bundle_id);
+                        self.store.remove(&for_bundle_id);
+                        // Mark the UI-facing message delivered (resolve carrier/deferral aliases).
+                        let display = self.display_id(&for_bundle_id);
+                        if let Some(info) = self.tx.get_mut(&display) {
+                            info.delivered = true;
+                            info.delivered_hops = delivery_hops;
+                            info.delivered_ms = delivery_ms;
+                        }
+                        // Our message reached its destination: learn the route (§27).
+                        if let Some((s, d, _)) = self.forwarded.remove(&for_bundle_id) {
+                            self.routes.learn(&s, &d, self.now_ms);
+                        }
                     }
                 }
             } else {
@@ -4305,13 +4320,26 @@ impl<S: Store> Node<S> {
         if bundle.inner.flags.is_ack {
             match bundle.inner.dst {
                 Destination::AckTo(_, delivered) => {
-                    self.store.remove(&delivered);
-                    self.relay_order.retain(|x| *x != delivered);
-                    self.immune.insert(delivered, self.now_ms);
-                    // The ACK for a bundle we forwarded is passing back through us — we're
-                    // on a working path between its endpoints, in both directions (§27).
-                    if let Some((s, d, _)) = self.forwarded.remove(&delivered) {
-                        self.routes.learn(&s, &d, self.now_ms);
+                    // core-protocol-r7-01: authorize before purging. If we still hold the acked bundle
+                    // and it is a Device(dst) (traced) bundle, honor this passing ack only when the
+                    // signer IS that dst; a forged ack from an observer must not purge (+ immune) the
+                    // real bundle at a relay that is actively carrying it. (Residual: a relay that does
+                    // NOT yet hold the bundle cannot authorize, so a forged ack can still immune-poison
+                    // it; the sender's retransmit, the immune TTL, and alternate routes bound that, and
+                    // this relay-side check stops the worst case of purging a relay mid-carry.)
+                    let authorized = !matches!(
+                        self.store.get(&delivered).map(|b| b.inner.dst),
+                        Some(Destination::Device(d)) if d != bundle.inner.src
+                    );
+                    if authorized {
+                        self.store.remove(&delivered);
+                        self.relay_order.retain(|x| *x != delivered);
+                        self.immune.insert(delivered, self.now_ms);
+                        // The ACK for a bundle we forwarded is passing back through us — we're
+                        // on a working path between its endpoints, in both directions (§27).
+                        if let Some((s, d, _)) = self.forwarded.remove(&delivered) {
+                            self.routes.learn(&s, &d, self.now_ms);
+                        }
                     }
                 }
                 // §39 delivery vaccine (sec-priv-07): the anti-packet carries ONLY the revealed token,
@@ -4473,9 +4501,11 @@ impl<S: Store> Node<S> {
                 status: 0,
                 delivery_hops: orig.env.hops,
                 delivery_ms: forward_ms(self.now_ms, orig.inner.created_at),
-                // Traced ACK: identity-signed, so the Ed25519 signature already authenticates the
-                // acker. No CDH proof needed (and none is possible — this path never recognizes a
-                // private tag). core-protocol-r2-04 hardens only the unsigned private-ACK path.
+                // Traced ACK: identity-signed, so the Ed25519 signature authenticates WHO acked. It
+                // does not by itself prove they are the destination, so the receiver additionally
+                // AUTHORIZES the acker against the acked bundle's plaintext Device(dst) before honoring
+                // it (core-protocol-r7-01); no CDH proof rides here (that hardens the unsigned
+                // private-ACK path, core-protocol-r2-04).
                 proof: None,
             },
             BundleOpts {
@@ -7313,6 +7343,89 @@ mod tests {
         assert!(
             !node.store.contains(&mid),
             "and the proven ACK clears the original from the store"
+        );
+    }
+
+    #[test]
+    fn a_forged_traced_ack_cannot_mark_a_send_delivered_or_drop_the_bundle() {
+        // core-protocol-r7-01: a traced (Device-dst, cleartext-id) ACK is identity-signed, which
+        // authenticates WHO signed it but not that they are the bundle's destination. An observer of
+        // the bundle's cleartext id could otherwise forge an AckTo(sender, id) and flip the send to
+        // Delivered + drop the sender's copy so it stops retransmitting, though the real recipient never
+        // got it. The receiver now AUTHORIZES the acker against the acked bundle's plaintext Device(dst).
+        // Assert a forged ACK (signed by a non-destination) is refused, and a genuine ACK (signed by the
+        // destination) is honored.
+        let recipient = Identity::generate();
+        let attacker = Identity::generate();
+        let recipient_addr = recipient.address();
+
+        let mut node = Node::new(Identity::generate());
+        // A traced direct bundle to the recipient, requesting an ACK. Sender holds it (pending + store).
+        let bundle = Bundle::create(
+            &node.identity,
+            Destination::Device(recipient_addr),
+            &recipient_addr,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"hi".to_vec(),
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mid = bundle.id();
+        node.submit(bundle);
+        assert!(
+            node.store.contains(&mid),
+            "sender holds its own traced bundle"
+        );
+        // store.contains is the direct signal of whether an ACK was HONORED: honoring an ACK removes
+        // the acked bundle from the store, so its staying present means the ACK was refused.
+
+        // A helper to build an AckTo(sender, mid) signed by a chosen identity (the forgery lever).
+        let make_ack = |signer: &Identity, to: PubKeyBytes| {
+            Bundle::create(
+                signer,
+                Destination::AckTo(to, mid),
+                &to,
+                &Payload::Ack {
+                    for_bundle_id: mid,
+                    status: 0,
+                    delivery_hops: 1,
+                    delivery_ms: 1,
+                    proof: None,
+                },
+                BundleOpts {
+                    flags: BundleFlags {
+                        is_ack: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        // (1) FORGED ACK: signed by the ATTACKER (not the recipient). Must NOT be honored, so the
+        // sender's bundle stays in the store and retransmission keeps going. Before the fix, this
+        // dropped the bundle (store.remove) on a merely-authenticated ack.
+        node.on_bundle(77, make_ack(&attacker, node.address()));
+        assert!(
+            node.store.contains(&mid),
+            "a forged traced ACK from a non-destination must NOT drop the sender's bundle"
+        );
+
+        // (2) GENUINE ACK: signed by the real RECIPIENT. IS honored (unchanged behavior): the acked
+        // bundle is cleared from the store.
+        node.on_bundle(78, make_ack(&recipient, node.address()));
+        assert!(
+            !node.store.contains(&mid),
+            "a genuine traced ACK from the destination DOES clear the acked bundle"
         );
     }
 
