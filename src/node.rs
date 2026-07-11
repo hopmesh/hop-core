@@ -4018,12 +4018,22 @@ impl<S: Store> Node<S> {
                     // the original in our store (we remove it just below); its PLAINTEXT Device(dst)
                     // names the intended recipient, so honor the ack only when the signer IS that dst.
                     // The analogous private-path forgery was closed by the CDH proof (r2-04); this closes
-                    // the traced path. A re-ack after we already delivered + dropped the original has no
-                    // stored dst to check and is left unhonored (delivered is already set, so harmless).
-                    let authorized = !matches!(
-                        self.store.get(&for_bundle_id).map(|b| b.inner.dst),
-                        Some(Destination::Device(d)) if d != bundle.inner.src
-                    );
+                    // the traced path. A re-ack after we already delivered + dropped the original finds
+                    // no stored bundle (store.get is None), so the match is false and it is re-honored
+                    // idempotently: the pending/store removes are no-ops and delivered is simply re-set.
+                    // core-protocol-r8-01: bundle.inner.src is only AUTHENTICATED for an identity-signed
+                    // bundle. verify() takes the private branch (binding ONLY the sealed payload to the
+                    // id, not src/dst) whenever inner.private.is_some(), so a private-flagged bundle has
+                    // an attacker-chosen src. A legit traced ACK is always identity-signed, so require
+                    // that here: otherwise a private "chimera" (is_ack, dst=AckTo(us), src set to the
+                    // recipient to pass the dst check, payload a public sealed-box Ack) would slip past
+                    // r7-01. Legit private ACKs never reach this path (they arrive Broadcast and go
+                    // through deliver_private's CDH-proof gate), so this refuses no genuine ack.
+                    let authorized = !bundle.is_private()
+                        && !matches!(
+                            self.store.get(&for_bundle_id).map(|b| b.inner.dst),
+                            Some(Destination::Device(d)) if d != bundle.inner.src
+                        );
                     if authorized {
                         self.pending.remove(&for_bundle_id);
                         self.store.remove(&for_bundle_id);
@@ -4327,10 +4337,14 @@ impl<S: Store> Node<S> {
                     // NOT yet hold the bundle cannot authorize, so a forged ack can still immune-poison
                     // it; the sender's retransmit, the immune TTL, and alternate routes bound that, and
                     // this relay-side check stops the worst case of purging a relay mid-carry.)
-                    let authorized = !matches!(
-                        self.store.get(&delivered).map(|b| b.inner.dst),
-                        Some(Destination::Device(d)) if d != bundle.inner.src
-                    );
+                    // core-protocol-r8-01: only an identity-signed ack has an authenticated src (see the
+                    // origin path). A private-flagged AckTo chimera has an attacker-chosen src, so never
+                    // let it purge a relay's held bundle; require the ack be identity-signed.
+                    let authorized = !bundle.is_private()
+                        && !matches!(
+                            self.store.get(&delivered).map(|b| b.inner.dst),
+                            Some(Destination::Device(d)) if d != bundle.inner.src
+                        );
                     if authorized {
                         self.store.remove(&delivered);
                         self.relay_order.retain(|x| *x != delivered);
@@ -7426,6 +7440,85 @@ mod tests {
         assert!(
             !node.store.contains(&mid),
             "a genuine traced ACK from the destination DOES clear the acked bundle"
+        );
+    }
+
+    #[test]
+    fn a_private_chimera_ack_cannot_forge_a_traced_delivery() {
+        // core-protocol-r8-01: verify()'s PRIVATE branch binds only the sealed payload to the id, NOT
+        // src/dst, so a private bundle's src is attacker-chosen. The r7-01 dst-match check trusted
+        // bundle.inner.src, so an attacker could take a private ack (src unauthenticated), rewrite
+        // src=recipient (to satisfy the dst check) + dst=AckTo(sender,mid) + is_ack, and slip it into
+        // the traced-ack honor path to forge a delivery. The fix additionally requires the ack be
+        // identity-signed (!is_private). Assert this chimera is refused.
+        let sender = Identity::generate();
+        let recipient = Identity::generate();
+        let recipient_addr = recipient.address();
+        let recipient_spk = recipient.derive_prekey().public;
+
+        let mut node = Node::new(sender);
+        let sender_addr = node.address();
+        // Sender holds a traced bundle to the recipient.
+        let bundle = Bundle::create(
+            &node.identity,
+            Destination::Device(recipient_addr),
+            &recipient_addr,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"hi".to_vec(),
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mid = bundle.id();
+        node.submit(bundle);
+        assert!(node.store.contains(&mid), "sender holds its traced bundle");
+
+        // Build the chimera: a PRIVATE ack sealed to the SENDER, then rewrite src=recipient and
+        // dst=AckTo(sender,mid). The id is over the sealed payload only, so these rewrites do NOT break
+        // verify()'s private-branch id check (that is the whole exploit).
+        let ack_payload = Payload::Ack {
+            for_bundle_id: mid,
+            status: 0,
+            delivery_hops: 1,
+            delivery_ms: 1,
+            proof: None,
+        };
+        let mut chimera = Bundle::create_private(
+            &sender_addr,
+            &recipient_spk,
+            &ack_payload,
+            Some(crypto::mailbox_route(&crypto::mailbox_tag(&sender_addr, 0))),
+            BundleOpts {
+                flags: BundleFlags {
+                    is_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        chimera.inner.src = recipient_addr; // claimed, but UNauthenticated in a private bundle
+        chimera.inner.dst = Destination::AckTo(sender_addr, mid); // target the traced-ack honor path
+        assert!(
+            chimera.is_private(),
+            "chimera is private-flagged (src is not authenticated)"
+        );
+        assert!(
+            chimera.verify().is_ok(),
+            "and it still passes verify() (the private branch binds only the sealed payload)"
+        );
+
+        node.on_bundle(77, chimera);
+        assert!(
+            node.store.contains(&mid),
+            "a private-flagged chimera ack must NOT forge a traced delivery or drop the bundle"
         );
     }
 
