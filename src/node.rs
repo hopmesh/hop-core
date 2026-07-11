@@ -1623,14 +1623,17 @@ impl<S: Store> Node<S> {
     /// matched bundle id, or `None` if we hold no bundle this vaccine clears.
     fn resolve_vaccine_target(&self, token: &[u8; 32]) -> Option<BundleId> {
         for id in self.store.have().ids {
-            let Some(tag) = self
-                .store
-                .get(&id)
-                .and_then(|b| b.inner.private.as_ref().map(|p| p.tag))
-            else {
+            let Some(b) = self.store.get(&id) else {
                 continue;
             };
-            if crypto::recognition_tag_from_shared(token, &id) == tag {
+            // r13-01: the tag keys on the content id, not the wire id — match against content_id.
+            let (Some(tag), Some(content_id)) = (
+                b.inner.private.as_ref().map(|p| p.tag),
+                b.private_content_id(),
+            ) else {
+                continue;
+            };
+            if crypto::recognition_tag_from_shared(token, &content_id) == tag {
                 return Some(id);
             }
         }
@@ -1670,10 +1673,13 @@ impl<S: Store> Node<S> {
         let Some(tag) = bundle.inner.private.as_ref().map(|p| p.tag) else {
             return false;
         };
-        let id = bundle.id();
+        // r13-01: the tag keys on the content id, not the wire id.
+        let Some(content_id) = bundle.private_content_id() else {
+            return false;
+        };
         self.seen_vaccine_tokens
             .keys()
-            .any(|token| crypto::recognition_tag_from_shared(token, &id) == tag)
+            .any(|token| crypto::recognition_tag_from_shared(token, &content_id) == tag)
     }
 
     /// core-protocol-r2-04: verify a private delivery-ACK's recipient-only CDH proof against the ORIGINAL
@@ -1687,14 +1693,17 @@ impl<S: Store> Node<S> {
         let Some(token) = proof else {
             return false; // an unproven private ACK never mutates send state
         };
-        let Some(tag) = self
-            .store
-            .get(for_bundle_id)
-            .and_then(|b| b.inner.private.as_ref().map(|p| p.tag))
-        else {
+        let Some(orig) = self.store.get(for_bundle_id) else {
             return false; // original already cleared (state is settled) — no mutation to authorize
         };
-        crypto::recognition_tag_from_shared(&token, for_bundle_id) == tag
+        // r13-01: the original's tag keys on ITS content id, not its wire id.
+        let (Some(tag), Some(content_id)) = (
+            orig.inner.private.as_ref().map(|p| p.tag),
+            orig.private_content_id(),
+        ) else {
+            return false;
+        };
+        crypto::recognition_tag_from_shared(&token, &content_id) == tag
     }
 
     /// core-protocol-r11-01: is `id` one of OUR OWN outstanding sends? A response/answer bundle
@@ -7426,28 +7435,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_recognition_header_chimera_cannot_suppress_delivery_of_the_genuine_private_copy() {
-        // core-protocol-r12-01 (§39 recognition-header chimera): the private id binds ONLY the sealed
-        // payload (`compute_private_id` excludes the PrivateHeader), and `verify()` checks neither the
-        // unsigned, recipient-secret-derived recognition tag nor its consistency. So an attacker who sees
-        // a real private bundle flood past can mint a SAME-ID chimera whose recognition tag is rewritten:
-        // it still verify()s (identical payload, identical Broadcast dst, identical id) yet is recognized
-        // by NOBODY. On the recipient it flows to the relay/flood path and marks `store.seen(id)`. The old
-        // delivery gate `first = !store.seen(id)` then saw the genuine copy as already-seen and skipped its
-        // `inbox.push` — a silent delivery denial of the real §39 message, plus a false "Delivered" ACK.
-        // The fix decouples delivery-once (`delivered_private`, populated ONLY by recognized copies here)
-        // from the flood-dedup `seen`, so a never-recognized chimera cannot poison it.
+    /// Build a genuine, correctly-ratcheted §39 private message from a fresh Alice to `bob`, returning
+    /// (alice_node, id, genuine_bundle). Alice holds her own private copy in the store.
+    fn genuine_private_to(bob: &Identity) -> (Node, BundleId, Bundle) {
         let alice = Identity::generate();
-        let bob = Identity::generate();
-        let bob_addr = bob.address();
-
-        // Alice builds a genuine, correctly-ratcheted §39 private message to Bob (needs his prekey).
         let mut alice_node = Node::new(alice);
-        inject_prekey(&mut alice_node, &bob);
+        inject_prekey(&mut alice_node, bob);
         let mid = alice_node
             .send_message(
-                bob_addr,
+                bob.address(),
                 "text/plain".into(),
                 b"meet at dawn".to_vec(),
                 true,
@@ -7458,52 +7454,102 @@ mod tests {
             .get(&mid)
             .expect("Alice holds her own private bundle");
         assert!(genuine.is_private());
+        (alice_node, mid, genuine)
+    }
 
-        // Mint the chimera: identical sealed payload (so the id is IDENTICAL) but a corrupted tag.
+    #[test]
+    fn a_recognition_header_chimera_is_rejected_at_verify_so_it_cannot_occupy_a_genuine_private_id()
+    {
+        // core-protocol-r13-01 (§39 recognition-header chimera, 7th vector — the ROOT fix). Before r13
+        // the private id bound ONLY the sealed payload, so an attacker who saw a genuine private bundle
+        // could reuse its sealed bytes and rewrite the recognition header (tag/ephemeral/mailbox) to
+        // garbage while keeping the SAME id — it self-verified. At a keep-first relay that chimera won the
+        // store race, occupied the id, re-flooded its unrecognizable header, and DROPPED the genuine
+        // same-id copy (store.put -> false), starving any recipient reachable only through that relay.
+        // r13 binds the header into the wire id (id = H(content_id ‖ ephemeral ‖ mailbox ‖ tag)), so a
+        // header rewrite yields a DIFFERENT id — a relay recomputes it with no secret and verify() rejects
+        // a bundle whose id doesn't match its own header. The chimera can never occupy the genuine id.
+        let bob = Identity::generate();
+        let (_alice, mid, genuine) = genuine_private_to(&bob);
+
+        // Attacker reuses the sealed bytes (same content_id) but flips the recognition tag, KEEPING the
+        // genuine id field — exactly the pre-r13 occupation attack.
         let mut chimera = genuine.clone();
         chimera.inner.private.as_mut().unwrap().tag[0] ^= 0xFF;
         assert_eq!(
             chimera.id(),
             genuine.id(),
-            "same sealed payload => same private id (the id never bound the header)"
+            "the attacker keeps the genuine id field (the occupation attempt)"
         );
+        assert!(genuine.verify().is_ok(), "the genuine bundle verifies");
         assert!(
-            chimera.verify().is_ok(),
-            "a tag-only chimera still passes verify(): id binds the payload, dst stays Broadcast"
+            chimera.verify().is_err(),
+            "r13: a header-rewrite chimera no longer self-verifies — the id binds the header"
         );
 
-        // Bob recognizes the genuine copy but NOT the chimera (its tag no longer matches his CDH).
+        // A RELAY (not the recipient) sees the chimera FIRST. on_bundle rejects it at verify() before the
+        // store, so it can neither mark the id seen nor occupy the keep-first slot.
+        let mut relay = Node::new(Identity::generate());
+        relay.on_bundle(1, chimera);
+        assert!(
+            !relay.store.seen(&mid),
+            "the rejected chimera never marked the id seen at the relay"
+        );
+        assert!(
+            !relay.store.contains(&mid),
+            "and never occupied the keep-first store slot"
+        );
+
+        // The genuine copy then arrives and IS held + floodable with its GENUINE tag, so a recipient
+        // behind this relay still receives a recognizable copy. (Revert r13 so the chimera self-verifies
+        // and it occupies the slot first, genuine put() returns false, and the recipient is starved.)
+        relay.on_bundle(2, genuine.clone());
+        assert!(
+            relay.store.contains(&mid),
+            "the relay holds the genuine copy for onward flood"
+        );
+        assert_eq!(
+            relay.store.get(&mid).unwrap().inner.private.as_ref().unwrap().tag,
+            genuine.inner.private.as_ref().unwrap().tag,
+            "the held copy carries the GENUINE recognition tag — a recipient behind the relay can recognize it"
+        );
+    }
+
+    #[test]
+    fn a_genuine_private_copy_delivers_exactly_once_and_a_header_chimera_never_reaches_the_inbox() {
+        // r12-01 delivery-once is decoupled from `store.seen` via `delivered_private` (populated only by
+        // recognized copies). With r13 a header chimera fails verify() at the recipient's gate too, so it
+        // never marks `seen` nor reaches the inbox; the genuine copy delivers, and a re-flooded GENUINE
+        // duplicate is deduped (delivered exactly once).
+        let bob = Identity::generate();
+        let (_alice, mid, genuine) = genuine_private_to(&bob);
         let mut bob_node = Node::new(bob);
-        assert!(
-            bob_node.recognizes(&genuine),
-            "Bob recognizes the real message"
-        );
-        assert!(
-            !bob_node.recognizes(&chimera),
-            "the corrupted-tag chimera is recognized by nobody"
-        );
 
-        // The chimera arrives FIRST and poisons the flood-dedup `seen` for the shared id...
+        // A header chimera is rejected at Bob's verify() gate — nothing delivered, nothing marked seen.
+        let mut chimera = genuine.clone();
+        chimera.inner.private.as_mut().unwrap().tag[0] ^= 0xFF;
         bob_node.on_bundle(1, chimera);
         assert!(
-            bob_node.store.seen(&mid),
-            "the chimera marked the id seen on the flood path (the precondition of the vector)"
+            bob_node.take_inbox().is_empty(),
+            "the header chimera is rejected at verify — nothing delivered"
         );
         assert!(
-            bob_node.take_inbox().is_empty(),
-            "and delivered nothing itself — Bob never recognized it"
+            !bob_node.store.seen(&mid),
+            "and it never marked the id seen"
         );
 
-        // ...then the genuine copy arrives. It must STILL be delivered despite the poisoned `seen`.
-        // (Revert the fix — gate on `!store.seen` — and this inbox is empty: silent delivery denial.)
-        bob_node.on_bundle(2, genuine);
+        // The genuine copy delivers once...
+        bob_node.on_bundle(2, genuine.clone());
         let inbox = bob_node.take_inbox();
-        assert_eq!(
-            inbox.len(),
-            1,
-            "the genuine private copy delivers even though a chimera poisoned `seen` first"
-        );
+        assert_eq!(inbox.len(), 1, "the genuine private copy delivers");
         assert!(inbox[0].is_private());
+
+        // ...and a re-flooded genuine duplicate does NOT double-deliver (delivered_private dedup).
+        bob_node.on_bundle(3, genuine.clone());
+        assert!(
+            bob_node.take_inbox().is_empty(),
+            "a genuine duplicate is deduped — delivered exactly once"
+        );
     }
 
     #[test]
