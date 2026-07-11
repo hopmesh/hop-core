@@ -1686,6 +1686,17 @@ impl<S: Store> Node<S> {
         crypto::recognition_tag_from_shared(&token, for_bundle_id) == tag
     }
 
+    /// core-protocol-r11-01: is `id` one of OUR OWN outstanding sends? A response/answer bundle
+    /// (HttpResponse/ServiceResponse/HnsAnswer) purges + immune-poisons the id it names, so that id
+    /// MUST be authorized the same way an ACK is: only a request we actually sent (still tracked in
+    /// `pending` while unacked, or in `tx` for the UI) may be dropped by an inbound response. Otherwise
+    /// an attacker who seals a forged response to us naming a real §39 private message's cleartext id
+    /// could purge + immune-poison that message at a relay, a network-wide delivery-denial. This is the
+    /// same authorization gate the traced-ACK paths use, applied to the response-cleanup handlers.
+    fn is_our_outstanding_send(&self, id: &BundleId) -> bool {
+        self.pending.contains_key(id) || self.tx.contains_key(id)
+    }
+
     /// §39 (sec-priv-07): flood a delivery vaccine revealing only `token`, so every node carrying a copy
     /// recovers the delivered bundle itself (`recognition_tag_from_shared(token, held_id) == held_tag`)
     /// and drops it. No plaintext delivered id on the wire. Outlives the message to chase the tail.
@@ -4060,20 +4071,25 @@ impl<S: Store> Node<S> {
                         body,
                         for_bundle_id,
                     }) => {
-                        // The response answers our request → drop the request bundle so it
-                        // stops being held/re-offered, and vaccinate any in-flight copies.
-                        self.pending.remove(&for_bundle_id);
-                        self.store.remove(&for_bundle_id);
-                        self.relay_order.retain(|x| *x != for_bundle_id);
-                        self.immune.insert(for_bundle_id, self.now_ms);
-                        self.tx.remove(&for_bundle_id);
-                        self.http_responses.push(HttpRespItem {
-                            from: bundle.inner.src,
-                            for_id: for_bundle_id,
-                            status,
-                            headers,
-                            body,
-                        });
+                        // r11-01: only a response to a request WE sent may purge/surface. A forged
+                        // response naming an id we never sent (e.g. a real private message's cleartext
+                        // id) is ignored, so it cannot purge + immune-poison that message at a relay.
+                        if self.is_our_outstanding_send(&for_bundle_id) {
+                            // The response answers our request → drop the request bundle so it
+                            // stops being held/re-offered, and vaccinate any in-flight copies.
+                            self.pending.remove(&for_bundle_id);
+                            self.store.remove(&for_bundle_id);
+                            self.relay_order.retain(|x| *x != for_bundle_id);
+                            self.immune.insert(for_bundle_id, self.now_ms);
+                            self.tx.remove(&for_bundle_id);
+                            self.http_responses.push(HttpRespItem {
+                                from: bundle.inner.src,
+                                for_id: for_bundle_id,
+                                status,
+                                headers,
+                                body,
+                            });
+                        }
                     }
                     // A hops:// request sealed to us (we're a hop-endpoint, §30): surface
                     // it for the operator's translator to execute against its backend.
@@ -4105,17 +4121,21 @@ impl<S: Store> Node<S> {
                         // calls carry no ACK-vaccine of their own, so without this the
                         // request bundle would sit pinned in our store forever. Drop it
                         // everywhere and vaccinate so any in-flight copy is dropped too.
-                        self.pending.remove(&for_bundle_id);
-                        self.store.remove(&for_bundle_id);
-                        self.relay_order.retain(|x| *x != for_bundle_id);
-                        self.immune.insert(for_bundle_id, self.now_ms);
-                        self.tx.remove(&for_bundle_id);
-                        self.service_responses.push(ServiceRespItem {
-                            from: bundle.inner.src,
-                            for_id: for_bundle_id,
-                            status,
-                            body,
-                        });
+                        // r11-01: only for a request WE sent, so a forged response cannot purge +
+                        // immune-poison an arbitrary (e.g. private) bundle at a relay.
+                        if self.is_our_outstanding_send(&for_bundle_id) {
+                            self.pending.remove(&for_bundle_id);
+                            self.store.remove(&for_bundle_id);
+                            self.relay_order.retain(|x| *x != for_bundle_id);
+                            self.immune.insert(for_bundle_id, self.now_ms);
+                            self.tx.remove(&for_bundle_id);
+                            self.service_responses.push(ServiceRespItem {
+                                from: bundle.inner.src,
+                                for_id: for_bundle_id,
+                                status,
+                                body,
+                            });
+                        }
                     }
                     Ok(Payload::ServiceRequest {
                         service,
@@ -4167,12 +4187,18 @@ impl<S: Store> Node<S> {
                         proof,
                         for_query,
                     }) => {
+                        // The proof is validated cryptographically and is trustworthy regardless of who
+                        // relayed it, so always cache a valid one. But only purge/immune the query if
+                        // WE sent it (r11-01): a forged HnsAnswer naming an arbitrary id must not purge
+                        // + immune-poison an unrelated (e.g. private) bundle at a relay.
                         self.provide_dns_proof(&domain, proof);
-                        self.pending.remove(&for_query);
-                        self.store.remove(&for_query);
-                        self.relay_order.retain(|x| *x != for_query);
-                        self.immune.insert(for_query, self.now_ms);
-                        self.tx.remove(&for_query);
+                        if self.is_our_outstanding_send(&for_query) {
+                            self.pending.remove(&for_query);
+                            self.store.remove(&for_query);
+                            self.relay_order.retain(|x| *x != for_query);
+                            self.immune.insert(for_query, self.now_ms);
+                            self.tx.remove(&for_query);
+                        }
                     }
                     // A join request for a topic we host (§32). Verify app+proof, then branch on
                     // access: Open → seal keys now; RequestToJoin → queue for approval; Invite →
@@ -7580,6 +7606,64 @@ mod tests {
         assert!(
             replay2.verify().is_err(),
             "including a Device-dst replay (the r10 pre-seed shape)"
+        );
+    }
+
+    #[test]
+    fn a_forged_response_cannot_purge_a_private_bundle_a_relay_is_carrying() {
+        // core-protocol-r11-01: the HttpResponse/ServiceResponse/HnsAnswer cleanup handlers purge +
+        // immune-poison the id they name. That id is an attacker-chosen field in a bundle sealed to us,
+        // so without authorization a forged response naming a real §39 private message's cleartext id
+        // would purge + immune-poison that message at a relay carrying it - a network-wide DoS reached
+        // outside the (now-closed) traced-ACK path. The handlers now purge ONLY for a request WE sent.
+        let sender = Identity::generate();
+        let bob = Identity::generate();
+        let attacker = Identity::generate();
+
+        // A relay R is carrying a real private message P (sender -> bob), which floods and is stored.
+        let mut relay = Node::new(Identity::generate());
+        let p = Bundle::create_private(
+            &bob.address(),
+            &bob.derive_prekey().public,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"secret".to_vec(),
+            },
+            Some(crypto::mailbox_route(&crypto::mailbox_tag(
+                &bob.address(),
+                0,
+            ))),
+            BundleOpts::default(),
+        )
+        .unwrap();
+        // Give P a real signed src so it is a well-formed flooded bundle from the sender's view; the
+        // relay ingests it and holds it for onward flooding.
+        let pid = p.id();
+        relay.on_bundle(1, p);
+        assert!(
+            relay.store.contains(&pid),
+            "relay is carrying the private message"
+        );
+        let _ = sender; // (sender identity only needed to frame the scenario)
+
+        // Attacker seals a forged HttpResponse to the relay naming P's observed cleartext id.
+        let forged = Bundle::create(
+            &attacker,
+            Destination::Device(relay.address()),
+            &relay.address(),
+            &Payload::HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: b"x".to_vec(),
+                for_bundle_id: pid,
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        relay.on_bundle(2, forged);
+        assert!(
+            relay.store.contains(&pid),
+            "a forged response naming a private message's id must NOT purge it (r11-01)"
         );
     }
 
