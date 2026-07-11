@@ -7446,7 +7446,12 @@ mod tests {
         let mut alice_node = Node::new(alice);
         inject_prekey(&mut alice_node, &bob);
         let mid = alice_node
-            .send_message(bob_addr, "text/plain".into(), b"meet at dawn".to_vec(), true)
+            .send_message(
+                bob_addr,
+                "text/plain".into(),
+                b"meet at dawn".to_vec(),
+                true,
+            )
             .unwrap();
         let genuine = alice_node
             .store
