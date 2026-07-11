@@ -4011,28 +4011,28 @@ impl<S: Store> Node<S> {
                     ..
                 }) = bundle.open(&self.identity)
                 {
-                    // core-protocol-r7-01: AUTHORIZE the acker, do not merely authenticate it. verify()
-                    // proved WHO signed this ack, not that they are the acked bundle's destination. An
-                    // observer of a traced (cleartext-id) bundle could otherwise forge an ack and flip
-                    // delivered=true + stop our retransmit, suppressing the real delivery. We still hold
-                    // the original in our store (we remove it just below); its PLAINTEXT Device(dst)
-                    // names the intended recipient, so honor the ack only when the signer IS that dst.
-                    // The analogous private-path forgery was closed by the CDH proof (r2-04); this closes
-                    // the traced path. A re-ack after we already delivered + dropped the original finds
-                    // no stored bundle (store.get is None), so the match is false and it is re-honored
-                    // idempotently: the pending/store removes are no-ops and delivered is simply re-set.
-                    // core-protocol-r8-01: bundle.inner.src is only AUTHENTICATED for an identity-signed
-                    // bundle. verify() takes the private branch (binding ONLY the sealed payload to the
-                    // id, not src/dst) whenever inner.private.is_some(), so a private-flagged bundle has
-                    // an attacker-chosen src. A legit traced ACK is always identity-signed, so require
-                    // that here: otherwise a private "chimera" (is_ack, dst=AckTo(us), src set to the
-                    // recipient to pass the dst check, payload a public sealed-box Ack) would slip past
-                    // r7-01. Legit private ACKs never reach this path (they arrive Broadcast and go
-                    // through deliver_private's CDH-proof gate), so this refuses no genuine ack.
+                    // core-protocol-r7/r8/r9-01: AUTHORIZE the acker, do not merely authenticate it.
+                    // verify() proves WHO signed the ack, not that they are the destination, so honor a
+                    // traced ACK ONLY when we hold the acked bundle AND it was sent TRACED, i.e. its
+                    // plaintext dst is Device(d) with d == the ack's signer, AND the ack is itself
+                    // identity-signed (so its src is authenticated; a private bundle's src is
+                    // attacker-chosen because verify() binds only the sealed payload to the id). All
+                    // three forgery vectors the audits found collapse to this positive check:
+                    //   (r7) a signed ack from a NON-destination: d != src, refused.
+                    //   (r8) a private "chimera" (is_ack, dst=AckTo(us), attacker-set src): is_private,
+                    //        refused.
+                    //   (r9) a genuine signed traced ACK naming a DEFAULT §39 PRIVATE send's cleartext
+                    //        id: that send is held as dst=Broadcast, not Device, so it does not match and
+                    //        is refused. Private sends are acked ONLY via the recipient-only CDH proof on
+                    //        the Broadcast/deliver_private path (r2-04), never here.
+                    // A legit traced ACK from the real destination for a still-held Device send matches
+                    // and is honored. The only thing this gives up vs blind honoring is a re-ack or an
+                    // ack for a store-evicted bundle (store.get None -> no match): delivered is not
+                    // (re-)set and retransmit continues until lifetime, which is safe and self-correcting.
                     let authorized = !bundle.is_private()
-                        && !matches!(
+                        && matches!(
                             self.store.get(&for_bundle_id).map(|b| b.inner.dst),
-                            Some(Destination::Device(d)) if d != bundle.inner.src
+                            Some(Destination::Device(d)) if d == bundle.inner.src
                         );
                     if authorized {
                         self.pending.remove(&for_bundle_id);
@@ -4340,10 +4340,16 @@ impl<S: Store> Node<S> {
                     // core-protocol-r8-01: only an identity-signed ack has an authenticated src (see the
                     // origin path). A private-flagged AckTo chimera has an attacker-chosen src, so never
                     // let it purge a relay's held bundle; require the ack be identity-signed.
+                    // core-protocol-r9-01: purge on a traced ACK ONLY when we hold the acked bundle, it
+                    // was sent TRACED (dst == Device(signer)), and the ack is identity-signed. A private
+                    // (Broadcast-dst) bundle we are carrying is NEVER purged by a traced AckTo: it is
+                    // vaccinated only by the token Vaccine on its own recognition tag (sec-priv-07). This
+                    // closes the network-wide DoS where a genuine signed AckTo naming a private send's
+                    // cleartext id purged + immune-poisoned the real §39 message mid-carry.
                     let authorized = !bundle.is_private()
-                        && !matches!(
+                        && matches!(
                             self.store.get(&delivered).map(|b| b.inner.dst),
-                            Some(Destination::Device(d)) if d != bundle.inner.src
+                            Some(Destination::Device(d)) if d == bundle.inner.src
                         );
                     if authorized {
                         self.store.remove(&delivered);
@@ -7519,6 +7525,64 @@ mod tests {
         assert!(
             node.store.contains(&mid),
             "a private-flagged chimera ack must NOT forge a traced delivery or drop the bundle"
+        );
+    }
+
+    #[test]
+    fn a_signed_traced_ack_cannot_forge_delivery_of_a_default_private_send() {
+        // core-protocol-r9-01: the DEFAULT send is §39 private, held by the sender as dst=Broadcast with
+        // a CLEARTEXT id on the wire. The earlier fix only bound signer==dst for Device-dst bundles, so
+        // for a Broadcast-held private send the check degraded to "any identity-signed ack is honored".
+        // An attacker who merely OBSERVES the flooded private id could then sign a genuine traced
+        // AckTo(sender, id) (their OWN identity, so it is identity-signed and passes the !is_private
+        // gate) and forge Delivered + stop retransmit at the sender. The fix requires a POSITIVE
+        // Device(dst)==signer match, so a Broadcast-held private send is never honored via the traced
+        // path (it is acked only by the recipient-only CDH proof on the private path).
+        let recipient = Identity::generate();
+        let attacker = Identity::generate();
+
+        let mut node = Node::new(Identity::generate());
+        let sender_addr = node.address();
+        // A default PRIVATE (§39) send: needs the recipient's prekey so it seals now (not deferred).
+        inject_prekey(&mut node, &recipient);
+        let mid = node
+            .send_message(recipient.address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap();
+        assert!(
+            node.store.contains(&mid),
+            "sender holds its own private send"
+        );
+        assert!(
+            node.store.get(&mid).unwrap().is_private(),
+            "and it is a §39 private (Broadcast-dst) bundle with a cleartext id"
+        );
+
+        // Attacker signs a GENUINE traced ACK (identity-signed, passes !is_private) naming that
+        // observed cleartext id. Must NOT be honored: the held send is Broadcast, not Device(attacker).
+        let forged = Bundle::create(
+            &attacker,
+            Destination::AckTo(sender_addr, mid),
+            &sender_addr,
+            &Payload::Ack {
+                for_bundle_id: mid,
+                status: 0,
+                delivery_hops: 1,
+                delivery_ms: 1,
+                proof: None,
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    is_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        node.on_bundle(77, forged);
+        assert!(
+            node.store.contains(&mid),
+            "a signed traced ACK naming a private send's cleartext id must NOT drop the private bundle"
         );
     }
 
