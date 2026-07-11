@@ -7516,6 +7516,52 @@ mod tests {
     }
 
     #[test]
+    fn a_flipped_scalar_twin_cannot_reuse_a_genuine_private_id() {
+        // core-protocol-r14-01: r13 bound the recognition HEADER into the wire id, but left the SignedInner
+        // SCALAR fields unbound. flags.request_ack is not carried inside the seal, so an attacker who
+        // captured a genuine ack-requested private bundle could clone it, flip request_ack -> false, keep
+        // the same id, and it still self-verified + was still recognized. Winning the keep-first slot at a
+        // recipient's chokepoint relay, that no-ack twin delivered the content but STRIPPED the recipient's
+        // ACK (sender stranded on "Sent") and suppressed the delivery vaccine (relay copies linger to TTL).
+        // r14 folds the WHOLE inner (every scalar) into the wire id, so any flipped field yields a
+        // different id and verify() rejects a twin that keeps the genuine id.
+        let bob = Identity::generate();
+        let (_alice, mid, genuine) = genuine_private_to(&bob);
+        assert!(
+            genuine.inner.flags.request_ack,
+            "the genuine send requested an ACK"
+        );
+
+        // Flip request_ack while KEEPING the genuine id field — the pre-r14 occupation attempt.
+        let mut twin = genuine.clone();
+        twin.inner.flags.request_ack = false;
+        assert_eq!(
+            twin.id(),
+            genuine.id(),
+            "the attacker keeps the genuine id field"
+        );
+        assert!(genuine.verify().is_ok(), "the genuine bundle verifies");
+        assert!(
+            twin.verify().is_err(),
+            "r14: a flipped-scalar twin no longer self-verifies — the id binds flags (and every scalar)"
+        );
+
+        // A relay rejects the twin at verify() before the store, so it can't occupy the id or strip the ACK.
+        let mut relay = Node::new(Identity::generate());
+        relay.on_bundle(1, twin);
+        assert!(
+            !relay.store.seen(&mid) && !relay.store.contains(&mid),
+            "the rejected twin never occupied the keep-first slot"
+        );
+        // The genuine ack-requesting copy is held + floodable, so the recipient still ACKs.
+        relay.on_bundle(2, genuine.clone());
+        assert!(
+            relay.store.get(&mid).unwrap().inner.flags.request_ack,
+            "the relay holds the genuine ack-requesting copy"
+        );
+    }
+
+    #[test]
     fn a_genuine_private_copy_delivers_exactly_once_and_a_header_chimera_never_reaches_the_inbox() {
         // r12-01 delivery-once is decoupled from `store.seen` via `delivered_private` (populated only by
         // recognized copies). With r13 a header chimera fails verify() at the recipient's gate too, so it

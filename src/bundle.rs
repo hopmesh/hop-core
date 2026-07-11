@@ -39,10 +39,11 @@ pub struct TraceHop {
 // unparseable by a v3 sender. No v3-decode window is offered because the Ack layout genuinely differs
 // (accepting v3 bytes and decoding as v4 would misread the trailing bytes) — mixed-fleet rollout is an
 // infra/version-negotiation concern, not a safe in-core transcode.
-// core-protocol-r13-01 bumped v4 -> v5: the §39 private WIRE id now binds the recognition header
-// (content_id ‖ ephemeral ‖ mailbox ‖ tag), not just the sealed payload, so a header-rewrite chimera
-// yields a DIFFERENT id and can no longer occupy a genuine private bundle's id at a keep-first relay.
-pub const BUNDLE_VERSION: u8 = 5;
+// core-protocol-r13-01 bumped v4 -> v5: the §39 private WIRE id binds the recognition header.
+// core-protocol-r14-01 bumped v5 -> v6: the private WIRE id now binds the ENTIRE inner (header + all
+// scalar fields, incl. flags), so no unbound field — e.g. a flipped flags.request_ack twin — can share a
+// genuine private id and shadow it at a keep-first relay. See compute_private_wire_id.
+pub const BUNDLE_VERSION: u8 = 6;
 
 /// Globally-unique bundle id: `BLAKE3(src || nonce || payload_hash)`.
 pub type BundleId = [u8; 32];
@@ -483,8 +484,9 @@ impl Bundle {
     ) -> Result<Self> {
         let plaintext = postcard::to_allocvec(payload)?;
         let sealed = crypto::seal(seal_to, &plaintext)?;
-        // r13-01: the recognition tag keys on the CONTENT id (sealed payload), then the wire id binds
-        // content_id + the whole header. Deriving the tag before the id avoids any id⇄tag circularity.
+        // r13-01: the recognition tag keys on the CONTENT id (sealed payload), computed before the id so
+        // there is no id⇄tag circularity. r14-01: the wire id then binds the WHOLE inner (header + every
+        // scalar field), so assemble the inner with a zeroed id and stamp the real id over it.
         let content_id = compute_private_content_id(&sealed);
         let (ephemeral, tag) = crypto::recognition_tag_sender(recipient_spk_pub, &content_id);
         let header = PrivateHeader {
@@ -492,12 +494,11 @@ impl Bundle {
             ephemeral,
             mailbox,
         };
-        let id = compute_private_wire_id(&header, &content_id);
 
-        let inner = SignedInner {
+        let mut inner = SignedInner {
             version: BUNDLE_VERSION,
             app: opts.app,
-            id,
+            id: [0u8; 32],
             src: [0u8; 32],
             dst: Destination::Broadcast,
             private: Some(header),
@@ -507,6 +508,7 @@ impl Bundle {
             priority: opts.priority,
             payload: sealed,
         };
+        inner.id = compute_private_wire_id(&inner);
         let env = Envelope {
             hop_limit: opts.hop_limit,
             custody: None,
@@ -611,25 +613,22 @@ impl Bundle {
         }
         // Private bundle (§39): not identity-signed. The id alone binds the sealed bytes;
         // the recipient is found by the recognition tag, not a signature or a dst.
-        if let Some(header) = &self.inner.private {
+        if self.inner.private.is_some() {
             // core-protocol-r10-01: enforce the §39 invariant that a private bundle is ALWAYS
             // Broadcast-dst (create_private sets exactly this; a private bundle floods and is routed by
-            // its recognition tag / mailbox prefix, never a dst). Because the private id binds ONLY the
-            // sealed payload (not src/dst) and there is no signature, an attacker could otherwise replay
-            // a real private message's sealed bytes with dst rewritten to Device/AckTo, keeping the same
-            // id. Such a chimera, accepted, could occupy the real message's id at a relay (keep-first
-            // store dedup) and then be traced-ACK-purged + immune-poisoned, denying delivery of the real
-            // §39 message network-wide. Reject the malformed shape at the gate.
+            // its recognition tag / mailbox prefix, never a dst). dst is now also folded into the id
+            // (r14), but keep this explicit gate so a malformed shape is rejected with a clear invariant.
             if !matches!(self.inner.dst, Destination::Broadcast) {
                 return Err(Error::BadSignature);
             }
-            // core-protocol-r13-01: the wire id binds the sealed payload AND the recognition header
-            // (content_id ‖ ephemeral ‖ mailbox ‖ tag). A chimera reusing the sealed bytes but rewriting
-            // the header keeps the same content_id yet MUST carry a different id (or fail this check), so
-            // it can never occupy the genuine bundle's id at a keep-first relay to shadow it (the 7th
-            // recognition-header chimera vector). A relay recomputes this with no recipient secret.
-            let content_id = compute_private_content_id(&self.inner.payload);
-            return if compute_private_wire_id(header, &content_id) == self.inner.id {
+            // core-protocol-r13-01/r14-01: the wire id binds the ENTIRE inner — the sealed payload, the
+            // recognition header (tag/ephemeral/mailbox), AND every scalar (app/created_at/lifetime_ms/
+            // flags/priority/...). A chimera reusing the sealed bytes but rewriting the header (r13) OR a
+            // twin flipping a scalar like flags.request_ack (r14) MUST carry a different id, so it can
+            // never occupy the genuine bundle's id at a keep-first relay to shadow it. A relay recomputes
+            // this with no recipient secret; there is no signature, so this id-recomputation IS the
+            // integrity check for an unsigned private bundle.
+            return if compute_private_wire_id(&self.inner) == self.inner.id {
                 Ok(())
             } else {
                 Err(Error::BadSignature)
@@ -764,27 +763,26 @@ fn compute_private_content_id(sealed: &Sealed) -> BundleId {
     *hasher.finalize().as_bytes()
 }
 
-/// §39 private WIRE id (core-protocol-r13-01): `BLAKE3(domain ‖ content_id ‖ ephemeral ‖ mailbox ‖ tag)`.
-/// This is the bundle's on-wire `id`. Binding the recognition header means a chimera that reuses a
-/// genuine bundle's sealed bytes but rewrites the header (tag/ephemeral/mailbox) to garbage yields a
-/// DIFFERENT id — so it floods as its own, simply-unrecognized bundle instead of colliding with and
-/// (at a keep-first relay store) shadowing the genuine copy. Any relay recomputes this with NO secret
-/// and `verify()` rejects a bundle whose id doesn't match its own header, closing the class at the gate.
-fn compute_private_wire_id(header: &PrivateHeader, content_id: &BundleId) -> BundleId {
+/// §39 private WIRE id (core-protocol-r13-01 + r14-01): `BLAKE3(domain ‖ postcard(inner with id zeroed))`.
+/// This is the bundle's on-wire `id`. A private bundle carries NO signature, so its id is its ONLY
+/// integrity check — it must therefore commit to the ENTIRE [`SignedInner`]: the sealed payload, the
+/// recognition header (`tag`/`ephemeral`/`mailbox`, inside `private`), AND every scalar field
+/// (`version`/`app`/`src`/`dst`/`created_at`/`lifetime_ms`/`flags`/`priority`). Any tamper — a rewritten
+/// recognition header (the r13 chimera class) OR a flipped scalar such as `flags.request_ack` (the r14
+/// twin, which stripped the recipient's ACK + the delivery vaccine) — yields a DIFFERENT id, so the twin
+/// floods as its own bundle and can never occupy the genuine id at a keep-first relay store. Any relay
+/// recomputes this with NO secret, and `verify()` rejects a bundle whose id doesn't match its own bytes,
+/// closing the whole tampering class at the gate. Hashing the postcard encoding (with `id` zeroed to
+/// break the self-reference) auto-binds any field added to `SignedInner` later, so the id can never again
+/// silently leave a mutable field unbound.
+fn compute_private_wire_id(inner: &SignedInner) -> BundleId {
+    let mut zeroed = inner.clone();
+    zeroed.id = [0u8; 32];
+    let bytes = postcard::to_allocvec(&zeroed)
+        .expect("a SignedInner that decoded from the wire always re-serializes");
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"hop private bundle wire-id v1");
-    hasher.update(content_id);
-    hasher.update(&header.ephemeral);
-    match &header.mailbox {
-        Some(m) => {
-            hasher.update(&[1u8]);
-            hasher.update(m);
-        }
-        None => {
-            hasher.update(&[0u8]);
-        }
-    }
-    hasher.update(&header.tag);
+    hasher.update(b"hop private bundle wire-id v2");
+    hasher.update(&bytes);
     *hasher.finalize().as_bytes()
 }
 
