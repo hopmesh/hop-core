@@ -638,7 +638,19 @@ impl Bundle {
         // so a tampered anti-packet is rejected. The token is matched against each held bundle's tag at
         // drop time; no plaintext delivered id rides in the clear.
         if let Destination::Vaccine(token) = &self.inner.dst {
-            return if compute_vaccine_id(token) == self.inner.id {
+            // core-protocol-r15-01: the vaccine id binds ONLY the token (by design — so every re-emitted
+            // vaccine for one delivery dedups to a single flood), which leaves the rest of the bundle
+            // unbound and, like any unsigned self-verifying id, forgeable in SHAPE. A same-id twin that
+            // flips `is_ack` to false passes the id check yet skips the entire is_ack-gated resolve/drop
+            // in on_bundle, so it marks the vaccine id `seen` WITHOUT purging — then the genuine
+            // anti-packet is deduped out and the delivered §39 bundle lingers + re-floods to TTL
+            // (epidemic recovery defeated). A payload-bearing twin would similarly amplify the flood.
+            // Enforce the canonical vaccine shape at the gate: it IS an ack, it is anonymous (no src),
+            // and it carries no payload — exactly what `create_vaccine` builds.
+            let canonical = self.inner.flags.is_ack
+                && self.inner.src == [0u8; 32]
+                && self.inner.payload.ciphertext.is_empty();
+            return if canonical && compute_vaccine_id(token) == self.inner.id {
                 Ok(())
             } else {
                 Err(Error::BadSignature)
@@ -1216,6 +1228,49 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&StreamKind::WebSocket).unwrap(),
             vec![1]
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_vaccine_twin_is_rejected_at_verify() {
+        // core-protocol-r15-01: the vaccine id = BLAKE3(domain ‖ token) binds ONLY the token, so every
+        // field but the token is unbound on this unsigned, self-verifying bundle. Pre-r15 an attacker who
+        // captured a genuine vaccine's (cleartext) token could mint a same-id twin with is_ack flipped
+        // OFF: it passed verify(), skipped the is_ack-gated resolve/drop, and marked the vaccine id `seen`
+        // — so the genuine anti-packet was later deduped out and the delivered §39 bundle was never purged
+        // (epidemic recovery defeated). r15 enforces the canonical vaccine shape at verify().
+        let token = [7u8; 32];
+        let genuine = Bundle::create_vaccine(token, BundleOpts::default());
+        assert!(genuine.verify().is_ok(), "a genuine vaccine verifies");
+        assert!(genuine.inner.flags.is_ack, "a genuine vaccine is an ack");
+
+        // Same token => same id, but is_ack flipped off — the resolve-suppression twin.
+        let mut no_ack = genuine.clone();
+        no_ack.inner.flags.is_ack = false;
+        assert_eq!(
+            no_ack.id(),
+            genuine.id(),
+            "the twin keeps the genuine vaccine id (the occupation attempt)"
+        );
+        assert!(
+            no_ack.verify().is_err(),
+            "r15: a non-ack vaccine twin is rejected — it can no longer occupy the vaccine id's seen slot"
+        );
+
+        // A payload-bearing twin (flood amplification) is rejected too.
+        let mut bloated = genuine.clone();
+        bloated.inner.payload.ciphertext = vec![0u8; 4096];
+        assert!(
+            bloated.verify().is_err(),
+            "r15: a vaccine carrying a payload is rejected (no flood amplification)"
+        );
+
+        // A non-anonymous twin (src set) is rejected.
+        let mut with_src = genuine.clone();
+        with_src.inner.src = [9u8; 32];
+        assert!(
+            with_src.verify().is_err(),
+            "r15: a vaccine must be anonymous (no src)"
         );
     }
 }
