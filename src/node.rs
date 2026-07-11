@@ -4031,7 +4031,7 @@ impl<S: Store> Node<S> {
                     // (re-)set and retransmit continues until lifetime, which is safe and self-correcting.
                     let authorized = !bundle.is_private()
                         && matches!(
-                            self.store.get(&for_bundle_id).map(|b| b.inner.dst),
+                            self.store.get(&for_bundle_id).filter(|b| !b.is_private()).map(|b| b.inner.dst),
                             Some(Destination::Device(d)) if d == bundle.inner.src
                         );
                     if authorized {
@@ -4330,13 +4330,14 @@ impl<S: Store> Node<S> {
         if bundle.inner.flags.is_ack {
             match bundle.inner.dst {
                 Destination::AckTo(_, delivered) => {
-                    // core-protocol-r7-01: authorize before purging. If we still hold the acked bundle
-                    // and it is a Device(dst) (traced) bundle, honor this passing ack only when the
-                    // signer IS that dst; a forged ack from an observer must not purge (+ immune) the
-                    // real bundle at a relay that is actively carrying it. (Residual: a relay that does
-                    // NOT yet hold the bundle cannot authorize, so a forged ack can still immune-poison
-                    // it; the sender's retransmit, the immune TTL, and alternate routes bound that, and
-                    // this relay-side check stops the worst case of purging a relay mid-carry.)
+                    // core-protocol-r7/r8/r9/r10: authorize before purging. Purge + immune ONLY when we
+                    // hold the acked bundle, it was sent TRACED (a NON-private Device(dst) bundle), the
+                    // held dst == the ack's signer, and the ack is itself identity-signed. A relay that
+                    // does not hold the bundle (store.get None) authorizes nothing, so it never
+                    // immune-poisons an unheld id. A §39 private bundle we carry is Broadcast (r10-01
+                    // rejects a Device-dst private replay at the gate) and is never purged here; it is
+                    // vaccinated only by the token Vaccine on its own recognition tag. So no forged or
+                    // chimera ack can deny a real message's delivery via this path.
                     // core-protocol-r8-01: only an identity-signed ack has an authenticated src (see the
                     // origin path). A private-flagged AckTo chimera has an attacker-chosen src, so never
                     // let it purge a relay's held bundle; require the ack be identity-signed.
@@ -4348,7 +4349,7 @@ impl<S: Store> Node<S> {
                     // cleartext id purged + immune-poisoned the real §39 message mid-carry.
                     let authorized = !bundle.is_private()
                         && matches!(
-                            self.store.get(&delivered).map(|b| b.inner.dst),
+                            self.store.get(&delivered).filter(|b| !b.is_private()).map(|b| b.inner.dst),
                             Some(Destination::Device(d)) if d == bundle.inner.src
                         );
                     if authorized {
@@ -7516,15 +7517,69 @@ mod tests {
             chimera.is_private(),
             "chimera is private-flagged (src is not authenticated)"
         );
+        // r10-01: the §39 invariant (private => Broadcast-dst) is now enforced at the gate, so a
+        // private bundle with a rewritten AckTo/Device dst is rejected by verify() itself, before it
+        // can ever reach the honor path. (The honor-path !is_private + Device-match guards remain as
+        // defense in depth.)
         assert!(
-            chimera.verify().is_ok(),
-            "and it still passes verify() (the private branch binds only the sealed payload)"
+            chimera.verify().is_err(),
+            "verify() rejects a private bundle whose dst is not Broadcast (r10-01)"
         );
 
         node.on_bundle(77, chimera);
         assert!(
             node.store.contains(&mid),
             "a private-flagged chimera ack must NOT forge a traced delivery or drop the bundle"
+        );
+    }
+
+    #[test]
+    fn a_private_bundle_replayed_with_a_device_dst_is_rejected_at_the_gate() {
+        // core-protocol-r10-01: the private id binds ONLY the sealed payload (not src/dst) and private
+        // bundles are unsigned, so an attacker can replay a real §39 message's exact sealed bytes with
+        // dst rewritten to Device(attacker) - SAME id. If accepted + stored (keep-first dedup), that
+        // chimera would occupy the real message's id at a relay and could then be traced-ACK-purged +
+        // immune-poisoned, a network-wide DoS of the real private message. verify() now enforces the
+        // §39 invariant (private => Broadcast-dst) so the replay is rejected at ingest and can never be
+        // stored to pre-seed a relay.
+        let recipient = Identity::generate();
+        let attacker = Identity::generate();
+        let real = Bundle::create_private(
+            &recipient.address(),
+            &recipient.derive_prekey().public,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"secret".to_vec(),
+            },
+            Some(crypto::mailbox_route(&crypto::mailbox_tag(
+                &recipient.address(),
+                0,
+            ))),
+            BundleOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            real.verify().is_ok(),
+            "the genuine Broadcast private bundle verifies"
+        );
+
+        // Replay its sealed bytes with dst rewritten to Device(attacker): same id, no signature.
+        let mut replay = real.clone();
+        replay.inner.dst = Destination::AckTo([0u8; 32], real.id()); // any non-Broadcast dst
+        assert_eq!(
+            replay.id(),
+            real.id(),
+            "the private id is unchanged by the dst rewrite"
+        );
+        assert!(
+            replay.verify().is_err(),
+            "a private bundle whose dst is not Broadcast is rejected at the gate (cannot pre-seed)"
+        );
+        let mut replay2 = real.clone();
+        replay2.inner.dst = Destination::Device(attacker.address());
+        assert!(
+            replay2.verify().is_err(),
+            "including a Device-dst replay (the r10 pre-seed shape)"
         );
     }
 

@@ -593,6 +593,17 @@ impl Bundle {
         // Private bundle (§39): not identity-signed. The id alone binds the sealed bytes;
         // the recipient is found by the recognition tag, not a signature or a dst.
         if self.inner.private.is_some() {
+            // core-protocol-r10-01: enforce the §39 invariant that a private bundle is ALWAYS
+            // Broadcast-dst (create_private sets exactly this; a private bundle floods and is routed by
+            // its recognition tag / mailbox prefix, never a dst). Because the private id binds ONLY the
+            // sealed payload (not src/dst) and there is no signature, an attacker could otherwise replay
+            // a real private message's sealed bytes with dst rewritten to Device/AckTo, keeping the same
+            // id. Such a chimera, accepted, could occupy the real message's id at a relay (keep-first
+            // store dedup) and then be traced-ACK-purged + immune-poisoned, denying delivery of the real
+            // §39 message network-wide. Reject the malformed shape at the gate.
+            if !matches!(self.inner.dst, Destination::Broadcast) {
+                return Err(Error::BadSignature);
+            }
             return if compute_private_id(&self.inner.payload) == self.inner.id {
                 Ok(())
             } else {
