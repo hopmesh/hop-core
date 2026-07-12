@@ -518,13 +518,19 @@ fn b64d(s: &str) -> Option<Vec<u8>> {
 }
 
 fn hexd(s: &str) -> Option<Vec<u8>> {
-    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if !s.len().is_multiple_of(2) {
+    // sec: decode over BYTES, not `&str` slices. `&s[i..i+2]` byte-indexes the string and, on a hostile
+    // DS-digest containing a multi-byte UTF-8 char, lands mid-character and PANICS before `from_str_radix`
+    // can reject it. Every `HnsAnswer` proof is attacker-controlled and reaches here unauthenticated
+    // (provide_dns_proof -> parse_doh -> parse_ds), so a `{"data":"1 8 2 a\u{ff}b"}` would panic the
+    // resolver. Filter ASCII whitespace and decode each pair via `to_digit`, which keeps every remaining
+    // unit exactly one byte wide, so a non-hex or non-ASCII byte is REJECTED (None), never a panic.
+    let digits: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if !digits.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    digits
+        .chunks_exact(2)
+        .map(|p| Some(((p[0] as char).to_digit(16)? * 16 + (p[1] as char).to_digit(16)?) as u8))
         .collect()
 }
 
@@ -763,6 +769,34 @@ pub fn parse_doh(json: &str) -> Result<DohAnswer, DnssecError> {
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
+
+    #[test]
+    fn hexd_rejects_a_hostile_multibyte_digest_without_panicking() {
+        // A DS-digest field is attacker-controlled (any HnsAnswer proof) and can be any UTF-8. The old
+        // hexd byte-indexed a &str gated only on even byte length, so a multi-byte char landed mid-
+        // character and panicked. Assert every hostile shape returns None instead of panicking:
+        assert_eq!(
+            hexd("a\u{ff}b"),
+            None,
+            "multi-byte char (was: byte-index panic)"
+        );
+        assert_eq!(
+            hexd("\u{ff}\u{ff}"),
+            None,
+            "all multi-byte, even byte length"
+        );
+        assert_eq!(
+            hexd("de\u{2028}ad"),
+            None,
+            "unicode line separator embedded in hex"
+        );
+        assert_eq!(hexd("zz"), None, "even length, non-hex");
+        assert_eq!(hexd("abc"), None, "odd length");
+        // Valid hex still round-trips, ASCII whitespace still stripped.
+        assert_eq!(hexd("deadBEEF"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(hexd("de ad be ef"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(hexd(""), Some(vec![]));
+    }
 
     fn b64(s: &str) -> Vec<u8> {
         STANDARD.decode(s.replace([' ', '\n'], "")).unwrap()
