@@ -14,7 +14,7 @@
 //! and ACK-based reach build on top.
 
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Key, KeyInit, Nonce};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
@@ -216,7 +216,13 @@ pub fn verify_publish(
     let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
         return false;
     };
-    vk.verify(
+    // verify_strict, not verify: reject non-canonical / malleable signatures, matching the strict check
+    // the rest of the crate uses for identity signatures (crypto::verify at crypto.rs). Non-strict
+    // ed25519 admits a cofactored second S and small-order point encodings, so a keyless attacker who
+    // saw one valid hps publish could mint a DIFFERENT 64-byte signature that still verifies for the same
+    // message. Strict rejects those. It never rejects a signature sign_publish itself produced (those are
+    // always canonical), so this only tightens against forged variants.
+    vk.verify_strict(
         &publish_msg(path, nonce, ciphertext),
         &Signature::from_bytes(sig),
     )
