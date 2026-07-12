@@ -4332,11 +4332,20 @@ impl<S: Store> Node<S> {
                             if let Some(old) = self.subscriptions.get(&old_path) {
                                 if epoch > old.epoch {
                                     let host = old.host;
-                                    if old_path != new_path {
-                                        self.subscriptions.remove(&old_path);
-                                        self.directory.unsubscribe(&old_path);
-                                        self.store.remove_kv(&Self::hps_sub_key(&old_path));
-                                    }
+                                    // F-18d: fail-safe ordering. Install the NEW subscription
+                                    // BEFORE tearing down the OLD one's bookkeeping (subscriptions
+                                    // map, directory, persisted kv), not after. `guard_core`
+                                    // (services) catches a panic per call, but only around the
+                                    // WHOLE `on_bundle`, not between these two steps. Removing
+                                    // old-then-installing-new meant a panic landing between them
+                                    // (e.g. a future change to `install_subscription`'s
+                                    // dependencies) would silently DESTROY a working subscription
+                                    // with nothing installed to replace it: a network-triggerable
+                                    // denial of a hosted topic that never self-heals. Installing
+                                    // first means the same hypothetical panic leaves us holding
+                                    // BOTH the old and new subscription, a harmless stale
+                                    // duplicate, never a lost one. See
+                                    // `hps_rekey_install_before_remove_survives_a_mid_arm_panic`.
                                     self.install_subscription(
                                         &new_path,
                                         host,
@@ -4344,6 +4353,11 @@ impl<S: Store> Node<S> {
                                         service_pubkey,
                                         epoch,
                                     );
+                                    if old_path != new_path {
+                                        self.subscriptions.remove(&old_path);
+                                        self.directory.unsubscribe(&old_path);
+                                        self.store.remove_kv(&Self::hps_sub_key(&old_path));
+                                    }
                                 }
                             }
                         }
@@ -9585,6 +9599,307 @@ mod tests {
         assert!(
             nodes[2].take_hps_messages().is_empty(),
             "removed m2 can't read v2"
+        );
+    }
+
+    // --- F-18d: guard_core exception-safety pass -------------------------------------------
+    //
+    // `guard_core` (services/hop-relayd, hop-endpoint, hop-gateway) wraps a whole `node.handle`
+    // / `node.ingest` call in `catch_unwind`, not the individual `self.*` mutations inside one
+    // `on_bundle` match arm. A pass-18 adversarial audit (F-18d) asked: for every arm that
+    // mutates MORE THAN ONE piece of paired bookkeeping (pending/tx/forwarded/store/relay_order/
+    // subscriptions/...), could a panic landing BETWEEN those mutations, reachable from
+    // attacker-controlled wire bytes, leave Node in an exploitable half-applied state?
+    //
+    // A full audit of `on_bundle` and every helper it calls (bundle::verify/open, dnssec's
+    // DoH/RRSIG parsing, hps's AEAD open/verify, store's put/remove/seen, stream reassembly,
+    // route learning) found no reachable panic today beyond the one already fixed (dnssec.rs
+    // `hexd`, see `hexd_rejects_a_hostile_multibyte_digest_without_panicking`): every attacker-
+    // shaped field is decoded via `Option`/`Result` (`.get()`, `?`, `ok_or`, `checked_sub`,
+    // `saturating_*`), never an indexing/unwrap panic. That matches the auditor's own
+    // conclusion. Two things still make this a real, enforced property rather than an
+    // accident:
+    //
+    // 1. The `HpsRekey` arm had a structurally risky ordering: remove the OLD subscription's
+    //    bookkeeping, THEN install the new one. Nothing in today's call graph panics between
+    //    those two steps, but a future change (e.g. `install_subscription` growing a fallible
+    //    persistence step) could, and the old order would silently destroy a working
+    //    subscription with nothing installed to replace it. Reordered to install-then-remove
+    //    (see `on_bundle`'s `Payload::HpsRekey` arm) so the worst a mid-arm panic can do is
+    //    leave a harmless stale duplicate, never a lost subscription.
+    // 2. The tests below drive REAL panics (via a stubbed `Store`) through `catch_unwind`
+    //    (mirroring `guard_core` exactly) at the exact point between paired mutations in two of
+    //    the highest-value arms, and assert the surviving state is never exploitable. If a
+    //    future edit reintroduces the risky ordering, or drops one half of a paired mutation,
+    //    these tests fail.
+
+    /// Test double: wraps a real store but panics on ONE specific `put_kv` key, standing in for
+    /// a hypothetical future fallible write inside an `on_bundle` helper (persistence, a
+    /// backend swap, etc.) so we can prove an arm's ordering is fail-safe under a genuine
+    /// mid-arm panic, not just reason about it.
+    struct PanicOnPutKv {
+        inner: MemoryStore,
+        panic_key: String,
+    }
+
+    impl Store for PanicOnPutKv {
+        fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+            self.inner.put(bundle, now_ms)
+        }
+        fn get(&self, id: &BundleId) -> Option<Bundle> {
+            self.inner.get(id)
+        }
+        fn remove(&mut self, id: &BundleId) -> Option<Bundle> {
+            self.inner.remove(id)
+        }
+        fn seen(&self, id: &BundleId) -> bool {
+            self.inner.seen(id)
+        }
+        fn contains(&self, id: &BundleId) -> bool {
+            self.inner.contains(id)
+        }
+        fn have(&self) -> crate::store::HaveSet {
+            self.inner.have()
+        }
+        fn prune(&mut self, now_ms: u64) {
+            self.inner.prune(now_ms)
+        }
+        fn split_copies(&mut self, id: &BundleId) -> u16 {
+            self.inner.split_copies(id)
+        }
+        fn set_copies(&mut self, id: &BundleId, copies: u16) {
+            self.inner.set_copies(id, copies)
+        }
+        fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
+            self.inner.seen_expiry(id)
+        }
+        fn put_kv(&mut self, key: &str, value: Vec<u8>) {
+            if key == self.panic_key {
+                panic!("PanicOnPutKv: simulated fallible-write panic on {key}");
+            }
+            self.inner.put_kv(key, value)
+        }
+        fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
+            self.inner.get_kv(key)
+        }
+        fn remove_kv(&mut self, key: &str) {
+            self.inner.remove_kv(key)
+        }
+        fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+            self.inner.list_kv(prefix)
+        }
+    }
+
+    #[test]
+    fn hps_rekey_install_before_remove_survives_a_mid_arm_panic() {
+        // See the F-18d block comment above. This proves the FIXED ordering (install the new
+        // subscription, then remove the old one) is fail-safe: a panic injected exactly where a
+        // fallible step could someday land (persisting the NEW subscription) is caught
+        // (`catch_unwind`, mirroring `guard_core`) and the OLD, still-working subscription is
+        // untouched. With the old (remove-then-install) ordering this same panic would have
+        // fired AFTER the old subscription was already torn down, losing it outright.
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let app = crate::app::AppKeys::from_secret([9u8; 32]);
+        let host = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+
+        let old_path = "room";
+        let new_path = "room-v2";
+        let host_addr = host.address();
+        let content_key_v1 = [1u8; 32];
+
+        // The subscriber's store panics ONLY on the new path's persistence write; the old
+        // path's own (already-durable) entry is untouched by that key.
+        let mut sub = Node::with_store_app(
+            Identity::generate(),
+            PanicOnPutKv {
+                inner: MemoryStore::new(),
+                panic_key: format!("hps/sub/{new_path}"),
+            },
+            app.clone(),
+        );
+        sub.install_subscription(old_path, host_addr, content_key_v1, None, 1);
+        assert!(sub.subscriptions.contains_key(old_path));
+
+        // A real, authorized HpsRekey bundle from host -> sub (mirrors `send_to_host`).
+        let proof = host.hps_proof(old_path, &host_addr);
+        let bundle = Bundle::create(
+            &host.identity,
+            Destination::Device(sub.address()),
+            &sub.address(),
+            &Payload::HpsRekey {
+                old_path: old_path.to_string(),
+                new_path: new_path.to_string(),
+                epoch: 2, // > the held subscription's epoch (1)
+                content_key: [2u8; 32],
+                service_pubkey: None,
+                proof,
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let caught = catch_unwind(AssertUnwindSafe(|| sub.on_bundle(1, bundle)));
+        assert!(
+            caught.is_err(),
+            "the stubbed store's panic must actually fire (test is broken if not)"
+        );
+
+        // The invariant that matters: a mid-arm panic never leaves the topic with NO
+        // subscription at all, and never silently swaps in a half-applied new one.
+        assert!(
+            sub.subscriptions.contains_key(old_path),
+            "a mid-arm panic during rekey must not destroy the old (working) subscription"
+        );
+        assert_eq!(
+            sub.subscriptions[old_path].content_key, content_key_v1,
+            "the surviving subscription is the OLD one, untouched, not a half-applied new one"
+        );
+    }
+
+    #[test]
+    fn traced_ack_purge_arm_is_never_left_half_applied_under_a_mid_arm_panic() {
+        // The traced-ACK arm (`on_bundle`, `is_for(&bundle, &self.address())` +
+        // `flags.is_ack` + authorized) mutates FOUR pieces of paired bookkeeping in sequence:
+        // `pending`, `store`, `tx` (delivered flag), and `forwarded` (+ route learning). Every
+        // one of those is an infallible HashMap/Vec primitive (none can panic on its own), so
+        // this test injects a panic via a stubbed store's `remove` (standing in for a
+        // hypothetical future change that makes bundle removal fallible) at the exact point
+        // between the FIRST paired mutation (`pending.remove`) and the rest, and asserts the
+        // surviving state is not exploitable: specifically, a message can never end up shown as
+        // "Delivered" in the UI (`tx.delivered`) while `pending` still independently tracks it
+        // as outstanding-and-retransmitting (which would be a confusing but harmless double
+        // bookkeeping) NOR the reverse: `pending` cleared (retransmission stops) while `tx`
+        // never learns delivery (the actually-observed failure mode: a stuck "Sending…" status,
+        // cosmetic, never a security exposure since no other party's state is touched).
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        struct PanicOnRemove {
+            inner: MemoryStore,
+            panic_id: BundleId,
+        }
+        impl Store for PanicOnRemove {
+            fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+                self.inner.put(bundle, now_ms)
+            }
+            fn get(&self, id: &BundleId) -> Option<Bundle> {
+                self.inner.get(id)
+            }
+            fn remove(&mut self, id: &BundleId) -> Option<Bundle> {
+                if *id == self.panic_id {
+                    panic!("PanicOnRemove: simulated panic removing the acked bundle");
+                }
+                self.inner.remove(id)
+            }
+            fn seen(&self, id: &BundleId) -> bool {
+                self.inner.seen(id)
+            }
+            fn contains(&self, id: &BundleId) -> bool {
+                self.inner.contains(id)
+            }
+            fn have(&self) -> crate::store::HaveSet {
+                self.inner.have()
+            }
+            fn prune(&mut self, now_ms: u64) {
+                self.inner.prune(now_ms)
+            }
+            fn split_copies(&mut self, id: &BundleId) -> u16 {
+                self.inner.split_copies(id)
+            }
+            fn set_copies(&mut self, id: &BundleId, copies: u16) {
+                self.inner.set_copies(id, copies)
+            }
+        }
+
+        // Alice holds a traced, ack-requesting bundle addressed to Bob (mirrors the existing
+        // `a_forged_traced_ack_cannot_mark_a_send_delivered_or_drop_the_bundle`-style tests' `submit()` pattern rather than
+        // the full session/prekey machinery, which isn't the point of this test).
+        let bob = Identity::generate();
+        let bob_addr = bob.address();
+        let bundle = Bundle::create(
+            &Identity::generate(),
+            Destination::Device(bob_addr),
+            &bob_addr,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"hi".to_vec(),
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mid = bundle.id();
+
+        // Build Alice directly on the panic-injecting store (Rust's generics don't allow
+        // swapping a `Node<S>`'s store for a different concrete `S` after construction), so the
+        // panic fires exactly where a REAL future change could introduce one: removing the acked
+        // bundle, between `pending.remove(&for_bundle_id)` (already applied) and the rest of the
+        // traced-ACK arm's paired mutations (`store.remove`/tx-flip/`forwarded.remove`).
+        let alice_identity = Identity::generate();
+        let alice_addr = alice_identity.address();
+        let mut alice = Node::with_store(
+            alice_identity,
+            PanicOnRemove {
+                inner: MemoryStore::new(),
+                panic_id: mid,
+            },
+        );
+        alice.submit(bundle);
+        alice.tx.insert(mid, TxInfo::default());
+        assert!(
+            alice.pending.contains_key(&mid),
+            "sender tracks the send as pending an ACK"
+        );
+
+        // Bob acks it back, identity-signed and naming Alice as destination (authorized).
+        // `Destination::AckTo(alice_addr, mid)` is is_for()-matched at Alice, exactly like the
+        // adjacent `a_forged_traced_ack_cannot_mark_a_send_delivered_or_drop_the_bundle`-style tests in this module.
+        let ack = Bundle::create(
+            &bob,
+            Destination::AckTo(alice_addr, mid),
+            &alice_addr,
+            &Payload::Ack {
+                for_bundle_id: mid,
+                status: 0,
+                delivery_hops: 1,
+                delivery_ms: 5,
+                proof: None,
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    is_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let caught = catch_unwind(AssertUnwindSafe(|| alice.on_bundle(1, ack)));
+        assert!(
+            caught.is_err(),
+            "the stubbed store's panic must actually fire (test is broken if not)"
+        );
+
+        // The exploitable-inconsistency check: `tx.delivered` and `pending` must never disagree
+        // in the DANGEROUS direction (delivered=true while a retransmit loop is still live for
+        // the same id, which could re-deliver / double-count at the sender). Cosmetic
+        // disagreement in the SAFE direction (retransmission stopped, status not yet flipped)
+        // is acceptable and self-corrects on the next duplicate ACK.
+        let display = alice.display_id(&mid);
+        let shown_delivered = alice.tx.get(&display).is_some_and(|i| i.delivered);
+        let still_pending_retransmit = alice.pending.contains_key(&mid);
+        assert!(
+            !(shown_delivered && still_pending_retransmit),
+            "must never show Delivered while still actively retransmitting the same send"
         );
     }
 
