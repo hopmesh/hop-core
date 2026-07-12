@@ -13,11 +13,23 @@
 
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+// ed25519-dalek 3 / x25519-dalek 3 need a `CryptoRng` from THEIR rand_core (0.10), which dropped
+// `OsRng` entirely; `getrandom::SysRng` (made infallible via `UnwrapErr`) is the replacement the
+// dalek crates' own docs point at. Same OS CSPRNG either way as the workspace `rand_core::OsRng`
+// used elsewhere in this file for plain `RngCore::fill_bytes`; this only satisfies the newer
+// `CryptoRng` bound the dalek crates now require of their key-generation entry points, so it
+// changes no key material or wire bytes.
+use getrandom::{rand_core::UnwrapErr, SysRng};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 use crate::error::{Error, Result};
+
+/// A fresh CSPRNG handle satisfying `{ed25519,x25519}_dalek`'s `CryptoRng` bound.
+fn dalek_rng() -> UnwrapErr<SysRng> {
+    UnwrapErr(SysRng)
+}
 
 /// 32-byte Ed25519 public key. A node's address / device key.
 pub type PubKeyBytes = [u8; 32];
@@ -49,7 +61,7 @@ impl Identity {
     /// Generate a fresh identity from the OS CSPRNG.
     pub fn generate() -> Self {
         Self {
-            signing: SigningKey::generate(&mut OsRng),
+            signing: SigningKey::generate(&mut dalek_rng()),
         }
     }
 
@@ -96,7 +108,7 @@ impl Identity {
     /// (DESIGN.md §25): a random X25519 keypair whose public half is signed by this
     /// identity. Use [`Identity::derive_prekey`] for a launch-stable one.
     pub fn generate_prekey(&self) -> SignedPreKey {
-        let secret = StaticSecret::random_from_rng(OsRng);
+        let secret = StaticSecret::random_from_rng(&mut dalek_rng());
         let public = XPublicKey::from(&secret).to_bytes();
         let sig = self.sign(&public);
         SignedPreKey {
@@ -153,12 +165,9 @@ impl Identity {
             .x_secret()
             .diffie_hellman(&XPublicKey::from(sealed.ephemeral_pub));
         let sym = blake3::hash(shared.as_bytes());
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(sym.as_bytes()));
+        let cipher = ChaCha20Poly1305::new(&Key::from(*sym.as_bytes()));
         cipher
-            .decrypt(
-                Nonce::from_slice(&sealed.nonce),
-                sealed.ciphertext.as_slice(),
-            )
+            .decrypt(&Nonce::from(sealed.nonce), sealed.ciphertext.as_slice())
             .map_err(|_| Error::Crypto("decrypt failed"))
     }
 }
@@ -184,17 +193,17 @@ pub fn address_to_x(address: &PubKeyBytes) -> Option<XPubKeyBytes> {
 /// that address's secret can [`Identity::open`] it.
 pub fn seal(to_address: &PubKeyBytes, plaintext: &[u8]) -> Result<Sealed> {
     let recipient = address_to_x(to_address).ok_or(Error::InvalidKey)?;
-    let ephemeral = StaticSecret::random_from_rng(OsRng);
+    let ephemeral = StaticSecret::random_from_rng(&mut dalek_rng());
     let ephemeral_pub = XPublicKey::from(&ephemeral).to_bytes();
     let shared = ephemeral.diffie_hellman(&XPublicKey::from(recipient));
     let sym = blake3::hash(shared.as_bytes());
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(sym.as_bytes()));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*sym.as_bytes()));
 
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
 
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(&Nonce::from(nonce), plaintext)
         .map_err(|_| Error::Crypto("encrypt failed"))?;
 
     Ok(Sealed {
@@ -296,7 +305,7 @@ pub fn x3dh_initiate(sender: &Identity, bundle: &PreKeyBundle) -> Result<(XPubKe
     let ik_b = address_to_x(&bundle.address).ok_or(Error::InvalidKey)?;
     let spk_b = XPublicKey::from(bundle.spk_pub);
     let ik_a = sender.x_secret();
-    let ek = StaticSecret::random_from_rng(OsRng);
+    let ek = StaticSecret::random_from_rng(&mut dalek_rng());
     let ek_pub = XPublicKey::from(&ek).to_bytes();
 
     let dh1 = ik_a.diffie_hellman(&spk_b); // IK_a · SPK_b
@@ -386,7 +395,7 @@ pub fn recognition_tag_sender(
     recipient_spk_pub: &XPubKeyBytes,
     bundle_id: &[u8; 32],
 ) -> (XPubKeyBytes, Tag) {
-    let ephemeral = StaticSecret::random_from_rng(OsRng);
+    let ephemeral = StaticSecret::random_from_rng(&mut dalek_rng());
     let eph_pub = XPublicKey::from(&ephemeral).to_bytes();
     let shared = ephemeral.diffie_hellman(&XPublicKey::from(*recipient_spk_pub));
     (
@@ -486,7 +495,7 @@ mod tests {
         use sha2::{Digest, Sha512};
         use x25519_dalek::{PublicKey as XP, StaticSecret};
 
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut dalek_rng());
         let h = Sha512::digest(sk.to_bytes());
         let mut s = [0u8; 32];
         s.copy_from_slice(&h[..32]);

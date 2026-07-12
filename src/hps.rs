@@ -166,19 +166,19 @@ impl ServiceConfig {
 
 /// Encrypt `plaintext` under the content `key`, returning `(nonce, ciphertext)`.
 pub fn seal_content(key: &ContentKey, plaintext: &[u8]) -> ([u8; 12], Vec<u8>) {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(&Nonce::from(nonce), plaintext)
         .expect("chacha20poly1305 encrypt");
     (nonce, ct)
 }
 
 /// Decrypt a content-keyed message; `None` if the key is wrong or the ciphertext was tampered.
 pub fn open_content(key: &ContentKey, nonce: &[u8; 12], ciphertext: &[u8]) -> Option<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    cipher.decrypt(Nonce::from_slice(nonce), ciphertext).ok()
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    cipher.decrypt(&Nonce::from(*nonce), ciphertext).ok()
 }
 
 /// The bytes a publish signature covers: the topic path, nonce, and ciphertext — so a signature

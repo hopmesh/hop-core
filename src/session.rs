@@ -23,11 +23,19 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
     ChaCha20Poly1305, Key, KeyInit, Nonce,
 };
+use getrandom::{rand_core::UnwrapErr, SysRng};
 use serde::{Deserialize, Serialize};
+// x25519-dalek 3 needs a `CryptoRng` from its own rand_core (0.10), which dropped `OsRng`
+// entirely; see the note in crypto.rs for why `getrandom::SysRng` is the replacement.
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 use crate::crypto::XPubKeyBytes;
 use crate::error::{Error, Result};
+
+/// A fresh CSPRNG handle satisfying `x25519_dalek`'s `CryptoRng` bound.
+fn dalek_rng() -> UnwrapErr<SysRng> {
+    UnwrapErr(SysRng)
+}
 
 /// Cap on retained skipped-message keys, to bound memory against a peer that
 /// claims huge message numbers.
@@ -104,7 +112,7 @@ impl Session {
     /// signed prekey public (its initial ratchet key). Sets up a sending chain so
     /// the first message can go out immediately.
     pub fn init_initiator(root: [u8; 32], remote_dh: XPubKeyBytes) -> Self {
-        let dh_self = StaticSecret::random_from_rng(rand_core::OsRng);
+        let dh_self = StaticSecret::random_from_rng(&mut dalek_rng());
         let dh_self_pub = XPublicKey::from(&dh_self).to_bytes();
         let dh_out = dh_self.diffie_hellman(&XPublicKey::from(remote_dh));
         let (rk, cks) = kdf_rk(&root, dh_out.as_bytes());
@@ -220,7 +228,7 @@ impl Session {
         self.rk = rk;
         self.ckr = Some(ckr);
 
-        let next = StaticSecret::random_from_rng(rand_core::OsRng);
+        let next = StaticSecret::random_from_rng(&mut dalek_rng());
         self.dh_self_pub = XPublicKey::from(&next).to_bytes();
         let dh_send = next.diffie_hellman(&XPublicKey::from(remote));
         let (rk2, cks) = kdf_rk(&self.rk, dh_send.as_bytes());
@@ -251,16 +259,16 @@ fn kdf_ck(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 /// nonce) pair is unique because each `mk` is used exactly once). The header is
 /// authenticated as associated data.
 fn aead_encrypt(mk: &[u8; 32], pt: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(mk));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*mk));
     cipher
-        .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: pt, aad })
+        .encrypt(&Nonce::from([0u8; 12]), Payload { msg: pt, aad })
         .map_err(|_| Error::Crypto("session encrypt failed"))
 }
 
 fn aead_decrypt(mk: &[u8; 32], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(mk));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*mk));
     cipher
-        .decrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: ct, aad })
+        .decrypt(&Nonce::from([0u8; 12]), Payload { msg: ct, aad })
         .map_err(|_| Error::Crypto("session decrypt failed"))
 }
 

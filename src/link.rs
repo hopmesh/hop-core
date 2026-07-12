@@ -44,7 +44,9 @@ impl LinkHandshake {
             .parse()
             .map_err(|_| Error::Crypto("noise params"))?;
         let secret = identity.link_secret();
-        let builder = snow::Builder::new(params).local_private_key(&secret);
+        let builder = snow::Builder::new(params)
+            .local_private_key(&secret)
+            .map_err(noise_err)?;
         let inner = if initiator {
             builder.build_initiator()
         } else {

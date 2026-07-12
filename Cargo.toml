@@ -15,6 +15,11 @@ ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
 chacha20poly1305.workspace = true
 rand_core.workspace = true
+# ed25519-dalek 3 / x25519-dalek 3 need a `CryptoRng` from THEIR rand_core (0.10), which dropped
+# `OsRng` entirely. `getrandom::SysRng` (wrapped `UnwrapErr`-infallible) is the replacement the
+# dalek crates' own docs point at: same OS CSPRNG as the workspace `rand_core::OsRng` used
+# elsewhere in this crate, just reached through the newer entry point.
+getrandom = { version = "0.4", features = ["sys_rng"] }
 thiserror.workspace = true
 miniz_oxide.workspace = true
 snow.workspace = true
@@ -22,7 +27,12 @@ snow.workspace = true
 # multi-hop HNS resolution is trustless. RSA/SHA-256 (alg 8) covers the .sh/hopme.sh chain;
 # ECDSA P-256/SHA-256 (alg 13) covers most modern zones (Cloudflare etc.).
 rsa = "0.9"
-p256 = { version = "0.13", features = ["ecdsa"] }
+# rsa 0.9's trait bounds (Digest/AssociatedOid) are pinned to the digest 0.10 generation, which is
+# a major behind the workspace `sha2` (0.11, digest 0.11). Same SHA-256 algorithm and output bytes
+# either way, so this is a second, differently-named build of the SAME crate purely to satisfy
+# rsa's older trait bound; it changes no verification behavior or wire bytes.
+sha2-rsa-compat = { package = "sha2", version = "0.10", features = ["oid"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 # Decode the baked root trust anchors (base64) and DNSSEC test vectors.
 base64 = "0.22"
 # Parse DoH (DNS-over-HTTPS) JSON responses in core, so the host stays a dumb fetcher.
@@ -31,3 +41,15 @@ serde_json = "1"
 bs58 = "0.5"
 # Wipe secret key material (prekey secrets, retired prekeys) from memory on drop (F-08).
 zeroize = "1"
+
+# On wasm32 the `getrandom` 0.4 dependency above (used to satisfy the dalek crates' CryptoRng
+# bound) needs the browser crypto.getRandomValues backend selected explicitly, the same way
+# hop-wasm/Cargo.toml already does for its own (separate, older) getrandom 0.2 need. Without this,
+# `getrandom`'s default backend selection fails to build for wasm32-unknown-unknown at all.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+# snow 0.10 (bumped from 0.9) pulls its OWN `getrandom` for Noise ephemeral-key randomness, a
+# THIRD major version (0.3) alongside the 0.4 above and the 0.2 rand_core 0.6 still uses. Never
+# referenced directly from this crate's source; declared purely so Cargo's feature unification
+# flips on the wasm_js backend for whichever exact getrandom 0.3.x snow resolves to.
+getrandom-for-snow = { package = "getrandom", version = "0.3", features = ["wasm_js"] }

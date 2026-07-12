@@ -18,7 +18,11 @@
 //! third-party domains (today the only `_hopaddress` zone is the project's own, non-wildcard).
 
 use rsa::{BigUint, Pkcs1v15Sign, RsaPublicKey};
-use sha2::{Digest, Sha256};
+// `rsa` 0.9's Digest/AssociatedOid bounds are pinned to the digest 0.10 generation, one major
+// behind the workspace `sha2` (0.11). Same algorithm, same output bytes: `sha2-rsa-compat` is a
+// second build of the plain `sha2` crate at 0.10, aliased locally, purely so `Sha256` satisfies
+// rsa's older trait bound.
+use sha2_rsa_compat::{Digest, Sha256};
 
 /// DNSSEC algorithm numbers we recognize (IANA DNSSEC Algorithm Numbers).
 pub const ALG_RSASHA256: u8 = 8;
@@ -770,6 +774,15 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
 
+    // ed25519-dalek 3 / the ecdsa crate need a `CryptoRng` from THEIR rand_core (0.10), which
+    // dropped `OsRng` entirely; `getrandom::SysRng` (made infallible via `UnwrapErr`) is the
+    // replacement both crates' own docs point at. Same OS CSPRNG as the workspace
+    // `rand_core::OsRng`, just reached through the newer entry point (test-only key generation,
+    // no wire format involved).
+    fn dalek_rng() -> getrandom::rand_core::UnwrapErr<getrandom::SysRng> {
+        getrandom::rand_core::UnwrapErr(getrandom::SysRng)
+    }
+
     #[test]
     fn hexd_rejects_a_hostile_multibyte_digest_without_panicking() {
         // A DS-digest field is attacker-controlled (any HnsAnswer proof) and can be any UTF-8. The old
@@ -1170,8 +1183,9 @@ mod tests {
         // Generate a P-256 zone key, sign a TXT RRset (ECDSA/SHA-256, alg 13), and verify —
         // covering the algorithm most modern zones (Cloudflare etc.) use.
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-        let sk = SigningKey::random(&mut rand_core::OsRng);
-        let point = sk.verifying_key().to_encoded_point(false); // 0x04 ‖ x ‖ y
+        use p256::elliptic_curve::Generate;
+        let sk = SigningKey::generate_from_rng(&mut dalek_rng());
+        let point = sk.verifying_key().to_sec1_point(false); // 0x04 ‖ x ‖ y
         let dnskey = Dnskey {
             flags: 256,
             protocol: 3,
@@ -1218,7 +1232,7 @@ mod tests {
         // D-dnssec: Ed25519 (alg 15, RFC 8080) — DNSKEY carries the raw 32-byte public key, the
         // RRSIG is a 64-byte pure Ed25519 signature over the signed data.
         use ed25519_dalek::{Signer, SigningKey};
-        let sk = SigningKey::generate(&mut rand_core::OsRng);
+        let sk = SigningKey::generate(&mut dalek_rng());
         let dnskey = Dnskey {
             flags: 256,
             protocol: 3,
