@@ -471,4 +471,178 @@ mod tests {
             "Box<dyn Store>::flush must forward to the concrete impl"
         );
     }
+
+    #[test]
+    fn boxed_store_forwards_every_trait_method_not_just_flush() {
+        // The previous test (boxed_store_forwards_flush) only proves `flush` forwards. Every OTHER
+        // method in `impl Store for Box<dyn Store>` has to forward too, or a `Node<Box<dyn Store>>`
+        // silently falls back to the trait's inert defaults instead of the real backend (e.g. a
+        // SQLite-backed store's kv reads would just go missing behind the box).
+        let mut boxed: Box<dyn Store> = Box::new(MemoryStore::new());
+
+        let b = bundle(3_600_000); // default copies = 8
+        assert!(boxed.put(b.clone(), 0), "put forwards");
+        assert!(
+            !boxed.put(b.clone(), 0),
+            "put forwards its dedup branch too"
+        );
+        assert_eq!(boxed.get(&b.id()), Some(b.clone()), "get forwards");
+        assert!(boxed.seen(&b.id()), "seen forwards");
+        assert!(boxed.contains(&b.id()), "contains forwards");
+        assert_eq!(boxed.have().ids, vec![b.id()], "have forwards");
+        assert_eq!(
+            boxed.seen_expiry(&b.id()),
+            Some(3_600_000),
+            "seen_expiry forwards"
+        );
+
+        assert_eq!(
+            boxed.split_copies(&b.id()),
+            4,
+            "split_copies forwards (8 copies -> give 4)"
+        );
+        boxed.set_copies(&b.id(), 1);
+        assert_eq!(
+            boxed.get(&b.id()).unwrap().env.copies,
+            1,
+            "set_copies forwards"
+        );
+
+        boxed.put_kv("session/alice", vec![9, 9]);
+        assert_eq!(
+            boxed.get_kv("session/alice"),
+            Some(vec![9, 9]),
+            "put_kv/get_kv forward"
+        );
+        assert_eq!(
+            boxed.list_kv("session/"),
+            vec![("session/alice".to_string(), vec![9, 9])],
+            "list_kv forwards"
+        );
+        boxed.remove_kv("session/alice");
+        assert_eq!(boxed.get_kv("session/alice"), None, "remove_kv forwards");
+
+        boxed.prune(u64::MAX);
+        assert!(!boxed.contains(&b.id()), "prune forwards");
+        assert!(
+            boxed.remove(&b.id()).is_none(),
+            "remove forwards (already pruned, so nothing left to remove)"
+        );
+    }
+
+    #[test]
+    fn default_store_methods_are_inert_when_not_overridden() {
+        // Covers the `Store` trait's own default bodies (kv side-store, flush, seen_expiry) with a
+        // backend that deliberately leaves them unimplemented, e.g. an ephemeral/relay store that
+        // doesn't need durable kv or an async flush. It must still compile and behave like "nothing
+        // is durable" rather than panic.
+        struct BareStore {
+            held: HashMap<BundleId, Bundle>,
+        }
+        impl Store for BareStore {
+            fn put(&mut self, bundle: Bundle, _now_ms: u64) -> bool {
+                let id = bundle.id();
+                if self.held.contains_key(&id) {
+                    return false;
+                }
+                self.held.insert(id, bundle);
+                true
+            }
+            fn get(&self, id: &BundleId) -> Option<Bundle> {
+                self.held.get(id).cloned()
+            }
+            fn remove(&mut self, id: &BundleId) -> Option<Bundle> {
+                self.held.remove(id)
+            }
+            fn seen(&self, id: &BundleId) -> bool {
+                self.held.contains_key(id)
+            }
+            fn contains(&self, id: &BundleId) -> bool {
+                self.held.contains_key(id)
+            }
+            fn have(&self) -> HaveSet {
+                HaveSet {
+                    ids: self.held.keys().copied().collect(),
+                }
+            }
+            fn prune(&mut self, _now_ms: u64) {}
+            fn split_copies(&mut self, _id: &BundleId) -> u16 {
+                0
+            }
+            fn set_copies(&mut self, _id: &BundleId, _copies: u16) {}
+        }
+
+        let b = bundle(1_000);
+        let mut store = BareStore {
+            held: HashMap::new(),
+        };
+        assert!(store.put(b.clone(), 0));
+
+        // None of these are overridden by BareStore, so they must fall back to the trait defaults.
+        assert_eq!(
+            store.seen_expiry(&b.id()),
+            None,
+            "default seen_expiry is None (no durable expiry tracked)"
+        );
+        store.put_kv("k", vec![1, 2, 3]); // default is a no-op; must not panic
+        assert_eq!(
+            store.get_kv("k"),
+            None,
+            "default get_kv never remembers anything put_kv was handed"
+        );
+        store.remove_kv("k"); // default is a no-op; must not panic
+        assert_eq!(
+            store.list_kv(""),
+            Vec::<(String, Vec<u8>)>::new(),
+            "default list_kv is always empty"
+        );
+        assert!(
+            store.flush(std::time::Duration::from_millis(1)),
+            "default flush reports done immediately, nothing is buffered"
+        );
+    }
+
+    #[test]
+    fn put_with_expiry_rejects_a_duplicate_id_and_keeps_the_first_expiry() {
+        // stores-02: rehydrating a backend must not let a duplicate id clobber the already-recorded
+        // (earlier) expiry with a later one, or a re-mirrored bundle could win extra dedup lifetime.
+        let b = bundle(3_600_000);
+        let mut store = MemoryStore::new();
+        assert!(store.put_with_expiry(b.clone(), 1_000));
+        assert!(
+            !store.put_with_expiry(b.clone(), 2_000_000),
+            "a duplicate id during rehydrate must be rejected, not overwrite the expiry"
+        );
+        assert_eq!(
+            store.seen_expiry(&b.id()),
+            Some(1_000),
+            "the first expiry wins; a later duplicate can't push it out"
+        );
+    }
+
+    #[test]
+    fn split_copies_halves_the_budget_and_bottoms_out_at_zero_when_absent() {
+        // The spray-and-wait copy budget must halve on the STORED bundle (not some detached copy),
+        // reach the wait phase (give 0, keep the last copy) instead of underflowing, and an id we
+        // don't hold gives 0 rather than panicking.
+        let b = bundle(3_600_000); // default copies = 8
+        let mut store = MemoryStore::new();
+        assert!(store.put(b.clone(), 0));
+
+        assert_eq!(store.split_copies(&b.id()), 4, "8 copies -> give 4, keep 4");
+        assert_eq!(store.get(&b.id()).unwrap().env.copies, 4);
+
+        assert_eq!(store.split_copies(&b.id()), 2, "4 copies -> give 2, keep 2");
+        assert_eq!(store.split_copies(&b.id()), 1, "2 copies -> give 1, keep 1");
+        assert_eq!(
+            store.split_copies(&b.id()),
+            0,
+            "at 1 copy we're in the wait phase: give 0, keep the last copy"
+        );
+        assert_eq!(store.get(&b.id()).unwrap().env.copies, 1);
+
+        // An id we've never stored can't be split; this must not panic.
+        let missing = bundle(1_000);
+        assert_eq!(store.split_copies(&missing.id()), 0);
+    }
 }

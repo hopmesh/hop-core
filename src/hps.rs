@@ -285,4 +285,123 @@ mod tests {
             .service_pubkey()
             .is_some());
     }
+
+    #[test]
+    fn rotate_bumps_the_epoch_and_remints_keys_including_the_service_signing_key() {
+        // DESIGN.md §32 selective rotation: a Service's broadcast key must ALSO rotate, not just
+        // the content key, or a removed member who kept the old signing seed could keep forging
+        // broadcasts after being "revoked".
+        let mut svc = ServiceConfig::new(ServiceKind::Service);
+        let old_content_key = svc.content_key;
+        let old_seed = svc.signing_seed.unwrap();
+        let old_pubkey = svc.service_pubkey().unwrap();
+
+        svc.rotate();
+
+        assert_eq!(svc.epoch, 1, "rotate bumps the epoch");
+        assert_ne!(
+            svc.content_key, old_content_key,
+            "rotate remints the content key"
+        );
+        assert_ne!(
+            svc.signing_seed.unwrap(),
+            old_seed,
+            "rotate remints the service signing key too"
+        );
+        assert_ne!(svc.service_pubkey().unwrap(), old_pubkey);
+
+        // A broadcast signed with the OLD (revoked) seed must not verify against the NEW pubkey.
+        let (nonce, ct) = seal_content(&svc.content_key, b"post-rotation");
+        let forged = sign_publish(&old_seed, "svc/topic", &nonce, &ct);
+        assert!(!verify_publish(
+            &svc.service_pubkey().unwrap(),
+            "svc/topic",
+            &nonce,
+            &ct,
+            &forged
+        ));
+    }
+
+    #[test]
+    fn rotate_on_a_channel_has_no_signing_seed_to_remint() {
+        let mut chan = ServiceConfig::new(ServiceKind::Channel);
+        assert!(chan.signing_seed.is_none());
+        let old_content_key = chan.content_key;
+
+        chan.rotate();
+
+        assert_eq!(chan.epoch, 1);
+        assert_ne!(chan.content_key, old_content_key);
+        assert!(
+            chan.signing_seed.is_none(),
+            "a channel never gets a signing seed from rotate"
+        );
+    }
+
+    #[test]
+    fn meta_builds_the_discovery_descriptor_from_the_config() {
+        let mut cfg = ServiceConfig::new_with(
+            ServiceKind::Service,
+            AccessMode::RequestToJoin,
+            Visibility::Discoverable,
+        );
+        cfg.title = "Weather".to_string();
+        cfg.summary = "Storm alerts".to_string();
+        cfg.tags = vec!["weather".to_string(), "alerts".to_string()];
+
+        let meta = cfg.meta("alerts/weather");
+
+        assert_eq!(meta.path, "alerts/weather");
+        assert_eq!(meta.kind, ServiceKind::Service);
+        assert_eq!(meta.title, "Weather");
+        assert_eq!(meta.summary, "Storm alerts");
+        assert_eq!(meta.tags, vec!["weather".to_string(), "alerts".to_string()]);
+        assert_eq!(meta.access, AccessMode::RequestToJoin);
+        assert_eq!(meta.service_pubkey, cfg.service_pubkey());
+        assert!(meta.service_pubkey.is_some());
+
+        let chan = ServiceConfig::new(ServiceKind::Channel);
+        assert_eq!(
+            chan.meta("chan/path").service_pubkey,
+            None,
+            "a channel's descriptor carries no verify key"
+        );
+    }
+
+    #[test]
+    fn verify_publish_rejects_a_pubkey_that_does_not_decode_to_a_curve_point() {
+        // A malformed/foreign pubkey (not just a wrong-but-valid one) must be rejected outright,
+        // not panic and not fall through to a signature check against garbage. This 32-byte string
+        // is a real value curve25519 rejects on decompression (it is not a point on the curve).
+        let bad_pubkey: [u8; 32] = [
+            34, 230, 141, 232, 28, 113, 203, 58, 213, 98, 226, 49, 72, 42, 249, 167, 171, 137, 213,
+            242, 87, 155, 47, 193, 204, 237, 239, 4, 29, 77, 70, 229,
+        ];
+        let svc = ServiceConfig::new(ServiceKind::Service);
+        let seed = svc.signing_seed.unwrap();
+        let (nonce, ct) = seal_content(&svc.content_key, b"whatever");
+        let sig = sign_publish(&seed, "topic", &nonce, &ct);
+
+        assert!(
+            !verify_publish(&bad_pubkey, "topic", &nonce, &ct, &sig),
+            "an undecodable pubkey must be rejected, not panic"
+        );
+    }
+
+    #[test]
+    fn seal_meta_and_open_meta_round_trip_and_reject_the_wrong_disc_key() {
+        let cfg = ServiceConfig::new(ServiceKind::Channel);
+        let meta = cfg.meta("chat/general");
+        let disc_key: [u8; 32] = [7u8; 32];
+
+        let (nonce, ct) = seal_meta(&disc_key, &meta);
+        assert_eq!(open_meta(&disc_key, &nonce, &ct), Some(meta.clone()));
+
+        let wrong_key: [u8; 32] = [9u8; 32];
+        assert_eq!(
+            open_meta(&wrong_key, &nonce, &ct),
+            None,
+            "a foreign app's discovery key must not decrypt someone else's descriptor"
+        );
+    }
 }
