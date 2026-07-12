@@ -576,7 +576,7 @@ pub struct Node<S: Store = MemoryStore> {
     /// and capped at [`MAX_SEEN_VACCINE_TOKENS`] (oldest-evicted) so a distinct-token flood can't grow
     /// it without bound.
     seen_vaccine_tokens: HashMap<[u8; 32], u64>,
-    /// Observability for the sim/debug wrapper: when `observe` is on, each bundle sent over a link
+    /// Observability: when `observe` is on, each bundle sent over a link
     /// is recorded as (link, bundle_id, is_final_delivery), drained via [`Node::drain_transfers`].
     /// Never enabled in production; zero cost when off.
     observe: bool,
@@ -1785,7 +1785,7 @@ impl<S: Store> Node<S> {
                     info.delivered_hops = delivery_hops;
                     info.delivered_ms = delivery_ms;
                 }
-                // Sim/debug: record that WE (the sender) just learned this send was delivered, from the
+                // Observability: record that WE (the sender) just learned this send was delivered, from the
                 // returning ACK — the only way the sender knows. Lets a UI show the sender's real status.
                 if newly && self.observe {
                     self.sends_delivered.push(display);
@@ -3578,7 +3578,7 @@ impl<S: Store> Node<S> {
             // F-06: the mailbox is now bound to our address + epoch (not the prekey), so the beacon is
             // self-verifying at the relay — no prekey coordination needed. Emits current + window epochs.
             let _ = self.publish_recv_beacon();
-            self.beaconed_tick = true; // sim/debug: pulse this node in the viz (drain_beaconed)
+            self.beaconed_tick = true; // observability: emitted a recv-beacon this tick (see drain_beaconed)
         }
         // Retry any content still waiting on a prekey (it gossips, §25).
         self.flush_pending_content();
@@ -3653,25 +3653,25 @@ impl<S: Store> Node<S> {
         std::mem::take(&mut self.outgoing)
     }
 
-    /// Sim/debug: enable recording of which bundle crosses which link (see [`Self::drain_transfers`]).
+    /// Observability: enable recording of which bundle crosses which link (see [`Self::drain_transfers`]).
     pub fn set_observe(&mut self, on: bool) {
         self.observe = on;
     }
 
-    /// Sim/debug: take the `(link, bundle_id, is_final_delivery)` transfers recorded since the last
-    /// call. Lets a visualizer color each hop by the real bundle that crossed it. Empty unless
+    /// Observability: take the `(link, bundle_id, is_final_delivery)` transfers recorded since the last
+    /// call. Lets a caller attribute each hop to the real bundle that crossed it. Empty unless
     /// [`Self::set_observe`]`(true)` was called.
     pub fn drain_transfers(&mut self) -> Vec<(LinkId, BundleId, bool)> {
         // Report DISPLAY ids: a deferred send (queued while the recipient's prekey gossips over, §25)
-        // flushes later under a fresh wire id — the UI tracked the id `send` returned, so without this
-        // mapping a deferred message's flood is invisible to the visualizer.
+        // flushes later under a fresh wire id, the caller tracked the id `send` returned, so without
+        // this mapping a deferred message's flood is invisible to an observer.
         std::mem::take(&mut self.transfers)
             .into_iter()
             .map(|(l, id, d)| (l, self.display_id(&id), d))
             .collect()
     }
 
-    /// Sim/debug: take the ids of our OWN sends that were confirmed delivered (by a returning ACK)
+    /// Observability: take the ids of our OWN sends that were confirmed delivered (by a returning ACK)
     /// since the last call. A sender only learns delivery this way — never from the recipient directly
     /// — so a per-device UI can show the sender "delivered" only once its ACK is home.
     pub fn drain_delivered(&mut self) -> Vec<BundleId> {
@@ -3679,30 +3679,30 @@ impl<S: Store> Node<S> {
     }
 
     /// Set the lifetime stamped on new messages/ACKs this node originates. A real per-bundle sender
-    /// choice (`BundleOpts::lifetime_ms`); the store's own prune enforces it on tick. The sim sets a
-    /// short one so relay copies of a delivered message actually expire within a demo (§39 has no relay
-    /// vaccine, so relays clean up by TTL). Production leaves it at the 24h default.
+    /// choice (`BundleOpts::lifetime_ms`); the store's own prune enforces it on tick. A short
+    /// lifetime makes relay copies of a delivered message expire quickly (§39 has no relay vaccine,
+    /// so relays clean up by TTL); production leaves it at the 24h default.
     pub fn set_default_lifetime_ms(&mut self, ms: u32) {
         self.default_lifetime_ms = ms;
     }
 
-    /// Sim/debug: the §39 P4 recv-gradient as `(route_key, inbound_link, hops)` — the reachable mailbox
+    /// Observability: the §39 P4 recv-gradient as `(route_key, inbound_link, hops)` — the reachable mailbox
     /// **routing prefixes** (sec-priv-04, right-padded into a Tag) this node can steer a private bundle
     /// toward, and the next hop for each. Read-only view of the distributed routing tree (each node
-    /// holds a slice); lets the sim draw it. Keys match [`Node::current_mailbox_tag`] (also projected).
+    /// holds a slice). Keys match [`Node::current_mailbox_tag`] (also projected).
     pub fn recv_gradient_view(&self) -> Vec<(Tag, LinkId, u8)> {
         // sec-priv-04: a bucket may hold several next-hops (an anonymity set); emit one row per
-        // (route-prefix, next-hop) so the sim sees every steer-able link.
+        // (route-prefix, next-hop) so a caller sees every steer-able link.
         self.recv_gradient
             .iter()
             .flat_map(|(tag, e)| e.links.iter().map(move |(l, gl)| (*tag, *l, gl.hops)))
             .collect()
     }
 
-    /// Sim/debug: this node's current mailbox **routing key** — its full tag `H(address ‖ epoch)`
+    /// Observability: this node's current mailbox **routing key** — its full tag `H(address ‖ epoch)`
     /// projected onto the sec-priv-04 routing prefix (right-padded into a Tag), i.e. the exact key a
-    /// relay's gradient buckets under. Projected (not the raw full tag) so the sim's match against
-    /// [`Node::recv_gradient_view`] keys still lines up now that routing decisions key on the prefix.
+    /// relay's gradient buckets under. Projected (not the raw full tag) so it lines up against
+    /// [`Node::recv_gradient_view`] keys now that routing decisions key on the prefix.
     pub fn current_mailbox_tag(&self) -> Tag {
         route_key(&crypto::mailbox_tag(
             &self.identity.address(),
@@ -3710,18 +3710,18 @@ impl<S: Store> Node<S> {
         ))
     }
 
-    /// Sim/debug: did this node emit a §39 recv-beacon since the last call? Lets the sim pulse a node
+    /// Observability: did this node emit a §39 recv-beacon since the last call? Surfaces when a node
     /// as it advertises its reachability (the presence signal that lays the gradient tree).
     pub fn drain_beaconed(&mut self) -> bool {
         std::mem::take(&mut self.beaconed_tick)
     }
 
-    /// Sim/debug: do we currently hold `addr`'s prekey (i.e. could we seal a private send to them now)?
+    /// Observability: do we currently hold `addr`'s prekey (i.e. could we seal a private send to them now)?
     pub fn knows_prekey(&self, addr: &PubKeyBytes) -> bool {
         self.directory.prekey(addr).is_some()
     }
 
-    /// Sim/debug: send status for each message we originated — `(display id, distinct peers we've handed
+    /// Observability: send status for each message we originated — `(display id, distinct peers we've handed
     /// it to, delivered)`. Mirrors the debug app's "Sending / Sent · N / Delivered" (peers==0 = Sending,
     /// N>0 = Sent·N, delivered = ACK home). Read-only.
     pub fn sends_status(&self) -> Vec<(BundleId, u16, bool)> {
@@ -3737,7 +3737,7 @@ impl<S: Store> Node<S> {
             .collect()
     }
 
-    /// Sim/debug: ids of the bundles this node currently holds — lets a visualizer show which
+    /// Observability: ids of the bundles this node currently holds, lets a caller show which
     /// devices still have a copy (they drop it as the delivery-ACK/vaccine reaches them). Read-only;
     /// storage lifecycle stays entirely with the core + its `Store` (real TTL, real prune).
     pub fn held_bundle_ids_display(&self) -> Vec<BundleId> {
@@ -3894,7 +3894,7 @@ impl<S: Store> Node<S> {
             // Generalize that to EVERYTHING we still hold: delivery-ACKs and vaccines have no
             // retransmit timer of their own, so a copy lost to a link flap (marked sent, never
             // received) would otherwise be stranded against this peer FOREVER — the stuck-"Sending…"
-            // sender the sim exposed. If we still hold a bundle it is still relevant; the receiver
+            // sender bug. If we still hold a bundle it is still relevant; the receiver
             // dedups duplicates by `seen`, so re-offering on a fresh contact costs only bandwidth.
             let held_ids = self.store.have().ids;
             if let Some(LinkState::Up(est)) = self.links.get_mut(&link) {
@@ -6479,10 +6479,10 @@ mod tests {
 
     #[test]
     fn reply_ack_returns_via_intermittent_carrier() {
-        // The sim's stuck topology: `you` is BLE-only and meets a carrier only in passes; the
+        // Intermittent-carrier topology (a stuck case the browser sim surfaced): `you` is BLE-only and meets a carrier only in passes; the
         // carrier and `friend` sit on a relay. m1 you→friend acks fine. friend's REPLY m2 reaches
-        // `you` on a later pass — and m2's ACK must ride back on subsequent passes. In the browser
-        // sim this ack never comes home (friend stays "Sending…" forever).
+        // `you` on a later pass — and m2's ACK must ride back on subsequent passes. Without the
+        // fix this ack never comes home (friend stays "Sending…" forever).
         let mut nodes = [
             Node::new(Identity::generate()), // 0 you (intermittent)
             Node::new(Identity::generate()), // 1 carrier
@@ -6491,7 +6491,7 @@ mod tests {
         ];
         for n in nodes.iter_mut() {
             n.publish_prekey().unwrap();
-        } // like the sim shim does at add()
+        } // (prekey publish, as a client does on node add)
         let mut net = Wire2::new();
         net.connect(&mut nodes, 1, 51, 2, 52); // carrier <-> relay (always up)
         net.connect(&mut nodes, 2, 53, 3, 54); // relay <-> friend (always up)
