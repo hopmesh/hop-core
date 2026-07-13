@@ -2209,17 +2209,34 @@ impl<S: Store> Node<S> {
         let key = normalize_domain(domain);
         self.dns_inflight.remove(&key);
         self.pending_resolves.remove(&key);
-        let now_secs = self.now_ms / 1000;
-        let (address, ttl_secs) = match crate::reach::ReachRecord::verify(&record, Some(now_secs)) {
-            Some(rec) => (Some(rec.claim.address), rec.claim.ttl_secs),
-            None => (None, 60), // unverifiable → short negative cache
-        };
-        let ttl_ms = (ttl_secs as u64).clamp(MIN_HNS_TTL_MS / 1000, MAX_HNS_TTL_MS / 1000) * 1000;
+        let now_ms = self.now_ms;
+        let (address, expires_at_ms) =
+            match crate::reach::ReachRecord::verify(&record, Some(now_ms / 1000)) {
+                Some(rec) => {
+                    // reach-A audit: trust the address until the record's OWN absolute expiry
+                    // (issued_at + ttl), NOT now + ttl. Caching for a full ttl from FETCH time would keep a
+                    // record fetched just before its expiry alive for up to ~2x ttl, so a publisher's
+                    // revocation-by-expiry could linger past the window the record itself declares (and past
+                    // what reach.rs documents). verify() already ensured now <= issued_at + ttl, so the
+                    // absolute expiry is >= now; cap the horizon at MAX_HNS_TTL from now against a bogus
+                    // far-future ttl.
+                    let abs = rec
+                        .claim
+                        .issued_at
+                        .saturating_add(rec.claim.ttl_secs as u64)
+                        .saturating_mul(1000);
+                    (
+                        Some(rec.claim.address),
+                        abs.min(now_ms.saturating_add(MAX_HNS_TTL_MS)),
+                    )
+                }
+                None => (None, now_ms.saturating_add(60_000)), // unverifiable → short (60s) negative cache
+            };
         self.hns_cache.insert(
             key.clone(),
             HnsEntry {
                 address,
-                expires_at_ms: self.now_ms.saturating_add(ttl_ms),
+                expires_at_ms,
             },
         );
         self.hns_results.push(HnsResult {
@@ -3538,6 +3555,13 @@ impl<S: Store> Node<S> {
         {
             self.last_resolve_retry_ms = now_ms;
             for key in self.pending_resolves.iter().cloned().collect::<Vec<_>>() {
+                // reach-A audit: clear the in-flight guard before re-attempting. A domain still in
+                // pending_resolves never got a provide_reach_record callback (an answer removes it), so
+                // its prior lookup either is still in flight or was DROPPED by the host. Without this
+                // remove, queue_dns_lookup's `dns_inflight.insert` returns false and the retry emits
+                // nothing, wedging the name forever on a single dropped callback. Re-emitting once per
+                // HNS_RETRY_INTERVAL is exactly the delay-tolerant retry this loop is for.
+                self.dns_inflight.remove(&key);
                 self.attempt_resolve(&key);
             }
         }
@@ -4406,7 +4430,21 @@ impl<S: Store> Node<S> {
             Destination::Device(d) => Some(d),
             _ => None,
         };
-        if self.store.put(bundle, self.now_ms) {
+        // relay-A audit: a trusted re-injection from our own durable storage (Node::ingest, from_link ==
+        // LOCAL_LINK) of a bundle we already `seen` but EVICTED from held (max_relayed pressure dropped
+        // the held copy while the durable mailbox copy + dedup row survived) must RE-HOLD it, not be
+        // refused by the surviving dedup entry. Otherwise process_mailbox's delete-before-ingest loses
+        // the message permanently on a same-relay re-pull. Live traffic and never-evicted stores take the
+        // ordinary `put` path (rehydrate defaults to put). Delivered bundles never reach here (the
+        // immune / vaccine checks above return early).
+        let rehydrating =
+            from_link == LOCAL_LINK && self.store.seen(&id) && !self.store.contains(&id);
+        let stored = if rehydrating {
+            self.store.rehydrate(bundle, self.now_ms)
+        } else {
+            self.store.put(bundle, self.now_ms)
+        };
+        if stored {
             self.relay_order.push(id);
             // Remember we're carrying this toward `dst` so a returning ACK teaches the
             // route (§27). `or_insert` keeps our own-send record if we have one.
@@ -7938,6 +7976,47 @@ mod tests {
     }
 
     #[test]
+    fn an_evicted_then_repulled_mailbox_bundle_is_rehydrated_not_dropped() {
+        // relay-A audit (2nd data-loss vector): the rate-cap fix closed the >cap-burst drop; this closes
+        // the dedup-after-eviction drop. A private bundle spooled + held, then EVICTED from held under
+        // relay pressure (store.remove keeps its `seen` dedup row), is re-pulled from its durable mailbox
+        // on the SAME relay and re-ingested. A plain put is refused by the surviving seen row -> the
+        // message is lost after process_mailbox's delete. The trusted re-ingest must RE-HOLD it.
+        let mut relay = Node::new(Identity::generate());
+        let recipient = Identity::generate();
+        let mailbox = crypto::mailbox_tag(&recipient.address(), 0);
+        let prefix = crypto::mailbox_route(&mailbox);
+        let pb = Bundle::create_private(
+            &recipient.address(),
+            &recipient.derive_prekey().public,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"held-then-evicted".to_vec(),
+            },
+            Some(prefix),
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let id = pb.id();
+        let repull = pb.clone(); // the durable mailbox copy, re-pulled later (same bytes -> same id)
+        relay.ingest(pb);
+        assert!(relay.store.contains(&id), "held after the first ingest");
+        // Evict from held under relay pressure; the dedup row survives (exactly what store.remove does).
+        relay.store.remove(&id);
+        assert!(
+            relay.store.seen(&id) && !relay.store.contains(&id),
+            "precondition: evicted-but-seen"
+        );
+        // process_mailbox deletes the durable copy then re-ingests it: it must re-hold, not drop on the
+        // surviving seen row.
+        relay.ingest(repull);
+        assert!(
+            relay.store.contains(&id),
+            "the re-pulled evicted bundle is re-held (rehydrate), not dropped on the surviving seen row"
+        );
+    }
+
+    #[test]
     fn vaccine_carries_no_plaintext_delivered_id_but_a_holder_still_drops() {
         // sec-priv-07: the delivery vaccine floods ONLY the recognition token — no plaintext delivered
         // id. Prove (1) a party that did NOT capture the flood cannot read any bundle id off the wire
@@ -8130,6 +8209,56 @@ mod tests {
         assert_eq!(
             node.resolve_hns("thisdoesnotexist.com"),
             HnsLookup::Cached(None)
+        );
+    }
+
+    #[test]
+    fn hns_cache_honors_the_record_absolute_expiry_not_fetch_plus_ttl() {
+        // reach-A audit: a record fetched near its expiry must be cached only until its OWN
+        // issued_at+ttl, not now+ttl (which would trust it for up to ~2x its ttl and let a
+        // publisher's revocation-by-expiry linger). Fetch a record with 10s of life left.
+        let id = Identity::generate();
+        let ttl = 3600u32;
+        let issued = 1_000u64; // seconds
+        let rec = crate::reach::ReachRecord::sign(&id, "wss://x/_hop", ttl, issued);
+        let mut node = Node::new(Identity::generate());
+        let now_secs = issued + ttl as u64 - 10; // still valid, but only 10s remain
+        node.set_time(now_secs * 1000);
+        node.provide_reach_record("x.com", rec.to_bytes());
+        let entry = node.hns_cache.get("x.com").expect("record cached");
+        assert_eq!(
+            entry.expires_at_ms,
+            (issued + ttl as u64) * 1000,
+            "cache ends at the record's absolute expiry (issued+ttl), ~10s out"
+        );
+        assert_ne!(
+            entry.expires_at_ms,
+            node.now_ms + ttl as u64 * 1000,
+            "NOT the buggy now+ttl (~1h out)"
+        );
+        assert_eq!(entry.address, Some(id.address()));
+    }
+
+    #[test]
+    fn a_dropped_host_reach_callback_does_not_wedge_a_name_forever() {
+        // reach-A audit: if the host drains a lookup but never calls provide_reach_record back (a
+        // dropped fetch, contract violation), the periodic retry must re-emit it instead of leaving the
+        // name stuck forever behind the dns_inflight guard.
+        let mut node = Node::new(Identity::generate());
+        node.set_internet(true);
+        node.set_time(0);
+        assert_eq!(node.resolve_hns("acme.com"), HnsLookup::Pending);
+        assert_eq!(
+            node.take_dns_lookups(),
+            vec!["acme.com".to_string()],
+            "the host is asked to resolve it once"
+        );
+        // The host never answers. Advance past the retry interval and tick.
+        node.tick(HNS_RETRY_INTERVAL_MS + 1);
+        assert_eq!(
+            node.take_dns_lookups(),
+            vec!["acme.com".to_string()],
+            "the dropped lookup is re-emitted on retry (self-heals), not wedged"
         );
     }
 

@@ -30,6 +30,17 @@ pub trait Store {
     /// Record a bundle for forwarding, stamping its dedup expiry from `now_ms`.
     /// Returns false if it was a duplicate (still within its dedup window).
     fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool;
+    /// Re-hold a bundle we already `seen` but EVICTED from held — a TRUSTED re-injection from our own
+    /// durable storage (a mailbox pull or cross-partition handoff via [`crate::node::Node::ingest`],
+    /// relay-A audit). Unlike [`Store::put`] it does NOT refuse on the surviving dedup entry: `remove`
+    /// (eviction/delivery) drops the held copy but keeps `seen`, so a plain `put` of an evicted bundle
+    /// returns false and the re-hydration would be lost after its durable mailbox copy is deleted. Keeps
+    /// the existing dedup window; returns whether the bundle is now held. Default: falls back to `put`
+    /// (a backend that never evicts-while-keeping-seen never needs the distinction). Backends that evict
+    /// under memory/relay pressure MUST override.
+    fn rehydrate(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+        self.put(bundle, now_ms)
+    }
     /// Fetch a stored bundle by id.
     fn get(&self, id: &BundleId) -> Option<Bundle>;
     /// Remove a held bundle (e.g. on custody handoff or delivery). Its dedup entry
@@ -91,6 +102,9 @@ pub trait Store {
 impl Store for Box<dyn Store> {
     fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool {
         (**self).put(bundle, now_ms)
+    }
+    fn rehydrate(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+        (**self).rehydrate(bundle, now_ms)
     }
     fn get(&self, id: &BundleId) -> Option<Bundle> {
         (**self).get(id)
@@ -226,6 +240,19 @@ impl Store for MemoryStore {
         let lifetime = (bundle.inner.lifetime_ms as u64).min(MAX_SEEN_LIFETIME_MS);
         let expiry = now_ms.saturating_add(lifetime);
         self.seen.insert(id, expiry);
+        self.held.insert(id, bundle);
+        self.enforce_seen_cap();
+        true
+    }
+
+    fn rehydrate(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+        // Re-hold an evicted-but-durable bundle even though its `seen` row survives (relay-A audit):
+        // keep the existing dedup window if present, else stamp a fresh one, then re-insert into held.
+        let id = bundle.id();
+        let lifetime = (bundle.inner.lifetime_ms as u64).min(MAX_SEEN_LIFETIME_MS);
+        self.seen
+            .entry(id)
+            .or_insert_with(|| now_ms.saturating_add(lifetime));
         self.held.insert(id, bundle);
         self.enforce_seen_cap();
         true

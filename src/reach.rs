@@ -7,6 +7,21 @@
 //! `myaddress.com -> X` when the record is served from `https://myaddress.com/.well-known/hop`. Either
 //! way this record needs NO external trust anchor: the claimed `address` is the very key that signs it,
 //! so a forged claim (someone else's address, a tampered endpoint) simply fails the signature check.
+//!
+//! ## Revocation model (why there is no revocation list)
+//!
+//! A self-certifying record has no issuing authority, so there is no CA to publish a CRL/OCSP against
+//! and nothing a third party could revoke on the signer's behalf. Revocation is instead **expiry +
+//! re-signing**, the same model as short-lived TLS certificates: a record is only trusted for
+//! `ttl_secs` from `issued_at` (enforced in [`ReachRecord::verify`]), and the holder keeps a live
+//! record fresh by re-signing before it lapses. To retire an endpoint, stop re-signing and let the
+//! last record expire; to move, sign a new record (a strictly-newer `issued_at` supersedes the old
+//! one for the same address). Publishers therefore choose a TTL that bounds their own worst-case
+//! staleness: **short TTLs (minutes to a few hours) are the revocation granularity** and are cheap
+//! because signing is one Ed25519 op (hop-endpoint re-signs hourly, see `WELL_KNOWN_RESIGN`). Key
+//! compromise is out of scope of the record itself (a stolen identity key can sign valid records for
+//! its own address until the address is abandoned), exactly as a stolen TLS key can, and is handled at
+//! the identity layer, not here.
 
 use crate::crypto::{self, Identity, PubKeyBytes};
 use serde::{Deserialize, Serialize};
