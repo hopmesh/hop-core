@@ -230,10 +230,11 @@ fn route_key_from_prefix(prefix: &crypto::MailboxRoute) -> Tag {
     k
 }
 
-/// Reserved [`LinkId`] for our own local re-injection path (rehydrate, stream reassembly) and the
-/// "no link to skip" argument to the offer helpers (core-05). It is exempt from the F-07
-/// private-ingest rate limit, so a real bearer must NEVER assign it to a transport connection;
-/// [`Node::on_connected`] refuses a link with this id defensively.
+/// Reserved [`LinkId`] for our own local re-injection path (rehydrate, stream reassembly, and the
+/// durable-storage re-ingest in [`Node::ingest`]) and the "no link to skip" argument to the offer
+/// helpers (core-05). It is exempt from the F-07 private-ingest rate limit (this traffic comes from
+/// our own trusted storage, not a live remote link), so a real bearer must NEVER assign it to a
+/// transport connection; [`Node::on_connected`] refuses a link with this id defensively.
 const LOCAL_LINK: LinkId = 0;
 
 /// Per-link inbound rate limit for §39 **private** bundles (F-07). Private bundles are unsigned
@@ -3321,9 +3322,15 @@ impl<S: Store> Node<S> {
     /// links, exactly as if a peer had handed it over. A cold-started node gets the same
     /// bundles for free via [`Node::with_store`]'s rehydrate.
     pub fn ingest(&mut self, bundle: Bundle) {
-        // A phantom link id that matches no real connection, so the bundle is offered to
-        // every live link (the offer step skips only the link it arrived on).
-        self.on_bundle(LinkId::MAX, bundle);
+        // relay-F (pass-5 audit): re-inject via LOCAL_LINK, NOT a phantom `LinkId::MAX`. Both match no
+        // real connection (so the bundle is offered to every live link, the offer step skips only the
+        // arrival link), but ONLY LOCAL_LINK is exempt from the F-07 per-link private-ingest flood cap.
+        // This IS our own re-injection from durable storage (a mailbox pull or a cross-partition handoff),
+        // so it must not be capped: relayd's `process_mailbox` deletes each spool copy BEFORE re-ingest,
+        // and a beacon that pulls > MAX_PRIV_BUNDLES_PER_WINDOW bundles (a real backlog, or an attacker
+        // co-locating spam under a shared mailbox prefix) would otherwise overflow the cap and silently
+        // drop the overflow AFTER the durable copy is gone: permanent loss of offline messages.
+        self.on_bundle(LOCAL_LINK, bundle);
     }
 
     /// Drop everything we're currently holding: our own undelivered messages (stop
@@ -7889,6 +7896,44 @@ mod tests {
         assert!(
             accepted > 0,
             "the rate limit admits up to the cap, not zero"
+        );
+    }
+
+    #[test]
+    fn mailbox_reingest_over_the_flood_cap_is_never_dropped() {
+        // relay-F (pass-5 audit): the relay's process_mailbox DELETES each spool copy, then re-ingests
+        // via Node::ingest. Before the fix, ingest re-injected via LinkId::MAX, which is subject to the
+        // F-07 256/window private-ingest cap, so a beacon pulling > cap bundles (a real backlog, or an
+        // attacker co-locating spam under a shared mailbox prefix) dropped the overflow AFTER the durable
+        // copy was gone: permanent loss. ingest now re-injects via LOCAL_LINK (our own trusted storage
+        // re-injection), which is exempt, so EVERY pulled bundle is accepted. All ingests land in one
+        // rate window (now_ms fixed at 0), so this would drop ~50 without the exemption.
+        let mut relay = Node::new(Identity::generate());
+        let recipient = Identity::generate();
+        let mailbox = crypto::mailbox_tag(&recipient.address(), 0);
+        let prefix = crypto::mailbox_route(&mailbox);
+        let n = MAX_PRIV_BUNDLES_PER_WINDOW as usize + 50; // well over one window's cap
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let pb = Bundle::create_private(
+                &recipient.address(),
+                &recipient.derive_prekey().public,
+                &Payload::PeerMessage {
+                    content_type: "t".into(),
+                    body: format!("m{i}").into_bytes(), // distinct body -> distinct bundle id
+                },
+                Some(prefix),
+                BundleOpts::default(), // created_at = 0 (all in the same rate window)
+            )
+            .unwrap();
+            assert!(pb.is_private());
+            ids.push(pb.id());
+            relay.ingest(pb); // the durable-storage re-ingest path
+        }
+        let accepted = ids.iter().filter(|id| relay.store.seen(id)).count();
+        assert_eq!(
+            accepted, n,
+            "every re-ingested mailbox bundle is accepted (LOCAL_LINK exempt from F-07); none dropped-after-delete"
         );
     }
 
