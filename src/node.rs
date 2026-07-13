@@ -2308,6 +2308,14 @@ impl<S: Store> Node<S> {
         std::mem::take(&mut self.hns_results)
     }
 
+    /// Sign a self-certifying reachability record for THIS node's address, binding it to `endpoint`
+    /// (e.g. `wss://myaddress.com/_hop` or `1.2.3.4:9944`) for `ttl_secs`. Serve it from
+    /// `/.well-known/hop` or gossip it; anyone verifies it against the address it carries, no trust
+    /// anchor needed (see [`crate::reach`]).
+    pub fn sign_reach_record(&self, endpoint: String, ttl_secs: u32) -> crate::reach::ReachRecord {
+        crate::reach::ReachRecord::sign(&self.identity, endpoint, ttl_secs, self.now_ms / 1000)
+    }
+
     // ---- hps:// pub/sub: services & channels (DESIGN.md §32) -----------------------------
 
     /// Register a `hps://` topic at `path` that this node hosts, minting its keys. `access`

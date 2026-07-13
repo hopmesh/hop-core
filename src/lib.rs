@@ -16,6 +16,7 @@ pub mod error;
 pub mod hps;
 pub mod link;
 pub mod node;
+pub mod reach;
 pub mod relay;
 pub mod route;
 pub mod routing;
