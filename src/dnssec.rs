@@ -631,6 +631,15 @@ fn parent_zone(z: &str) -> String {
     }
 }
 
+/// Is `owner` at or below `zone` (a label-boundary suffix; both normalized)? A zone may only sign
+/// records within itself (RFC 4035 §5.3.1). The empty (root) zone contains everything, but the root
+/// KSK is an unforgeable anchor, so allowing it is safe.
+fn owner_in_zone(owner: &str, zone: &str) -> bool {
+    let owner = norm(owner);
+    let zone = norm(zone);
+    zone.is_empty() || owner == zone || owner.ends_with(&format!(".{zone}"))
+}
+
 /// Assemble a [`DnssecChain`] for `_hopaddress.<domain>` from the parsed DoH responses (the
 /// TXT record plus DNSKEY/DS for each zone up to root). The leaf zone is taken from the
 /// record's RRSIG signer, then we walk up to root. Missing pieces → `Malformed` so a partial
@@ -671,6 +680,19 @@ pub fn assemble_chain(domain: &str, dohs: &[DohAnswer]) -> Result<DnssecChain, D
 
     // Leaf zone = the RRSIG's signer; walk up to root.
     let leaf = wire_to_name(&record_rrsig.signer_name);
+
+    // RFC 4035 §5.3.1: the signing zone must be AUTHORITATIVE for the record it signs, i.e. the leaf
+    // zone (the RRSIG's signer) must CONTAIN the record owner. The leaf name, its whole DNSKEY/DS key
+    // chain, and the record signature are all supplied by whoever produced this proof and can be made
+    // internally valid by anyone who controls ANY DNSSEC-signed zone. Without this check they could
+    // sign a `_hopaddress.<victim-domain>` TXT with their own zone's key and chain it to root, hijacking
+    // that name -> Hop address binding. Requiring owner-within-signer forces the attacker to control a
+    // zone that actually contains the victim name (i.e. the victim's own zone, or an ancestor).
+    if !owner_in_zone(&record_name, &leaf) {
+        return Err(DnssecError::Malformed(
+            "record owner not within its signer zone",
+        ));
+    }
     let mut zones = Vec::new();
     let mut z = leaf;
     loop {
@@ -1145,6 +1167,48 @@ mod tests {
         let (got, ttl) = validate_and_extract("example", &[doh], &anchors, now).expect("extract");
         assert_eq!(got, addr);
         assert_eq!(ttl, 300);
+    }
+
+    #[test]
+    fn owner_in_zone_enforces_label_boundary() {
+        assert!(owner_in_zone("_hopaddress.victim.com", "victim.com")); // a zone signs its own record
+        assert!(owner_in_zone("victim.com", "victim.com")); // apex
+        assert!(owner_in_zone("_hopaddress.victim.com", "com")); // a true ancestor (com won't in practice)
+        assert!(owner_in_zone("anything.tld", "")); // root contains everything
+        assert!(!owner_in_zone("_hopaddress.victim.com", "evil.example")); // the hijack: unrelated signer
+        assert!(!owner_in_zone("evilvictim.com", "victim.com")); // suffix, but not on a label boundary
+    }
+
+    #[test]
+    fn assemble_chain_rejects_a_record_signed_by_a_foreign_zone() {
+        // The DNSSEC hijack (pass-5 F1): an attacker who controls a real DNSSEC-signed zone
+        // (evil.example) signs a `_hopaddress.victim.com` TXT with their own key and chains it to root.
+        // assemble_chain must refuse it on the owner-not-in-signer-zone check, BEFORE any signature is
+        // verified, so a real key chain behind the forged signer never gets a chance to validate.
+        let rrsig = Rrsig {
+            type_covered: 16,
+            algorithm: 13,
+            labels: 2,
+            original_ttl: 3600,
+            sig_expiration: u32::MAX,
+            sig_inception: 0,
+            key_tag: 1234,
+            signer_name: name_to_wire("evil.example"),
+            signature: vec![0u8; 64],
+        };
+        let doh = DohAnswer {
+            ad: true,
+            status: 0,
+            txt: vec![("_hopaddress.victim.com".into(), "SomeBase58Addr".into())],
+            dnskeys: Vec::new(),
+            ds: Vec::new(),
+            rrsigs: vec![("_hopaddress.victim.com".into(), rrsig)],
+        };
+        let err = assemble_chain("victim.com", &[doh]).unwrap_err();
+        assert!(
+            matches!(err, DnssecError::Malformed(_)),
+            "a foreign-zone signer must be refused, got {err:?}"
+        );
     }
 
     #[test]
