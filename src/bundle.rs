@@ -43,7 +43,12 @@ pub struct TraceHop {
 // core-protocol-r14-01 bumped v5 -> v6: the private WIRE id now binds the ENTIRE inner (header + all
 // scalar fields, incl. flags), so no unbound field — e.g. a flipped flags.request_ack twin — can share a
 // genuine private id and shadow it at a keep-first relay. See compute_private_wire_id.
-pub const BUNDLE_VERSION: u8 = 6;
+// v6 -> v7: HNS consolidated onto self-certifying reach records. The `Payload::HnsQuery`/`HnsAnswer`
+// variants (mesh-assisted DNSSEC name resolution) were REMOVED, which shifts the postcard discriminant
+// of every later variant, so a v6 decoder misreads a v7 Payload and vice-versa — the version gate must
+// reject a mixed v6/v7 fleet. Name resolution is now a direct HTTPS /.well-known/hop fetch of the reach
+// record (Node::provide_reach_record); the DNSSEC validator + DoH machinery are gone.
+pub const BUNDLE_VERSION: u8 = 7;
 
 /// Globally-unique bundle id: `BLAKE3(src || nonce || payload_hash)`.
 pub type BundleId = [u8; 32];
@@ -122,22 +127,6 @@ pub enum Payload {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
         for_bundle_id: BundleId,
-    },
-    /// HNS resolution query (DESIGN.md §30): "what is the hops endpoint address for this
-    /// domain?" Sealed and addressed to an internet-connected peer (e.g. a relay) that can
-    /// reach the public DNS. Any such peer may answer; a relay *may* serve this but need not.
-    HnsQuery {
-        /// The fully-qualified domain to resolve (the resolver looks up `_hopaddress.<domain>`).
-        domain: String,
-    },
-    /// HNS resolution answer (DESIGN.md §30): the **raw DoH response bodies** making up the
-    /// domain's full DNSSEC chain. The asker re-validates this proof itself against the root
-    /// anchors — so it never trusts the answering node, only the cryptography. (Carrying the
-    /// proof, not a bare address, is what makes multi-hop resolution trustless.)
-    HnsAnswer {
-        domain: String,
-        proof: Vec<String>,
-        for_query: BundleId,
     },
     PeerMessage {
         content_type: String,
@@ -1035,27 +1024,13 @@ mod tests {
             ),
             (
                 2,
-                Payload::HnsQuery {
-                    domain: String::new(),
-                },
-            ),
-            (
-                3,
-                Payload::HnsAnswer {
-                    domain: String::new(),
-                    proof: Vec::new(),
-                    for_query: [0u8; 32],
-                },
-            ),
-            (
-                4,
                 Payload::PeerMessage {
                     content_type: String::new(),
                     body: Vec::new(),
                 },
             ),
             (
-                5,
+                3,
                 Payload::SessionInit {
                     ek_pub: [0u8; 32],
                     spk_pub: [0u8; 32],
@@ -1063,13 +1038,13 @@ mod tests {
                 },
             ),
             (
-                6,
+                4,
                 Payload::SessionMessage {
                     msg: ratchet.clone(),
                 },
             ),
             (
-                7,
+                5,
                 Payload::Private {
                     sender: [0u8; 32],
                     inner: Box::new(Payload::PeerMessage {
@@ -1079,7 +1054,7 @@ mod tests {
                 },
             ),
             (
-                8,
+                6,
                 Payload::Ack {
                     for_bundle_id: [0u8; 32],
                     status: 0,
@@ -1089,7 +1064,7 @@ mod tests {
                 },
             ),
             (
-                9,
+                7,
                 Payload::StreamOpen {
                     stream_id: [0u8; 16],
                     kind: StreamKind::Sse,
@@ -1099,7 +1074,7 @@ mod tests {
                 },
             ),
             (
-                10,
+                8,
                 Payload::StreamData {
                     stream_id: [0u8; 16],
                     seq: 0,
@@ -1108,21 +1083,21 @@ mod tests {
                 },
             ),
             (
-                11,
+                9,
                 Payload::StreamAck {
                     stream_id: [0u8; 16],
                     ack: 0,
                 },
             ),
             (
-                12,
+                10,
                 Payload::StreamClose {
                     stream_id: [0u8; 16],
                     reason: 0,
                 },
             ),
             (
-                13,
+                11,
                 Payload::ServiceRequest {
                     service: String::new(),
                     method: String::new(),
@@ -1130,7 +1105,7 @@ mod tests {
                 },
             ),
             (
-                14,
+                12,
                 Payload::ServiceResponse {
                     for_bundle_id: [0u8; 32],
                     status: 0,
@@ -1138,7 +1113,7 @@ mod tests {
                 },
             ),
             (
-                15,
+                13,
                 Payload::Carrier {
                     stream_id: [0u8; 16],
                     seq: 0,
@@ -1147,14 +1122,14 @@ mod tests {
                 },
             ),
             (
-                16,
+                14,
                 Payload::HpsJoinRequest {
                     path: String::new(),
                     proof: [0u8; 32],
                 },
             ),
             (
-                17,
+                15,
                 Payload::HpsKeys {
                     path: String::new(),
                     content_key: [0u8; 32],
@@ -1163,7 +1138,7 @@ mod tests {
                 },
             ),
             (
-                18,
+                16,
                 Payload::HpsInvite {
                     path: String::new(),
                     kind: crate::hps::ServiceKind::Channel,
@@ -1171,21 +1146,21 @@ mod tests {
                 },
             ),
             (
-                19,
+                17,
                 Payload::HpsInviteAccept {
                     path: String::new(),
                     proof: [0u8; 32],
                 },
             ),
             (
-                20,
+                18,
                 Payload::HpsLeave {
                     path: String::new(),
                     proof: [0u8; 32],
                 },
             ),
             (
-                21,
+                19,
                 Payload::HpsRekey {
                     old_path: String::new(),
                     new_path: String::new(),
@@ -1196,14 +1171,14 @@ mod tests {
                 },
             ),
             (
-                22,
+                20,
                 Payload::HpsReachAck {
                     topic_tag: [0u8; 16],
                     epoch: 0,
                 },
             ),
             (
-                23,
+                21,
                 Payload::HpsPublish {
                     topic_tag: [0u8; 16],
                     epoch: 0,
@@ -1212,7 +1187,7 @@ mod tests {
                     sig: Vec::new(),
                 },
             ),
-            (24, Payload::SessionReset),
+            (22, Payload::SessionReset),
         ];
         for (want, p) in &variants {
             let enc = postcard::to_allocvec(p).unwrap();
@@ -1221,7 +1196,7 @@ mod tests {
                 "Payload::{p:?} must keep discriminant {want} (append-only wire discipline)"
             );
         }
-        assert_eq!(variants.len(), 25, "all 25 Payload variants are pinned");
+        assert_eq!(variants.len(), 23, "all 23 Payload variants are pinned");
 
         // StreamKind also rides inside sealed StreamOpen; pin it too.
         assert_eq!(postcard::to_allocvec(&StreamKind::Sse).unwrap(), vec![0]);
