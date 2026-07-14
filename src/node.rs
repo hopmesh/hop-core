@@ -1076,6 +1076,12 @@ impl<S: Store> Node<S> {
         self.now_ms = now_ms;
     }
 
+    /// The node's current clock (last value passed to [`tick`](Self::tick) or
+    /// [`set_time`](Self::set_time)).
+    pub fn now_ms(&self) -> u64 {
+        self.now_ms
+    }
+
     /// Raise (or lower) the learned-route table capacity (DESIGN.md §27). Cloud nodes
     /// set this high to become the long-memory backbone; mobile nodes keep the default.
     pub fn set_route_capacity(&mut self, cap: usize) {
@@ -2517,6 +2523,22 @@ impl<S: Store> Node<S> {
     /// Publish a message to a topic we can write to — a `Service` we host (signed by the
     /// service key) or a `Channel` we belong to (signed by our own identity). Floods to all
     /// subscribers via [`Destination::Broadcast`].
+    /// Register an `hps://` topic with a caller-supplied pre-shared **content key**, so a group that
+    /// already agrees on the key (endpoint replicas deriving it from a shared secret, say) can read
+    /// and write the topic with NO host/join handshake. Behaves like a channel subscription: each
+    /// publish is signed by the sender's identity and verified against `src` on receipt. Idempotent
+    /// per `path`. This is a general pre-shared-key primitive; it knows nothing about clusters.
+    pub fn hps_register_keyed(&mut self, path: &str, content_key: [u8; 32]) {
+        let sub = HpsSubscription {
+            content_key,
+            service_pubkey: None, // channel-style: members sign with their own identity
+            host: self.identity.address(), // no distinct host in a pre-shared-key group
+            epoch: 0,
+            topic_tag: self.app.topic_tag(path),
+        };
+        self.subscriptions.insert(path.to_string(), sub);
+    }
+
     pub fn hps_publish(&mut self, path: &str, plaintext: &[u8]) -> Result<BundleId> {
         let (content_key, epoch) = if let Some(cfg) = self.services.get(path) {
             let content_key = cfg.content_key;
@@ -5478,6 +5500,31 @@ mod tests {
             !nodes[0].store.contains(&req_id),
             "request purged once its response arrives"
         );
+    }
+
+    #[test]
+    fn hps_register_keyed_lets_a_preshared_group_talk_without_a_handshake() {
+        // The general pre-shared-key primitive the endpoint cluster is built on: two nodes that
+        // already agree on a content key can read + write a topic with no host and no join.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let ck = [3u8; 32];
+        let path = "_grp/x";
+        nodes[0].hps_register_keyed(path, ck);
+        nodes[1].hps_register_keyed(path, ck);
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        nodes[0].hps_publish(path, b"hello group").unwrap();
+        net.pump(&mut nodes);
+
+        let msgs = nodes[1].take_hps_messages();
+        assert_eq!(msgs.len(), 1, "the peer received the keyed publish");
+        assert_eq!(msgs[0].path, path);
+        assert_eq!(msgs[0].body, b"hello group");
+        assert_eq!(msgs[0].sender, nodes[0].address(), "verified against src");
     }
 
     #[test]
