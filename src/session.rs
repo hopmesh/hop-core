@@ -168,6 +168,15 @@ impl Session {
     /// Decrypt an inbound message, performing a DH ratchet step and/or replaying
     /// skipped keys as needed. Tolerates out-of-order and dropped messages.
     pub fn decrypt(&mut self, msg: &RatchetMessage) -> Result<Vec<u8>> {
+        // Authentication failure must not consume skipped keys or advance either ratchet. Stage the
+        // transition on a clone, then commit it only after AEAD verification succeeds.
+        let mut staged = self.clone();
+        let plaintext = staged.decrypt_staged(msg)?;
+        *self = staged;
+        Ok(plaintext)
+    }
+
+    fn decrypt_staged(&mut self, msg: &RatchetMessage) -> Result<Vec<u8>> {
         let aad = postcard::to_allocvec(&msg.header)?;
 
         // A previously-skipped (out-of-order) message?
@@ -277,6 +286,25 @@ mod tests {
     use super::*;
     use crate::crypto::{self, Identity};
 
+    fn pair() -> (Session, Session) {
+        let alice_id = Identity::generate();
+        let bob_id = Identity::generate();
+        let bob_spk = bob_id.generate_prekey();
+        let bundle = bob_spk.bundle(bob_id.address());
+        let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle).unwrap();
+        let root_b = crypto::x3dh_respond(
+            &bob_id,
+            &bob_spk.secret_bytes(),
+            &alice_id.address(),
+            &ek_pub,
+        )
+        .unwrap();
+        (
+            Session::init_initiator(root_a, bundle.spk_pub),
+            Session::init_responder(root_b, bob_spk.secret_bytes(), bob_spk.public),
+        )
+    }
+
     /// Establish a session via X3DH and run a full conversation, including a
     /// direction switch (DH ratchet) and out-of-order delivery.
     #[test]
@@ -362,5 +390,22 @@ mod tests {
         let mut m = alice.encrypt(b"secret").unwrap();
         m.ciphertext[0] ^= 0xff;
         assert!(bob.decrypt(&m).is_err());
+    }
+
+    #[test]
+    fn failed_authentication_does_not_consume_a_skipped_key() {
+        let (mut alice, mut bob) = pair();
+        let first = alice.encrypt(b"first").unwrap();
+        let second = alice.encrypt(b"second").unwrap();
+        assert_eq!(bob.decrypt(&second).unwrap(), b"second");
+
+        let mut corrupted = first.clone();
+        corrupted.ciphertext[0] ^= 0x80;
+        assert!(bob.decrypt(&corrupted).is_err());
+        assert_eq!(
+            bob.decrypt(&first).unwrap(),
+            b"first",
+            "a forged copy must not burn the genuine skipped-message key"
+        );
     }
 }

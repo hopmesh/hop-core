@@ -55,6 +55,10 @@ enum LinkPacket {
 /// Max plaintext bytes per Noise transport message. Noise caps a message at 65535 bytes
 /// including the 16-byte AEAD tag; we leave headroom for the postcard `LinkPacket` framing.
 const MAX_RECORD_PLAINTEXT: usize = 60_000;
+/// Hard aggregate cap for one link record. User payloads larger than this are not rejected: the
+/// carrier-stream layer splits them into 48 KiB bundles before they reach link framing.
+const MAX_REASSEMBLED_RECORD: usize = 1 << 20;
+const MAX_RECORD_FRAGMENTS: usize = MAX_REASSEMBLED_RECORD.div_ceil(MAX_RECORD_PLAINTEXT);
 
 /// Claims the peer's hop address during the Noise handshake. No signature needed:
 /// the sealing key is derived from the address (Montgomery), so the peer is bound to
@@ -3935,6 +3939,14 @@ impl<S: Store> Node<S> {
             let Ok(piece) = est.session.decrypt(ct) else {
                 return;
             };
+            if usize::from(cnt) > MAX_RECORD_FRAGMENTS
+                || piece.len() > MAX_RECORD_PLAINTEXT
+                || est.frag_buf.len().saturating_add(piece.len()) > MAX_REASSEMBLED_RECORD
+            {
+                est.frag_buf.clear();
+                est.frag_next = 0;
+                return;
+            }
             if cnt == 0 || idx >= cnt || idx != est.frag_next {
                 // Stray or reordered fragment: reset. Only a fresh idx 0 starts a new record.
                 est.frag_buf.clear();
@@ -5035,6 +5047,9 @@ impl<S: Store> Node<S> {
         // Too large for one Noise message — fragment across several so it isn't silently
         // dropped. Each piece is independently encrypted; the peer reassembles (§20).
         let pieces: Vec<&[u8]> = plaintext.chunks(MAX_RECORD_PLAINTEXT).collect();
+        if pieces.len() > MAX_RECORD_FRAGMENTS {
+            return;
+        }
         let cnt = pieces.len() as u16;
         for (i, piece) in pieces.into_iter().enumerate() {
             let Ok(ct) = est.session.encrypt(piece) else {
@@ -8757,6 +8772,36 @@ mod tests {
             data_bytes < 100_000,
             "reconnect re-flooded the foreign directory: {data_bytes} bytes over 10 flap cycles"
         );
+    }
+
+    #[test]
+    fn hostile_fragment_count_is_rejected_before_reassembly() {
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 10);
+        let ct = match nodes[0].links.get_mut(&1) {
+            Some(LinkState::Up(est)) => est.session.encrypt(b"x").unwrap(),
+            _ => panic!("link established"),
+        };
+        let hostile = LinkPacket::DataFrag {
+            idx: 0,
+            cnt: (MAX_RECORD_FRAGMENTS as u16) + 1,
+            ct,
+        };
+        nodes[1].handle(BearerEvent::Data(
+            10,
+            postcard::to_allocvec(&hostile).unwrap(),
+        ));
+        match nodes[1].links.get(&10) {
+            Some(LinkState::Up(est)) => {
+                assert!(est.frag_buf.is_empty());
+                assert_eq!(est.frag_next, 0);
+            }
+            _ => panic!("link remains established"),
+        }
     }
 
     #[test]
