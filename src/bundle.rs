@@ -44,10 +44,10 @@ pub struct TraceHop {
 // scalar fields, incl. flags), so no unbound field — e.g. a flipped flags.request_ack twin — can share a
 // genuine private id and shadow it at a keep-first relay. See compute_private_wire_id.
 // v6 -> v7: HNS consolidated onto self-certifying reach records. The `Payload::HnsQuery`/`HnsAnswer`
-// variants (mesh-assisted DNSSEC name resolution) were REMOVED, which shifts the postcard discriminant
+// variants (mesh-assisted name resolution) were REMOVED, which shifts the postcard discriminant
 // of every later variant, so a v6 decoder misreads a v7 Payload and vice-versa — the version gate must
 // reject a mixed v6/v7 fleet. Name resolution is now a direct HTTPS /.well-known/hop fetch of the reach
-// record (Node::provide_reach_record); the DNSSEC validator + DoH machinery are gone.
+// record (Node::provide_reach_record); the old validator + DoH machinery are gone.
 pub const BUNDLE_VERSION: u8 = 7;
 
 /// Globally-unique bundle id: `BLAKE3(src || nonce || payload_hash)`.
