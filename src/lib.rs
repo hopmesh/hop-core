@@ -7,6 +7,7 @@
 //!
 //! See `DESIGN.md` at the repo root for the full protocol specification.
 
+pub mod access;
 pub mod app;
 pub mod bundle;
 pub mod crypto;
@@ -70,6 +71,10 @@ pub fn relay_app_id() -> AppId {
 
 /// Common imports for working with hop-core.
 pub mod prelude {
+    pub use crate::access::{
+        carriage_hint, epoch_of, AccessPolicy, Admit, CarriageStamp, KeyServer, KeyedAccess,
+        Stamper, TenantId, Usage, CARRIAGE_EPOCH_MS,
+    };
     pub use crate::app::{AppKeys, AppSecret, JOIN_EPOCH_MS};
     pub use crate::bundle::TraceHop;
     pub use crate::bundle::{

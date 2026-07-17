@@ -11,11 +11,15 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::bundle::{Bundle, BundleId};
 
 /// What a node knows it currently holds — used by routing to avoid re-offering
-/// bundles a peer already has.
-#[derive(Clone, Debug, Default)]
+/// bundles a peer already has. Serializable so it can ride a `Wire::Have` custody beacon
+/// (DESIGN.md §35): a node tells a directly-connected peer what it holds so the peer suppresses
+/// re-offering those, cutting duplicate-ingress COGS.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HaveSet {
     pub ids: Vec<BundleId>,
 }

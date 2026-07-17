@@ -48,7 +48,13 @@ pub struct TraceHop {
 // of every later variant, so a v6 decoder misreads a v7 Payload and vice-versa — the version gate must
 // reject a mixed v6/v7 fleet. Name resolution is now a direct HTTPS /.well-known/hop fetch of the reach
 // record (Node::provide_reach_record); the old validator + DoH machinery are gone.
-pub const BUNDLE_VERSION: u8 = 7;
+// v7 -> v8: §35 carriage stamps. `Envelope` gained a trailing `access: Option<CarriageStamp>` field
+// (per-bundle backbone access + metering attribution). A struct-layout change: a v7 decoder fails on
+// the extra envelope bytes and a v8 decoder misreads a v7 envelope, so the gate must reject a mixed
+// fleet. Deliberately on the UNSIGNED envelope so both the private content id and the wire id exclude
+// it (identical content dedups regardless of access material); the stamp is self-certifying instead
+// (root-signed cert + a tenant signature over this bundle's id). See access.rs and DESIGN.md §35.
+pub const BUNDLE_VERSION: u8 = 8;
 
 /// Globally-unique bundle id: `BLAKE3(src || nonce || payload_hash)`.
 pub type BundleId = [u8; 32];
@@ -373,6 +379,15 @@ pub struct Envelope {
     /// signed — it's mutable forwarding metadata. Lets the destination see the path
     /// (who + which app) and nodes learn routes from ACK/trace correlation.
     pub trace: Vec<TraceHop>,
+    /// §35 carriage stamp: per-bundle backbone access + metering attribution, verified by
+    /// keyed relays before they take custody. On the unsigned envelope ON PURPOSE, so both the
+    /// private content id and the wire id exclude it: identical content keeps one identity and
+    /// dedups regardless of access material, and a custodian with a tenant key can re-stamp a
+    /// stripped bundle without forking its id. Self-certifying (the bundle's own integrity
+    /// checks do not cover it): the cert is billing-root-signed and the stamp signature binds
+    /// it to exactly this bundle's id. `None` everywhere access is not required (pure P2P,
+    /// open relays). See `access::CarriageStamp`.
+    pub access: Option<Box<crate::access::CarriageStamp>>,
 }
 
 /// Delivery options for a new bundle. Use `..Default::default()` for the rest.
@@ -453,6 +468,7 @@ impl Bundle {
             copies: opts.copies.max(1),
             hops: 0,
             trace: Vec::new(),
+            access: None,
         };
 
         Ok(Bundle { inner, env, sig })
@@ -504,6 +520,7 @@ impl Bundle {
             copies: opts.copies.max(1),
             hops: 0,
             trace: Vec::new(),
+            access: None,
         };
         Ok(Bundle {
             inner,
@@ -550,6 +567,7 @@ impl Bundle {
             copies: opts.copies.max(1),
             hops: 0,
             trace: Vec::new(),
+            access: None,
         };
         Bundle {
             inner,
@@ -1247,5 +1265,84 @@ mod tests {
             with_src.verify().is_err(),
             "r15: a vaccine must be anonymous (no src)"
         );
+    }
+}
+
+/// §35 carriage-stamp wire tests: the stamp rides the unsigned envelope and must be identity-
+/// neutral (same content id, same wire id, same dedup) while surviving the wire roundtrip.
+#[cfg(test)]
+mod stamp_wire_tests {
+    use super::*;
+    use crate::access::{CarriageStamp, Stamper};
+
+    fn stamped(bundle: &Bundle) -> CarriageStamp {
+        // Any well-formed rotating-tag stamp; these tests only assert the stamp is id-neutral on
+        // the wire, not that it verifies (that lives in access.rs).
+        Stamper::new([7u8; 16], Identity::generate()).stamp(&bundle.id(), 12_345)
+    }
+
+    #[test]
+    fn a_stamped_bundle_roundtrips_and_keeps_its_stamp() {
+        let from = Identity::generate();
+        let to = Identity::generate();
+        let mut b = Bundle::create(
+            &from,
+            Destination::Device(to.address()),
+            &to.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"postage".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        b.env.access = Some(Box::new(stamped(&b)));
+        let decoded = Bundle::from_bytes(&b.to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded, b);
+        assert!(decoded.verify().is_ok());
+        assert!(decoded.env.access.is_some());
+    }
+
+    #[test]
+    fn the_stamp_never_changes_a_traced_bundle_id_or_signature() {
+        let from = Identity::generate();
+        let to = Identity::generate();
+        let bare = Bundle::create(
+            &from,
+            Destination::Device(to.address()),
+            &to.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"same identity".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let mut with_stamp = bare.clone();
+        with_stamp.env.access = Some(Box::new(stamped(&bare)));
+        assert_eq!(bare.id(), with_stamp.id());
+        assert!(with_stamp.verify().is_ok(), "sig excludes the envelope");
+    }
+
+    #[test]
+    fn the_stamp_never_changes_a_private_bundle_wire_or_content_id() {
+        let to = Identity::generate();
+        let spk = to.generate_prekey();
+        let bare = Bundle::create_private(
+            &to.address(),
+            &spk.public,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"private postage".to_vec(),
+            },
+            None,
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let mut with_stamp = bare.clone();
+        with_stamp.env.access = Some(Box::new(stamped(&bare)));
+        assert_eq!(bare.id(), with_stamp.id());
+        assert_eq!(bare.private_content_id(), with_stamp.private_content_id());
+        assert!(with_stamp.verify().is_ok(), "wire id excludes the envelope");
     }
 }

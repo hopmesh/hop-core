@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::access::{AccessPolicy, Admit, Stamper, TenantId, Usage};
 use crate::app::AppKeys;
 use crate::bundle::{Bundle, BundleFlags, BundleId, BundleOpts, Destination, Payload, StreamId};
 use crate::crypto::{
@@ -69,10 +70,19 @@ struct LinkAuth {
 }
 
 /// An application record exchanged over an established link.
+///
+/// WIRE DISCIPLINE: append-only, same as the bundle enums. `Have` was appended as the §35
+/// custody beacon (a node tells this peer what it already holds so the peer stops re-offering it);
+/// added within the v8 wire bump.
 #[derive(Serialize, Deserialize)]
 enum Wire {
     Bundle(Bundle),
     Advert(Advert),
+    /// §35 custody beacon: "I already hold these ids, do not offer them to me." Mode-1 only:
+    /// exchanged over the authenticated Noise link with the peer it constrains, so it is the
+    /// peer's own truthful claim about its own store (no forgery/censorship surface, unlike a
+    /// flooded beacon). Cuts duplicate-ingress COGS.
+    Have(crate::store::HaveSet),
 }
 
 struct Handshaking {
@@ -85,6 +95,10 @@ struct Established {
     peer: PubKeyBytes,
     sent_bundles: HashSet<crate::bundle::BundleId>,
     sent_adverts: HashSet<crate::discover::AdvertId>,
+    /// §35 custody beacon: ids this peer told us (over this authenticated link) it already holds,
+    /// so we suppress re-offering them. Bounded by [`MAX_PEER_HAS`]; cleared on reconnect (the
+    /// peer re-sends its `Wire::Have`).
+    peer_has: HashSet<crate::bundle::BundleId>,
     /// Reassembly of an in-progress fragmented record (DESIGN.md §20): accumulated decrypted
     /// plaintext and the next fragment index expected. `frag_cnt == 0` means none in progress.
     frag_buf: Vec<u8>,
@@ -246,6 +260,23 @@ const LOCAL_LINK: LinkId = 0;
 /// approaches this. Traced (signed, attributable) bundles and stream carriers are NOT limited.
 const PRIV_INGEST_WINDOW_MS: u64 = 1_000;
 const MAX_PRIV_BUNDLES_PER_WINDOW: u32 = 256;
+
+/// Cap on distinct tenants the in-memory §35 usage map tracks between host flushes. Every
+/// entry is backed by a VERIFIED stamp (forgeries never reach the meter), so this only bounds a
+/// hostile issuer-side explosion or a very long flush gap. At the cap, new tenants are still
+/// admitted (availability wins) but not metered until a drain frees space; the host flush
+/// interval (tens of seconds) makes the unmetered window negligible.
+const MAX_METERED_TENANTS: usize = 4_096;
+
+/// Cap on the pending-attribution map (verified-at-admit tenant per held foreign bundle, awaiting
+/// a delivery proof to bill). A relay holds at most `max_relayed` foreign bundles, so this
+/// comfortably covers the held set plus the one-tick lag before `tick` prunes evicted entries.
+const MAX_METERED_ATTRIBUTION: usize = 16_384;
+
+/// §35 custody beacon: cap on ids advertised in one `Wire::Have`, and on ids remembered per peer.
+/// Bounds the beacon's link bandwidth (a full held set can be large) and the per-link `peer_has`
+/// memory; a relay that holds more than this simply advertises its most-recent slice.
+const MAX_HAVE_ADVERTISE: usize = 4_096;
 /// Cap on the soft-state gradient table (bounds a Sybil flooding fake mailbox-tags; signed
 /// beacons stop *hijack*, this stops *bloat*). On overflow the nearest-to-expiry entry is evicted.
 pub const MAX_RECV_GRADIENT: usize = 4_096;
@@ -694,6 +725,33 @@ pub struct Node<S: Store = MemoryStore> {
     /// commit 6bb5739). The host drains it via [`Node::take_rehydrate_report`] and surfaces it
     /// so a silent state wipe is observable instead of invisible.
     rehydrate_report: RehydrateReport,
+    /// §35: the tenant cert + key this node stamps its originated bundles with (`None` on
+    /// pure-P2P nodes). Applied in [`Node::submit`], the single origination choke point.
+    stamper: Option<Stamper>,
+    /// §35: admission policy for foreign bundles. `Open` (the default) preserves the
+    /// pre-stamp behavior everywhere; a hosted relay sets `Keyed` to require stamps and meter.
+    access_policy: AccessPolicy,
+    /// §35 metering atoms per tenant, accumulated when delivery is PROVEN (via
+    /// [`Node::meter_delivered`]) and drained by the host's flush loop via [`Node::take_usage`].
+    /// Bounded by [`MAX_METERED_TENANTS`].
+    usage: HashMap<TenantId, Usage>,
+    /// §35 delivery-justified metering: the tenant + sealed bytes VERIFIED when we took custody of
+    /// a foreign bundle, held until we either see proof of delivery (bill it, [`meter_delivered`])
+    /// or drop it undelivered (evicted/expired: never billed as carriage, `tick` prunes these).
+    /// Verifying at admit and carrying the result here means a delay-tolerant bundle delivered
+    /// after its stamp epoch has rolled still bills correctly, and the mutable stamp is never
+    /// re-read at delivery. Bounded by [`MAX_METERED_ATTRIBUTION`].
+    metered_attribution: HashMap<BundleId, (TenantId, u64)>,
+    /// Foreign bundles refused by the `Keyed` policy since the host last drained
+    /// [`Node::take_access_refused`]. Observability only (netlog_private), never per-bundle.
+    access_refused: u64,
+    /// Accepted bundles NOT metered because the per-flush tenant map was at
+    /// [`MAX_METERED_TENANTS`]. Carried but unattributed = lost revenue; surfaced via
+    /// [`Node::take_usage_dropped`] so overflow is never silent.
+    usage_dropped: u64,
+    /// §35 custody beacon: whether this node advertises a `Wire::Have` on connect. Off by default
+    /// (devices should not burn a constrained BLE link with a full held set); relays turn it on.
+    emit_have: bool,
 }
 
 /// A tally of persisted records that failed to decode on startup, per kind. Empty is the
@@ -883,6 +941,13 @@ impl<S: Store> Node<S> {
             hps_acked: std::collections::HashSet::new(),
             priv_ingest: HashMap::new(),
             rehydrate_report: RehydrateReport::default(),
+            stamper: None,
+            access_policy: AccessPolicy::Open,
+            usage: HashMap::new(),
+            metered_attribution: HashMap::new(),
+            access_refused: 0,
+            usage_dropped: 0,
+            emit_have: false,
         };
         node.rehydrate();
         node
@@ -1137,9 +1202,100 @@ impl<S: Store> Node<S> {
         self.directory.subscribe(topic);
     }
 
+    /// §35: configure the tenant cert + key this node stamps its originated bundles with.
+    /// `None` (the default) originates unstamped bundles: full pure-P2P function, but keyed
+    /// relays will refuse them custody. Configured once per app/account; [`Node::submit`]
+    /// then stamps everything this node originates, ACKs and control bundles included, so
+    /// the return path is admissible at keyed relays too.
+    pub fn set_stamper(&mut self, stamper: Option<Stamper>) {
+        self.stamper = stamper;
+    }
+
+    /// §35: set the admission policy for foreign (not-ours) bundles. `Open` (the default)
+    /// takes custody of any verifiable bundle, unmetered, on every device and open relay.
+    /// A hosted relay sets `Keyed` to require a valid carriage stamp and meter per tenant.
+    pub fn set_access_policy(&mut self, policy: AccessPolicy) {
+        self.access_policy = policy;
+    }
+
+    /// The current §35 admission policy (hosts assert their configuration wired through).
+    pub fn access_policy(&self) -> &AccessPolicy {
+        &self.access_policy
+    }
+
+    /// Refresh the keyed-access epoch tables against the node's clock, now. A keyed host calls
+    /// this once after configuring the policy and seeding the clock, so the first bundle that
+    /// arrives before the first tick is admitted; thereafter [`Node::tick`] keeps them current.
+    pub fn refresh_access(&mut self) {
+        self.access_policy.refresh(self.now_ms);
+    }
+
+    /// §35: enable the custody beacon (advertise a `Wire::Have` on connect so peers stop
+    /// re-offering bundles we already hold). Relays turn this on; devices leave it off to spare a
+    /// constrained BLE link.
+    pub fn set_emit_have(&mut self, on: bool) {
+        self.emit_have = on;
+    }
+
+    /// Test-only: the ids a peer told us (via `Wire::Have`) it already holds on `link`.
+    #[cfg(test)]
+    fn link_peer_has(&self, link: LinkId) -> Vec<BundleId> {
+        match self.links.get(&link) {
+            Some(LinkState::Up(est)) => est.peer_has.iter().copied().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Drain the §35 per-tenant usage accumulated at the custody choke point since the last
+    /// call. The host's flush loop merges these into its durable ledger (§37); draining here
+    /// keeps the in-memory map bounded and makes a host crash lose at most one interval.
+    pub fn take_usage(&mut self) -> Vec<(TenantId, Usage)> {
+        self.usage.drain().collect()
+    }
+
+    /// Drain the count of foreign bundles the `Keyed` policy refused since the last call.
+    /// Aggregate observability for the host's private log, never a per-bundle event.
+    pub fn take_access_refused(&mut self) -> u64 {
+        std::mem::take(&mut self.access_refused)
+    }
+
+    /// Drain the count of accepted-but-unmetered bundles (tenant-map overflow) since the last
+    /// call. Nonzero means the flush interval is too long for the tenant cardinality.
+    pub fn take_usage_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.usage_dropped)
+    }
+
+    /// §35 delivery-justified billing: bill the tenant we recorded (verified) when we took custody
+    /// of `id`, because its delivery is now PROVEN (an ACK or §39 vaccine cleared our held copy).
+    /// Idempotent: the attribution is removed, so a re-flooded proof cannot double-charge, and a
+    /// bundle we never metered (Open policy, our own send, or already billed) is a no-op.
+    fn meter_delivered(&mut self, id: &BundleId) {
+        if let Some((tenant, bytes)) = self.metered_attribution.remove(id) {
+            if self.usage.len() < MAX_METERED_TENANTS || self.usage.contains_key(&tenant) {
+                let u = self.usage.entry(tenant).or_default();
+                u.bundles = u.bundles.saturating_add(1);
+                u.payload_bytes = u.payload_bytes.saturating_add(bytes);
+            } else {
+                self.usage_dropped = self.usage_dropped.saturating_add(1);
+            }
+        }
+    }
+
     /// Submit a locally-originated bundle for delivery; offers it to live links.
     /// If it requests an ACK, it's tracked for retransmission until acked/expired.
-    pub fn submit(&mut self, bundle: Bundle) {
+    pub fn submit(&mut self, mut bundle: Bundle) {
+        // §35: stamp everything we originate when a tenant stamper is configured. The id is
+        // stamp-independent (the stamp rides the unsigned envelope, excluded from both id
+        // derivations), so stamping after id computation is sound. A bundle that already
+        // carries a stamp keeps it.
+        if let Some(stamper) = &self.stamper {
+            // Vaccines are exempt: they are anonymous anti-packets (stamping leaks the recipient),
+            // and keyed relays admit them unstamped.
+            let is_vaccine = matches!(bundle.inner.dst, Destination::Vaccine(_));
+            if bundle.env.access.is_none() && !is_vaccine {
+                bundle.env.access = Some(Box::new(stamper.stamp(&bundle.id(), self.now_ms)));
+            }
+        }
         let id = bundle.id();
         let track = bundle.inner.flags.request_ack && !bundle.inner.flags.is_ack;
         let pend = PendingTx {
@@ -3446,6 +3602,17 @@ impl<S: Store> Node<S> {
     /// retry timer is due, giving up on any past their lifetime (§7, §8).
     pub fn tick(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+        // §35: roll the keyed-access hint tables when the epoch advances (no-op under Open, cheap
+        // when the epoch is stable). Keeps admission an O(1) hint lookup instead of a per-bundle scan.
+        self.access_policy.refresh(now_ms);
+        // §35: drop pending attribution for any bundle no longer HELD. A delivered bundle already
+        // removed its own entry (via meter_delivered) synchronously; what remains here for a
+        // no-longer-held id is an evicted or TTL-expired bundle that never delivered, and is
+        // therefore never billed as carriage (decision 2). Cheap: only runs when non-empty.
+        if !self.metered_attribution.is_empty() {
+            self.metered_attribution
+                .retain(|id, _| self.store.contains(id));
+        }
         self.directory.expire(now_ms);
         // §39 P4 (+ sec-priv-04): drop stale next-hops — a recipient that stopped beaconing (moved or
         // went passive) stops attracting bundles down its link within one TTL (no permanent black-hole).
@@ -3864,6 +4031,7 @@ impl<S: Store> Node<S> {
                     peer,
                     sent_bundles: prior.bundles,
                     sent_adverts: prior.adverts,
+                    peer_has: HashSet::new(),
                     frag_buf: Vec::new(),
                     frag_next: 0,
                 })),
@@ -3898,6 +4066,16 @@ impl<S: Store> Node<S> {
                     est.sent_bundles.remove(id);
                 }
             }
+            // §35 custody beacon: if enabled (relays), tell this peer what we already hold so it
+            // stops re-offering those to us, cutting duplicate-ingress COGS. Mode-1 (over the
+            // authenticated link with the peer it constrains): the peer's own truthful claim, no
+            // forgery surface. Sent BEFORE our offers so the peer's first offer pass to us is
+            // already filtered by what we hold (symmetric: each side beacons its holdings).
+            if self.emit_have {
+                let mut ids = self.store.have().ids;
+                ids.truncate(MAX_HAVE_ADVERTISE);
+                self.send_record(link, &Wire::Have(crate::store::HaveSet { ids }));
+            }
             // Adverts (prekeys + presence) FIRST, then bulk bundles: a peer needs our prekey to
             // open a forward-secret session to us, so it must not sit behind a burst of relay-bundle
             // offers on a rate-limited BLE link (that head-of-line blocking delayed "Securing").
@@ -3906,6 +4084,22 @@ impl<S: Store> Node<S> {
         } else {
             self.links
                 .insert(link, LinkState::Handshaking(Box::new(state)));
+        }
+    }
+
+    /// §35 custody beacon inbound: this peer told us (over the authenticated link) which ids it
+    /// already holds, so we suppress re-offering them on this link. Mode-1: the claim constrains
+    /// only this peer's own link, so a dishonest claim just denies the peer a bundle it said it
+    /// had (self-harm), never censors delivery to anyone else. Bounded by [`MAX_HAVE_ADVERTISE`]
+    /// via a truncating merge.
+    fn on_have(&mut self, link: LinkId, have: crate::store::HaveSet) {
+        if let Some(LinkState::Up(est)) = self.links.get_mut(&link) {
+            for id in have.ids.into_iter().take(MAX_HAVE_ADVERTISE) {
+                if est.peer_has.len() >= MAX_HAVE_ADVERTISE {
+                    break;
+                }
+                est.peer_has.insert(id);
+            }
         }
     }
 
@@ -3922,6 +4116,7 @@ impl<S: Store> Node<S> {
         match postcard::from_bytes::<Wire>(&plaintext) {
             Ok(Wire::Bundle(b)) => self.on_bundle(link, b),
             Ok(Wire::Advert(a)) => self.on_advert(link, peer, a),
+            Ok(Wire::Have(hs)) => self.on_have(link, hs),
             Err(_) => {}
         }
     }
@@ -3969,6 +4164,7 @@ impl<S: Store> Node<S> {
             match postcard::from_bytes::<Wire>(&plaintext) {
                 Ok(Wire::Bundle(b)) => self.on_bundle(link, b),
                 Ok(Wire::Advert(a)) => self.on_advert(link, peer, a),
+                Ok(Wire::Have(hs)) => self.on_have(link, hs),
                 Err(_) => {}
             }
         }
@@ -4385,6 +4581,8 @@ impl<S: Store> Node<S> {
                             Some(Destination::Device(d)) if d == bundle.inner.src
                         );
                     if authorized {
+                        // §35: a returning ACK proves this relay carried the bundle to delivery.
+                        self.meter_delivered(&delivered);
                         self.store.remove(&delivered);
                         self.relay_order.retain(|x| *x != delivered);
                         self.immune.insert(delivered, self.now_ms);
@@ -4430,6 +4628,9 @@ impl<S: Store> Node<S> {
                                 }
                             }
                         }
+                        // §35: a §39 delivery vaccine proves this relay's held private bundle was
+                        // delivered (the same delivery-justified atom, on the untraceable path).
+                        self.meter_delivered(&delivered);
                         self.store.remove(&delivered);
                         self.relay_order.retain(|x| *x != delivered);
                         self.immune.insert(delivered, self.now_ms);
@@ -4459,6 +4660,45 @@ impl<S: Store> Node<S> {
             return;
         }
         // Not ours: store for onward relay, then offer to every other live link.
+        //
+        // §35 carriage gate: under a `Keyed` policy, custody of a foreign bundle requires a stamp
+        // whose signer is in the keyserver; `admit` VERIFIES the rotating-hint signature against
+        // the current/previous epoch and returns the attributable tenant. We record that verified
+        // tenant now (metering itself is DELIVERY-justified, below) so a delay-tolerant delivery
+        // after the stamp epoch rolls still bills, and the mutable stamp is never re-read later.
+        // LOCAL_LINK re-injections (durable re-ingest: warm reload, mailbox pulls, rehydrate) are
+        // trusted first-accepts (they were gated on live arrival); re-gating them would lose
+        // spooled mail (process_mailbox deletes the durable copy after the custody ack).
+        // Vaccines are §39 anti-packets, not billable carriage: they MUST propagate freely to
+        // purge delivered copies fleet-wide, and stamping one would leak the recipient. Exempt
+        // them from the gate and the meter entirely (decision: vaccine exemption).
+        let is_vaccine = matches!(bundle.inner.dst, Destination::Vaccine(_));
+        let metered_tenant = if is_vaccine {
+            None
+        } else if from_link == LOCAL_LINK {
+            // Durable re-ingest (a spooled bundle pulled back for offline delivery, or a warm
+            // reload of our own partition): a trusted first-accept, NOT gated. But if it carries a
+            // stamp, attribute it now (any-epoch, since a spooled stamp is legitimately old) so the
+            // eventual mesh delivery bills the OFFLINE-delivery path, which is otherwise silent
+            // because the origin relay's in-memory attribution was pruned when it evicted the copy.
+            bundle
+                .env
+                .access
+                .as_deref()
+                .and_then(|s| self.access_policy.attribute(s, &id))
+        } else {
+            match self
+                .access_policy
+                .admit(bundle.env.access.as_deref(), &id, self.now_ms)
+            {
+                Admit::Granted(tenant) => tenant,
+                Admit::Refused => {
+                    self.access_refused = self.access_refused.saturating_add(1);
+                    return;
+                }
+            }
+        };
+        let metered_bytes = bundle.inner.payload.ciphertext.len() as u64;
         let relay_src = bundle.inner.src;
         let relay_dst = match bundle.inner.dst {
             Destination::Device(d) => Some(d),
@@ -4479,6 +4719,22 @@ impl<S: Store> Node<S> {
             self.store.put(bundle, self.now_ms)
         };
         if stored {
+            // §35: record the VERIFIED attribution for this held bundle, but do NOT bill yet.
+            // Billing is DELIVERY-justified (decision 2): we charge this tenant only if/when we
+            // later see proof the bundle was delivered (an ACK or §39 vaccine purges our copy,
+            // `meter_delivered`). A bundle we hold that never delivers (evicts or TTL-expires) is
+            // never billed as carriage; its durable-storage occupancy is priced by the separate
+            // storage floor. `tick` prunes attribution for any bundle no longer held.
+            if let Some(tenant) = metered_tenant {
+                if self.metered_attribution.len() < MAX_METERED_ATTRIBUTION
+                    || self.metered_attribution.contains_key(&id)
+                {
+                    self.metered_attribution.insert(id, (tenant, metered_bytes));
+                } else {
+                    // Cap hit: carried but unattributed. Count the drop so the host can surface it.
+                    self.usage_dropped = self.usage_dropped.saturating_add(1);
+                }
+            }
             self.relay_order.push(id);
             // Remember we're carrying this toward `dst` so a returning ACK teaches the
             // route (§27). `or_insert` keeps our own-send record if we have one.
@@ -4860,7 +5116,11 @@ impl<S: Store> Node<S> {
         let Some(LinkState::Up(est)) = self.links.get(&link) else {
             return;
         };
-        if est.sent_bundles.contains(&id) {
+        // Already sent this bundle on this link, OR the peer's custody beacon said it already holds
+        // it: either way, do not re-offer (§35 duplicate-ingress suppression). Mode-1 exact set, so
+        // no false positives; a recipient-gradient bundle still floods on links where the peer did
+        // NOT claim it, so no flood floor is needed.
+        if est.sent_bundles.contains(&id) || est.peer_has.contains(&id) {
             return;
         }
         let peer = est.peer;
@@ -9136,6 +9396,45 @@ mod tests {
     }
 
     #[test]
+    fn custody_beacon_tells_a_peer_what_we_hold_so_it_suppresses_reoffers() {
+        // §35 mode-1 custody beacon: node 1 holds a bundle and, with emit_have on, advertises it
+        // on connect. Node 0 records it in peer_has for that link and will not re-offer it.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        nodes[1].set_emit_have(true);
+
+        // Node 1 holds a foreign bundle X (admit it from nowhere so it is in the store).
+        let from = Identity::generate();
+        let to = Identity::generate();
+        let x = Bundle::create(
+            &from,
+            Destination::Device(to.address()),
+            &to.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"held".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let xid = x.id();
+        nodes[1].on_bundle(7, x);
+        assert!(nodes[1].store.contains(&xid));
+
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 10, 1, 11); // node 0's link to node 1 is link 10
+        net.pump(&mut nodes);
+
+        // Node 0 learned, over the authenticated link, that node 1 already holds X.
+        assert!(
+            nodes[0].link_peer_has(10).contains(&xid),
+            "the custody beacon populated peer_has, so X will not be re-offered to node 1"
+        );
+    }
+
+    #[test]
     fn trace_records_each_relay_hop() {
         // 0 <-> 1 <-> 2; a message 0 → 2 should arrive carrying the short address of
         // each node that forwarded it (DESIGN.md §27).
@@ -10079,6 +10378,363 @@ mod tests {
         assert!(
             !node.holds_prekey_secret(&intermediate),
             "an out-of-window past epoch secret is wiped"
+        );
+    }
+}
+
+/// §35 carriage gate + meter tests (rotating key-hint stamps): a `Keyed` node only takes custody
+/// of a foreign bundle whose stamp signer is in its keyserver, meters each accept once to its
+/// tenant, and leaves `Open` nodes byte-for-byte at the pre-stamp behavior.
+#[cfg(test)]
+mod access_gate_tests {
+    use super::*;
+    use crate::access::{
+        carriage_hint, epoch_of, AccessPolicy, CarriageStamp, KeyServer, KeyedAccess, Stamper,
+        TenantId, CARRIAGE_EPOCH_MS,
+    };
+
+    const TENANT: TenantId = [7u8; 16];
+    const NOW: u64 = 100 * CARRIAGE_EPOCH_MS + 5;
+
+    /// A keyed relay knowing exactly `TENANT -> stamper.key`, clock seeded + tables refreshed.
+    fn keyed_relay(stamper_key: &Identity) -> Node {
+        let mut node = Node::new(Identity::generate());
+        node.set_time(NOW);
+        let mut server = KeyServer::new();
+        server.insert(TENANT, stamper_key.address());
+        node.set_access_policy(AccessPolicy::Keyed(KeyedAccess::new(
+            server,
+            HashSet::new(),
+        )));
+        node.refresh_access();
+        node
+    }
+
+    fn tenant_stamper() -> (Stamper, Identity) {
+        let key = Identity::generate();
+        (
+            Stamper::new(TENANT, Identity::from_secret_bytes(&key.to_secret_bytes())),
+            key,
+        )
+    }
+
+    /// A foreign traced bundle between two identities that are not the node under test.
+    fn foreign(body: &[u8]) -> Bundle {
+        let from = Identity::generate();
+        let to = Identity::generate();
+        Bundle::create(
+            &from,
+            Destination::Device(to.address()),
+            &to.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: body.to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_keyed_node_refuses_unstamped_foreign_bundles() {
+        let (_, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+        let b = foreign(b"no postage");
+        let id = b.id();
+        relay.on_bundle(9, b);
+        assert!(!relay.store.contains(&id), "custody refused");
+        assert!(!relay.store.seen(&id), "never entered the store");
+        assert_eq!(relay.take_access_refused(), 1);
+        assert!(relay.take_usage().is_empty(), "refusals are never metered");
+    }
+
+    #[test]
+    fn a_keyed_node_admits_a_stamped_bundle_but_does_not_bill_at_custody() {
+        // Custody records the VERIFIED attribution; billing is delivery-justified and does NOT
+        // fire here (the wire-level `delivery_bills_the_recorded_tenant` proves the delivery bill).
+        let (stamper, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+        let mut b = foreign(b"stamped");
+        let id = b.id();
+        b.env.access = Some(Box::new(stamper.stamp(&id, NOW)));
+
+        relay.on_bundle(9, b.clone());
+        assert!(relay.store.contains(&id), "admitted to custody");
+        // Duplicate flood from another link: keep-first, still held once.
+        relay.on_bundle(10, b);
+        assert!(
+            relay.take_usage().is_empty(),
+            "custody records but does not bill"
+        );
+        assert_eq!(relay.take_access_refused(), 0);
+    }
+
+    #[test]
+    fn a_denied_tenant_is_refused() {
+        let (stamper, key) = tenant_stamper();
+        let mut relay = Node::new(Identity::generate());
+        relay.set_time(NOW);
+        let mut server = KeyServer::new();
+        server.insert(TENANT, key.address());
+        let mut denied = HashSet::new();
+        denied.insert(TENANT);
+        relay.set_access_policy(AccessPolicy::Keyed(KeyedAccess::new(server, denied)));
+        relay.refresh_access();
+        let mut b = foreign(b"denied");
+        let id = b.id();
+        b.env.access = Some(Box::new(stamper.stamp(&id, NOW)));
+        relay.on_bundle(9, b);
+        assert!(!relay.store.contains(&id));
+        assert_eq!(relay.take_access_refused(), 1);
+    }
+
+    #[test]
+    fn a_forged_stamp_with_the_right_hint_but_wrong_key_is_refused() {
+        // Attacker knows the tenant id (right bucket) but not the key: no valid signature.
+        let (_, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+        let mut b = foreign(b"forged");
+        let id = b.id();
+        let e = epoch_of(NOW);
+        b.env.access = Some(Box::new(CarriageStamp {
+            hint: carriage_hint(&TENANT, e),
+            sig: Identity::generate().sign(b"whatever").to_vec(),
+            epoch: e,
+        }));
+        relay.on_bundle(9, b);
+        assert!(!relay.store.contains(&id), "wrong signer never resolves");
+    }
+
+    #[test]
+    fn a_stamp_from_a_tenant_not_in_the_keyserver_is_refused() {
+        // Cryptographic partition: a stamper whose tenant is unknown to this fleet's keyserver.
+        let (_, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+        let other = Stamper::new([9u8; 16], Identity::generate());
+        let mut b = foreign(b"other fleet");
+        let id = b.id();
+        b.env.access = Some(Box::new(other.stamp(&id, NOW)));
+        relay.on_bundle(9, b);
+        assert!(!relay.store.contains(&id));
+    }
+
+    #[test]
+    fn local_link_reingest_is_exempt_and_never_double_metered() {
+        let (_, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+        let b = foreign(b"durable copy");
+        let id = b.id();
+        relay.on_bundle(LOCAL_LINK, b);
+        assert!(
+            relay.store.contains(&id),
+            "re-ingest admitted without a stamp"
+        );
+        assert!(relay.take_usage().is_empty(), "re-ingest is never metered");
+        assert_eq!(relay.take_access_refused(), 0);
+    }
+
+    #[test]
+    fn an_open_node_behaves_exactly_as_before_stamps_existed() {
+        let mut device = Node::new(Identity::generate());
+        let b = foreign(b"open world");
+        let id = b.id();
+        device.on_bundle(9, b);
+        assert!(device.store.contains(&id));
+        assert!(device.take_usage().is_empty(), "Open never meters");
+    }
+
+    #[test]
+    fn a_proven_delivery_bills_the_recorded_tenant_exactly_once() {
+        // Custody records attribution; a returning delivery-ACK that purges the held copy is the
+        // billable event. Build the sender + recipient explicitly so we can hand-craft the ACK.
+        let sender = Identity::generate();
+        let recipient = Identity::generate();
+        let (stamper, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+
+        // A stamped, device-addressed bundle the relay carries toward `recipient`.
+        let mut b = Bundle::create(
+            &sender,
+            Destination::Device(recipient.address()),
+            &recipient.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"carry me".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let bid = b.id();
+        b.env.access = Some(Box::new(stamper.stamp(&bid, NOW)));
+        relay.on_bundle(9, b);
+        assert!(relay.store.contains(&bid), "held");
+        assert!(relay.take_usage().is_empty(), "not billed at custody");
+
+        // The recipient's delivery ACK: identity-signed, dst = AckTo(sender, bid), is_ack. Exactly
+        // what emit_ack builds; the relay's authorize check honors it (it holds bid, bid.dst ==
+        // Device(recipient) == ack.src, ack identity-signed) and purges + bills.
+        let ack = Bundle::create(
+            &recipient,
+            Destination::AckTo(sender.address(), bid),
+            &sender.address(),
+            &Payload::Ack {
+                for_bundle_id: bid,
+                status: 0,
+                delivery_hops: 1,
+                delivery_ms: 0,
+                proof: None,
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    is_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        relay.on_bundle(9, ack);
+
+        assert!(!relay.store.contains(&bid), "purged by the delivery ACK");
+        let usage = relay.take_usage();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].0, TENANT);
+        assert_eq!(usage[0].1.bundles, 1, "billed once, on proven delivery");
+        assert!(usage[0].1.payload_bytes > 0);
+    }
+
+    #[test]
+    fn a_keyed_relay_admits_unstamped_vaccines_and_never_meters_them() {
+        // Vaccines are §39 anti-packets: they must propagate through a keyed relay unstamped (so
+        // delivery recovery works fleet-wide) and are never billed.
+        let (_, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+        let vax = Bundle::create_vaccine([3u8; 32], BundleOpts::default());
+        let vid = vax.id();
+        relay.on_bundle(9, vax);
+        assert!(
+            relay.store.contains(&vid),
+            "unstamped vaccine admitted (propagates)"
+        );
+        assert_eq!(
+            relay.take_access_refused(),
+            0,
+            "vaccine not refused by the gate"
+        );
+        assert!(relay.take_usage().is_empty(), "vaccines are never metered");
+    }
+
+    #[test]
+    fn a_spooled_delivery_bills_even_after_the_stamp_epoch_rolls() {
+        // The offline path: a bundle stamped long ago, spooled, then pulled back via LOCAL_LINK
+        // re-ingest and delivered. The relay attributes it (any-epoch) at re-ingest so the
+        // delivery bills, even though the stamp is far too old for the fresh-admission window.
+        use crate::access::CARRIAGE_EPOCH_MS;
+        let sender = Identity::generate();
+        let recipient = Identity::generate();
+        let (stamper, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key); // clock/tables at NOW (epoch 100)
+
+        let mut b = Bundle::create(
+            &sender,
+            Destination::Device(recipient.address()),
+            &recipient.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"spooled".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let bid = b.id();
+        // Stamped 50 epochs ago: too old for `resolve` (current/prev only), fine for `attribute`.
+        b.env.access = Some(Box::new(stamper.stamp(&bid, NOW - 50 * CARRIAGE_EPOCH_MS)));
+
+        // Durable re-ingest (LOCAL_LINK): admitted + attributed, not yet billed.
+        relay.on_bundle(LOCAL_LINK, b);
+        assert!(relay.store.contains(&bid), "re-ingested to custody");
+        assert!(relay.take_usage().is_empty(), "not billed at re-ingest");
+
+        // Delivery proof bills the attributed tenant.
+        let ack = Bundle::create(
+            &recipient,
+            Destination::AckTo(sender.address(), bid),
+            &sender.address(),
+            &Payload::Ack {
+                for_bundle_id: bid,
+                status: 0,
+                delivery_hops: 1,
+                delivery_ms: 0,
+                proof: None,
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    is_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        relay.on_bundle(9, ack);
+        let usage = relay.take_usage();
+        assert_eq!(usage.len(), 1, "the offline delivery billed once");
+        assert_eq!(usage[0].0, TENANT);
+    }
+
+    #[test]
+    fn an_undelivered_hold_is_pruned_without_billing() {
+        // Admitted + held but never delivered: dropping it from the store (mimicking
+        // eviction/expiry) leaves attribution that `tick` prunes, and it is never billed.
+        let (stamper, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+        let mut b = foreign(b"never delivered");
+        let id = b.id();
+        b.env.access = Some(Box::new(stamper.stamp(&id, NOW)));
+        relay.on_bundle(9, b);
+        assert!(relay.store.contains(&id));
+        relay.store.remove(&id); // eviction / expiry
+        relay.tick(NOW + 1);
+        assert!(
+            relay.take_usage().is_empty(),
+            "an undelivered hold is never billed"
+        );
+    }
+
+    #[test]
+    fn submit_stamps_every_originated_bundle_when_a_stamper_is_set() {
+        let key = Identity::generate();
+        let mut sender = Node::new(Identity::generate());
+        sender.set_time(NOW);
+        sender.set_stamper(Some(Stamper::new(
+            TENANT,
+            Identity::from_secret_bytes(&key.to_secret_bytes()),
+        )));
+        let to = Identity::generate();
+        let b = Bundle::create(
+            &sender.identity,
+            Destination::Device(to.address()),
+            &to.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"outbound".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let id = b.id();
+        assert!(b.env.access.is_none());
+        sender.submit(b);
+        let held = sender.store.get(&id).expect("submitted into the store");
+        assert!(held.env.access.is_some(), "submit attached the stamp");
+        // The stamp verifies at a keyed relay that knows this tenant: admitted to custody
+        // (billing waits for delivery proof, tested at the wire level).
+        let mut relay = keyed_relay(&key);
+        relay.on_bundle(9, held);
+        assert!(relay.store.contains(&id));
+        assert!(
+            relay.take_usage().is_empty(),
+            "admitted, billed only on delivery"
         );
     }
 }
