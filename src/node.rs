@@ -34,6 +34,7 @@ use crate::routing::{BundleMeta, ForwardDecision, Router, SprayAndWait};
 use crate::session::Session;
 use crate::store::{MemoryStore, Store};
 use crate::stream::StreamReassembler;
+use crate::telemetry::TelemetryBatch;
 use crate::{short_app, AppId, ShortApp, FABRIC_APP};
 
 /// A link packet on the wire: a Noise handshake message, or an encrypted record.
@@ -467,6 +468,12 @@ pub struct HttpRespItem {
 /// node's display name + kind. Answered by the node itself, not the app.
 pub const SERVICE_IDENTIFY: &str = "hop.identify";
 
+/// The built-in telemetry sink (OTel-over-Hop, DESIGN.md §40): a device exports a
+/// [`TelemetryBatch`](crate::telemetry::TelemetryBatch) to a collector's address. One-way and
+/// fire-and-forget (no response); the node decodes + bounds-checks it and surfaces it via
+/// [`Node::take_telemetry`]. Statically sealed to the collector like any addressed service.
+pub const SERVICE_TELEMETRY: &str = "hop.telemetry";
+
 /// What kind of node this is, reported by [`SERVICE_IDENTIFY`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
@@ -505,6 +512,14 @@ pub struct ServiceRespItem {
     pub for_id: BundleId,
     pub status: u16,
     pub body: Vec<u8>,
+}
+
+/// A telemetry batch received via `hop.telemetry` (OTel-over-Hop, §40), already decoded and
+/// bounds-checked, for the embedding collector to drain and forward (to an OTel collector or a
+/// warehouse) and to meter for the `hop_telemetry_events` observability dimension.
+pub struct TelemetryIn {
+    pub from: PubKeyBytes,
+    pub batch: TelemetryBatch,
 }
 
 /// In-progress reassembly of an inbound **carrier stream** (DESIGN.md §20): a bundle too
@@ -652,6 +667,9 @@ pub struct Node<S: Store = MemoryStore> {
     service_requests: Vec<ServiceReqItem>,
     /// Service responses sealed back to us as a caller.
     service_responses: Vec<ServiceRespItem>,
+    /// Telemetry batches received via `hop.telemetry` (OTel-over-Hop, §40), decoded + bounded, for
+    /// the embedding collector to drain and forward.
+    telemetry_in: Vec<TelemetryIn>,
     /// In-progress inbound carrier-stream reassembly, keyed by `(sender, stream_id)` (§20).
     incoming_streams: HashMap<(PubKeyBytes, StreamId), IncomingStream>,
     /// Monotonic counter for our outbound stream ids.
@@ -913,6 +931,7 @@ impl<S: Store> Node<S> {
             kind: NodeKind::Device,
             service_requests: Vec::new(),
             service_responses: Vec::new(),
+            telemetry_in: Vec::new(),
             incoming_streams: HashMap::new(),
             stream_seq: 0,
             ack_replicate: HashMap::new(),
@@ -3224,6 +3243,30 @@ impl<S: Store> Node<S> {
         std::mem::take(&mut self.service_responses)
     }
 
+    /// Export a [`TelemetryBatch`](crate::telemetry::TelemetryBatch) to a collector's address over
+    /// the mesh (OTel-over-Hop, §40). The batch rides an addressed, statically sealed
+    /// `hop.telemetry` bundle, so it is delay-tolerant: if the collector is unreachable it spools
+    /// and delivers when a path opens. Fire-and-forget; there is no service response. Returns the
+    /// bundle id.
+    pub fn send_telemetry(
+        &mut self,
+        collector: PubKeyBytes,
+        batch: &TelemetryBatch,
+    ) -> Result<BundleId> {
+        self.send_service_request(
+            collector,
+            SERVICE_TELEMETRY.into(),
+            "export".into(),
+            batch.to_bytes(),
+        )
+    }
+
+    /// Drain telemetry batches received from devices (as a collector). Each was decoded and
+    /// bounds-checked on receipt; malformed or oversized batches were dropped.
+    pub fn take_telemetry(&mut self) -> Vec<TelemetryIn> {
+        std::mem::take(&mut self.telemetry_in)
+    }
+
     // --- transparent carrier streaming (DESIGN.md §20) ------------------------
 
     /// A fresh stream id, unique per this node.
@@ -4377,6 +4420,13 @@ impl<S: Store> Node<S> {
                             let body =
                                 postcard::to_allocvec(&self.identity_record()).unwrap_or_default();
                             let _ = self.send_service_response(from, id, 0, body);
+                        } else if service == SERVICE_TELEMETRY {
+                            // Built-in OTel-over-Hop sink (§40): decode + bounds-check, then surface
+                            // for the collector to forward. Fire-and-forget (no response); a
+                            // malformed or oversized batch is dropped rather than trusted.
+                            if let Some(batch) = TelemetryBatch::from_bytes(&args) {
+                                self.telemetry_in.push(TelemetryIn { from, batch });
+                            }
                         } else {
                             // Custom service: hand to the embedding app to fulfill.
                             self.service_requests.push(ServiceReqItem {
@@ -5730,6 +5780,37 @@ mod tests {
         let rec: IdentityRecord = postcard::from_bytes(&resps[0].body).unwrap();
         assert_eq!(rec.name, None);
         assert_eq!(rec.address, nodes[1].address());
+    }
+
+    #[test]
+    fn telemetry_rides_over_the_mesh() {
+        // A device exports a TelemetryBatch to a collector's address. It rides an addressed,
+        // statically sealed hop.telemetry bundle and surfaces (decoded + bounds-checked) via
+        // take_telemetry, one-way, with no service response back to the sender.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        let batch = crate::telemetry::TelemetryBatch::new()
+            .with_resource("platform", "ios")
+            .with_resource("app", "acme.dispatch")
+            .counter("hop.bundle.delivered", 1, 1000)
+            .gauge("hop.delivery.latency_ms", 2100, 1000);
+
+        nodes[0].send_telemetry(nodes[1].address(), &batch).unwrap();
+        net.pump(&mut nodes);
+
+        let got = nodes[1].take_telemetry();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].from, nodes[0].address());
+        assert_eq!(got[0].batch, batch);
+        assert_eq!(got[0].batch.billable_events(), 2);
+        // Fire-and-forget: it is not surfaced as a custom service request, and no response returns.
+        assert!(nodes[1].take_service_requests().is_empty());
+        assert!(nodes[0].take_service_responses().is_empty());
     }
 
     #[test]

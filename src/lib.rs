@@ -23,6 +23,7 @@ pub mod routing;
 pub mod session;
 pub mod store;
 pub mod stream;
+pub mod telemetry;
 pub mod util;
 
 pub use error::{Error, Result};
