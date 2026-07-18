@@ -8,6 +8,7 @@
 //! See `DESIGN.md` at the repo root for the full protocol specification.
 
 pub mod access;
+pub mod admission;
 pub mod app;
 pub mod bundle;
 pub mod crypto;

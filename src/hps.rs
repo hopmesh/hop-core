@@ -18,7 +18,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::Identity;
+use crate::crypto::{Identity, PubKeyBytes};
+use crate::AppId;
 
 /// A well-known keypair every node holds, used only to seal/open the *envelope* of a broadcast
 /// bundle (DESIGN.md §32). Its secret is public (derived from a constant), so any node can open
@@ -181,16 +182,36 @@ pub fn open_content(key: &ContentKey, nonce: &[u8; 12], ciphertext: &[u8]) -> Op
     cipher.decrypt(&Nonce::from(*nonce), ciphertext).ok()
 }
 
-/// The bytes a publish signature covers: the topic path, nonce, and ciphertext — so a signature
-/// can't be replayed onto a different topic or ciphertext. Public so a channel member can sign
-/// it with their own [`Identity`].
-pub fn publish_signing_bytes(path: &str, nonce: &[u8; 12], ciphertext: &[u8]) -> Vec<u8> {
-    publish_msg(path, nonce, ciphertext)
+/// The bytes a publish signature covers. Binding the app, outer sender, opaque topic tag, and exact
+/// key epoch prevents a valid publication from being rewrapped under another envelope identity or
+/// replayed into another app, topic, or generation.
+pub fn publish_signing_bytes(
+    app: &AppId,
+    sender: &PubKeyBytes,
+    topic_tag: &[u8; 16],
+    epoch: u32,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    publish_msg(app, sender, topic_tag, epoch, nonce, ciphertext)
 }
 
-fn publish_msg(path: &str, nonce: &[u8; 12], ciphertext: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(path.len() + 12 + ciphertext.len());
-    m.extend_from_slice(path.as_bytes());
+fn publish_msg(
+    app: &AppId,
+    sender: &PubKeyBytes,
+    topic_tag: &[u8; 16],
+    epoch: u32,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(
+        18 + app.len() + sender.len() + topic_tag.len() + 4 + 12 + ciphertext.len(),
+    );
+    m.extend_from_slice(b"hop.hps.publish.v2");
+    m.extend_from_slice(app);
+    m.extend_from_slice(sender);
+    m.extend_from_slice(topic_tag);
+    m.extend_from_slice(&epoch.to_le_bytes());
     m.extend_from_slice(nonce);
     m.extend_from_slice(ciphertext);
     m
@@ -198,17 +219,31 @@ fn publish_msg(path: &str, nonce: &[u8; 12], ciphertext: &[u8]) -> Vec<u8> {
 
 /// Sign a published message with an ed25519 `seed` (the writer's identity for a channel, or the
 /// service signing key for a service).
-pub fn sign_publish(seed: &[u8; 32], path: &str, nonce: &[u8; 12], ciphertext: &[u8]) -> [u8; 64] {
+pub fn sign_publish(
+    seed: &[u8; 32],
+    app: &AppId,
+    sender: &PubKeyBytes,
+    topic_tag: &[u8; 16],
+    epoch: u32,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+) -> [u8; 64] {
     SigningKey::from_bytes(seed)
-        .sign(&publish_msg(path, nonce, ciphertext))
+        .sign(&publish_msg(
+            app, sender, topic_tag, epoch, nonce, ciphertext,
+        ))
         .to_bytes()
 }
 
 /// Verify a published message's signature against `pubkey` (the sender's address for a channel,
 /// or the service's public key for a service broadcast).
+#[allow(clippy::too_many_arguments)] // every argument is part of the signed publication context
 pub fn verify_publish(
     pubkey: &[u8; 32],
-    path: &str,
+    app: &AppId,
+    sender: &PubKeyBytes,
+    topic_tag: &[u8; 16],
+    epoch: u32,
     nonce: &[u8; 12],
     ciphertext: &[u8],
     sig: &[u8; 64],
@@ -223,10 +258,68 @@ pub fn verify_publish(
     // message. Strict rejects those. It never rejects a signature sign_publish itself produced (those are
     // always canonical), so this only tightens against forged variants.
     vk.verify_strict(
-        &publish_msg(path, nonce, ciphertext),
+        &publish_msg(app, sender, topic_tag, epoch, nonce, ciphertext),
         &Signature::from_bytes(sig),
     )
     .is_ok()
+}
+
+/// Stable content id for an authenticated publication, independent of the outer bundle id. A relay
+/// or attacker can rewrap the same signed publication in a fresh outer bundle, but cannot change this
+/// id without invalidating the publication signature.
+#[allow(clippy::too_many_arguments)] // every argument is authenticated publication content
+pub fn publication_id(
+    app: &AppId,
+    sender: &PubKeyBytes,
+    topic_tag: &[u8; 16],
+    epoch: u32,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+    sig: &[u8; 64],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hop.hps.publication-id.v1");
+    hasher.update(&publish_msg(
+        app, sender, topic_tag, epoch, nonce, ciphertext,
+    ));
+    hasher.update(sig);
+    *hasher.finalize().as_bytes()
+}
+
+/// Authenticate a reach acknowledgement with the current topic content key. The MAC binds the
+/// member identity and exact app/topic/epoch tuple, so an old key or copied acknowledgement cannot
+/// grow another topic's retained-member set.
+pub fn reach_ack_mac(
+    content_key: &ContentKey,
+    app: &AppId,
+    member: &PubKeyBytes,
+    topic_tag: &[u8; 16],
+    epoch: u32,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_keyed(content_key);
+    h.update(b"hop.hps.reach-ack.v1");
+    h.update(app);
+    h.update(member);
+    h.update(topic_tag);
+    h.update(&epoch.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// Verify a reach acknowledgement without an early-exit byte comparison.
+pub fn verify_reach_ack_mac(
+    content_key: &ContentKey,
+    app: &AppId,
+    member: &PubKeyBytes,
+    topic_tag: &[u8; 16],
+    epoch: u32,
+    mac: &[u8; 32],
+) -> bool {
+    let expected = reach_ack_mac(content_key, app, member, topic_tag, epoch);
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= expected[i] ^ mac[i];
+    }
+    diff == 0
 }
 
 /// Encrypt a discovery descriptor under the app discovery key, returning `(nonce, ct)` for an
@@ -272,14 +365,39 @@ mod tests {
         let seed = svc.signing_seed.unwrap();
         let pubkey = svc.service_pubkey().unwrap();
         let (nonce, ct) = seal_content(&svc.content_key, b"broadcast");
-        let sig = sign_publish(&seed, "news", &nonce, &ct);
-        assert!(verify_publish(&pubkey, "news", &nonce, &ct, &sig));
+        let app = [4u8; 16];
+        let sender = [5u8; 32];
+        let topic_tag = [6u8; 16];
+        let sig = sign_publish(&seed, &app, &sender, &topic_tag, 3, &nonce, &ct);
+        assert!(verify_publish(
+            &pubkey, &app, &sender, &topic_tag, 3, &nonce, &ct, &sig
+        ));
         // A different signer (a subscriber who leaked-read the content key) can't forge.
         let imposter = ServiceConfig::new(ServiceKind::Service);
-        let forged = sign_publish(&imposter.signing_seed.unwrap(), "news", &nonce, &ct);
-        assert!(!verify_publish(&pubkey, "news", &nonce, &ct, &forged));
-        // Signature is bound to the path + ciphertext.
-        assert!(!verify_publish(&pubkey, "other", &nonce, &ct, &sig));
+        let forged = sign_publish(
+            &imposter.signing_seed.unwrap(),
+            &app,
+            &sender,
+            &topic_tag,
+            3,
+            &nonce,
+            &ct,
+        );
+        assert!(!verify_publish(
+            &pubkey, &app, &sender, &topic_tag, 3, &nonce, &ct, &forged
+        ));
+        assert!(!verify_publish(
+            &pubkey, &[7u8; 16], &sender, &topic_tag, 3, &nonce, &ct, &sig
+        ));
+        assert!(!verify_publish(
+            &pubkey, &app, &[8u8; 32], &topic_tag, 3, &nonce, &ct, &sig
+        ));
+        assert!(!verify_publish(
+            &pubkey, &app, &sender, &[9u8; 16], 3, &nonce, &ct, &sig
+        ));
+        assert!(!verify_publish(
+            &pubkey, &app, &sender, &topic_tag, 4, &nonce, &ct, &sig
+        ));
     }
 
     #[test]
@@ -318,10 +436,16 @@ mod tests {
 
         // A broadcast signed with the OLD (revoked) seed must not verify against the NEW pubkey.
         let (nonce, ct) = seal_content(&svc.content_key, b"post-rotation");
-        let forged = sign_publish(&old_seed, "svc/topic", &nonce, &ct);
+        let app = [1u8; 16];
+        let sender = [2u8; 32];
+        let topic_tag = [3u8; 16];
+        let forged = sign_publish(&old_seed, &app, &sender, &topic_tag, 1, &nonce, &ct);
         assert!(!verify_publish(
             &svc.service_pubkey().unwrap(),
-            "svc/topic",
+            &app,
+            &sender,
+            &topic_tag,
+            1,
             &nonce,
             &ct,
             &forged
@@ -386,12 +510,30 @@ mod tests {
         let svc = ServiceConfig::new(ServiceKind::Service);
         let seed = svc.signing_seed.unwrap();
         let (nonce, ct) = seal_content(&svc.content_key, b"whatever");
-        let sig = sign_publish(&seed, "topic", &nonce, &ct);
+        let app = [1u8; 16];
+        let sender = [2u8; 32];
+        let topic_tag = [3u8; 16];
+        let sig = sign_publish(&seed, &app, &sender, &topic_tag, 0, &nonce, &ct);
 
         assert!(
-            !verify_publish(&bad_pubkey, "topic", &nonce, &ct, &sig),
+            !verify_publish(&bad_pubkey, &app, &sender, &topic_tag, 0, &nonce, &ct, &sig),
             "an undecodable pubkey must be rejected, not panic"
         );
+    }
+
+    #[test]
+    fn reach_ack_mac_binds_member_topic_app_and_exact_epoch() {
+        let key = [1u8; 32];
+        let app = [2u8; 16];
+        let member = [3u8; 32];
+        let tag = [4u8; 16];
+        let mac = reach_ack_mac(&key, &app, &member, &tag, 5);
+
+        assert!(verify_reach_ack_mac(&key, &app, &member, &tag, 5, &mac));
+        assert!(!verify_reach_ack_mac(
+            &[9u8; 32], &app, &member, &tag, 5, &mac
+        ));
+        assert!(!verify_reach_ack_mac(&key, &app, &member, &tag, 6, &mac));
     }
 
     #[test]

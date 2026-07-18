@@ -9,17 +9,193 @@
 //! clock skew), and [`Store::prune`] drops entries past it so memory stays bounded
 //! without ever weakening the guarantee inside the window that matters.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::{Bundle, BundleId};
 
+/// One mutation in an atomic security-critical store batch. Bundle custody and the KV state that
+/// authorizes or advances it can share one commit, so no caller has to choose which half survives a
+/// crash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KvMutation {
+    Put { key: String, value: Vec<u8> },
+    Remove { key: String },
+    PutBundle { bundle: Box<Bundle>, now_ms: u64 },
+    RemoveBundle { id: BundleId },
+}
+
+/// One row returned by a bounded persisted-KV scan. `storage_id` is an optional opaque backend
+/// identity used to remove a malformed row whose stored document does not match its claimed key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvPageRow {
+    pub key: String,
+    pub value: Option<Vec<u8>>,
+    pub storage_id: Option<String>,
+    pub canonical: bool,
+}
+
+impl KvPageRow {
+    pub fn canonical(key: String, value: Vec<u8>) -> Self {
+        Self {
+            key,
+            value: Some(value),
+            storage_id: None,
+            canonical: true,
+        }
+    }
+
+    pub fn removal(key: String) -> Self {
+        Self {
+            key,
+            value: None,
+            storage_id: None,
+            canonical: true,
+        }
+    }
+}
+
+/// One bounded persisted-KV page plus the actual remote work used to read it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KvPage {
+    pub rows: Vec<KvPageRow>,
+    pub scanned_bytes: usize,
+    pub scanned_pages: usize,
+}
+
+/// Whether a durable store may currently accept protocol custody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurabilityReadiness {
+    Ready,
+    NotReady,
+    /// A write may have committed, but its outcome could not be reconciled. Continuing from the
+    /// previous live state could reuse security state, so only a restart/reconciliation may clear it.
+    Quarantined,
+}
+
+/// A cheap cross-thread readiness handle shared by a store, its I/O worker, and its host service.
+#[derive(Clone)]
+pub struct DurabilityHandle {
+    state: Arc<AtomicU8>,
+    unreconciled: Arc<Mutex<u64>>,
+    failure_generation: Arc<Mutex<u64>>,
+    transition: Arc<Mutex<()>>,
+}
+
+impl Default for DurabilityHandle {
+    fn default() -> Self {
+        Self::ready()
+    }
+}
+
+impl DurabilityHandle {
+    const READY: u8 = 0;
+    const NOT_READY: u8 = 1;
+    const QUARANTINED: u8 = 2;
+
+    pub fn ready() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(Self::READY)),
+            unreconciled: Arc::new(Mutex::new(0)),
+            failure_generation: Arc::new(Mutex::new(0)),
+            transition: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn not_ready() -> Self {
+        let handle = Self::ready();
+        handle.mark_not_ready();
+        handle
+    }
+
+    pub fn status(&self) -> DurabilityReadiness {
+        match self.state.load(Ordering::Acquire) {
+            Self::READY => DurabilityReadiness::Ready,
+            Self::QUARANTINED => DurabilityReadiness::Quarantined,
+            _ => DurabilityReadiness::NotReady,
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.status() == DurabilityReadiness::Ready
+    }
+
+    pub fn unreconciled(&self) -> u64 {
+        *self.unreconciled.lock().expect("unreconciled counter lock")
+    }
+
+    /// Monotonic generation advanced by every runtime durability failure. Recovery captures this
+    /// before probing and may publish Ready only while the same generation is still current.
+    pub fn failure_generation(&self) -> u64 {
+        *self
+            .failure_generation
+            .lock()
+            .expect("failure generation lock")
+    }
+
+    pub fn mark_not_ready(&self) {
+        let _transition = self.transition.lock().expect("durability transition lock");
+        let mut generation = self
+            .failure_generation
+            .lock()
+            .expect("failure generation lock");
+        *generation = generation.wrapping_add(1);
+        if self.state.load(Ordering::Acquire) != Self::QUARANTINED {
+            self.state.store(Self::NOT_READY, Ordering::Release);
+        }
+    }
+
+    pub fn quarantine(&self) {
+        let _transition = self.transition.lock().expect("durability transition lock");
+        let mut generation = self
+            .failure_generation
+            .lock()
+            .expect("failure generation lock");
+        *generation = generation.wrapping_add(1);
+        let mut unreconciled = self.unreconciled.lock().expect("unreconciled counter lock");
+        *unreconciled = unreconciled.wrapping_add(1);
+        self.state.store(Self::QUARANTINED, Ordering::Release);
+    }
+
+    /// Put admission in recovery mode and return the generation the caller must carry through its
+    /// definitive probe. This transition does not itself count as a failure.
+    pub fn begin_recovery(&self) -> u64 {
+        let _transition = self.transition.lock().expect("durability transition lock");
+        let generation = self.failure_generation();
+        if self.unreconciled() == 0 {
+            self.state.store(Self::NOT_READY, Ordering::Release);
+        } else {
+            self.state.store(Self::QUARANTINED, Ordering::Release);
+        }
+        generation
+    }
+
+    /// Restore admission only when no ambiguous mutation remains and no failure occurred after the
+    /// caller began recovery. Counters are deliberately not cleared by a generic health probe because
+    /// doing so would erase the evidence needed at restart.
+    pub fn mark_ready_if_reconciled(&self, recovery_generation: u64) -> bool {
+        let _transition = self.transition.lock().expect("durability transition lock");
+        if self.unreconciled() != 0 {
+            self.state.store(Self::QUARANTINED, Ordering::Release);
+            return false;
+        }
+        if self.failure_generation() != recovery_generation {
+            self.state.store(Self::NOT_READY, Ordering::Release);
+            return false;
+        }
+        self.state.store(Self::READY, Ordering::Release);
+        true
+    }
+}
+
 /// What a node knows it currently holds — used by routing to avoid re-offering
 /// bundles a peer already has. Serializable so it can ride a `Wire::Have` custody beacon
 /// (DESIGN.md §35): a node tells a directly-connected peer what it holds so the peer suppresses
 /// re-offering those, cutting duplicate-ingress COGS.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaveSet {
     pub ids: Vec<BundleId>,
 }
@@ -77,20 +253,125 @@ pub trait Store {
     // --- key/value persistence (DESIGN.md §25) --------------------------------------------
     // A small durable key→bytes surface alongside bundles, for state that must survive a
     // restart but isn't a bundle: forward-secret ratchet sessions, prekey secrets, etc. The
-    // host supplies the backing store (SQLite on device, Firestore on the cloud relay); the
-    // default no-ops keep ephemeral/relay backends working unchanged.
+    // host supplies the backing store (SQLite on device, Firestore on the cloud relay). Best-effort
+    // metadata methods default to no-ops; security-critical mutations are mandatory and fallible.
 
     /// Persist `value` under `key`, replacing any prior value. Default: no-op (not durable).
     fn put_kv(&mut self, _key: &str, _value: Vec<u8>) {}
+    /// Atomically apply security-critical store mutations and report whether the backend durably
+    /// accepted the whole batch. Implementations must not expose a prefix of the batch, return
+    /// success for a no-op, queue work that can still be shed, or return while the outcome is
+    /// unknown. An empty batch succeeds without touching storage.
+    fn apply_kv_batch(&mut self, mutations: &[KvMutation]) -> std::result::Result<(), String>;
+    /// Persist one security-critical value through the same atomic path used for multi-key commits.
+    fn put_kv_critical(&mut self, key: &str, value: Vec<u8>) -> std::result::Result<(), String> {
+        self.apply_kv_batch(&[KvMutation::Put {
+            key: key.to_string(),
+            value,
+        }])
+    }
     /// Fetch a persisted value by exact key. Default: `None`.
     fn get_kv(&self, _key: &str) -> Option<Vec<u8>> {
         None
     }
     /// Remove a persisted value. Default: no-op.
     fn remove_kv(&mut self, _key: &str) {}
-    /// All persisted `(key, value)` pairs whose key starts with `prefix`. Default: empty.
-    fn list_kv(&self, _prefix: &str) -> Vec<(String, Vec<u8>)> {
+    /// Durably remove security-critical state, reporting any failure before callers discard their
+    /// live in-memory copy.
+    fn remove_kv_critical(&mut self, key: &str) -> std::result::Result<(), String> {
+        self.apply_kv_batch(&[KvMutation::Remove {
+            key: key.to_string(),
+        }])
+    }
+    /// One lexicographically ordered page of persisted `(key, value)` pairs whose key starts with
+    /// `prefix`. `after` is an exclusive key cursor. Implementations must honor `limit`; callers use
+    /// this for attacker-influenced namespaces where materializing every row before admission is not
+    /// safe. Default: empty for stores without KV persistence.
+    fn list_kv_page(
+        &self,
+        _prefix: &str,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> Vec<(String, Vec<u8>)> {
         Vec::new()
+    }
+    /// Fallible bounded scan used by startup recovery. Remote stores override this to apply
+    /// `max_bytes` before decoding the response and report the exact number of backend requests.
+    fn list_kv_page_bounded(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> std::result::Result<KvPage, String> {
+        if limit == 0 || max_bytes == 0 {
+            return Ok(KvPage::default());
+        }
+        let rows: Vec<_> = self
+            .list_kv_page(prefix, after, limit)
+            .into_iter()
+            .map(|(key, value)| KvPageRow::canonical(key, value))
+            .collect();
+        let scanned_bytes = rows.iter().fold(0usize, |total, row| {
+            total
+                .saturating_add(row.key.len())
+                .saturating_add(row.value.as_ref().map_or(0, Vec::len))
+        });
+        if rows.len() > limit || scanned_bytes > max_bytes {
+            return Err("persisted KV backend exceeded its bounded page request".into());
+        }
+        Ok(KvPage {
+            rows,
+            scanned_bytes,
+            scanned_pages: 1,
+        })
+    }
+    /// Remove rows returned by [`Store::list_kv_page_bounded`]. Callers keep batches below backend
+    /// limits; the default removes canonical keys through the critical atomic path.
+    fn remove_kv_rows_critical(&mut self, rows: &[KvPageRow]) -> std::result::Result<(), String> {
+        let removals: Vec<_> = rows
+            .iter()
+            .map(|row| KvMutation::Remove {
+                key: row.key.clone(),
+            })
+            .collect();
+        self.apply_kv_batch(&removals)
+    }
+    /// All persisted `(key, value)` pairs whose key starts with `prefix`. Bounded consumers should
+    /// call [`Store::list_kv_page`] directly; this compatibility helper walks fixed-size pages.
+    fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        const PAGE: usize = 256;
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = self.list_kv_page(prefix, after.as_deref(), PAGE);
+            if page.is_empty() {
+                break;
+            }
+            let next = page.last().map(|(key, _)| key.clone());
+            let short = page.len() < PAGE;
+            out.extend(page);
+            if short || next == after {
+                break;
+            }
+            after = next;
+        }
+        out
+    }
+    /// Current durability admission state. Ephemeral and local transactional stores are ready by
+    /// construction; remote stores override this with their shared runtime state.
+    fn durability_status(&self) -> DurabilityReadiness {
+        DurabilityReadiness::Ready
+    }
+    /// Cross-thread readiness handle for a host that admits producers outside the node owner thread.
+    /// `None` means the backend is synchronously ready by construction.
+    fn durability_handle(&self) -> Option<DurabilityHandle> {
+        None
+    }
+    /// Perform a definitive backend write/read/delete probe. A remote store may restore readiness
+    /// only after this succeeds and every previously accepted mutation is reconciled or flushed.
+    fn probe_durability(&mut self) -> std::result::Result<(), String> {
+        Ok(())
     }
     /// Drain any asynchronous/background writes, blocking up to `timeout`; returns whether the queue
     /// drained (F-21). Default: nothing is buffered (synchronous store) → immediately done. The
@@ -140,14 +421,52 @@ impl Store for Box<dyn Store> {
     fn put_kv(&mut self, key: &str, value: Vec<u8>) {
         (**self).put_kv(key, value)
     }
+    fn apply_kv_batch(&mut self, mutations: &[KvMutation]) -> std::result::Result<(), String> {
+        (**self).apply_kv_batch(mutations)
+    }
+    fn put_kv_critical(&mut self, key: &str, value: Vec<u8>) -> std::result::Result<(), String> {
+        (**self).put_kv_critical(key, value)
+    }
     fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
         (**self).get_kv(key)
     }
     fn remove_kv(&mut self, key: &str) {
         (**self).remove_kv(key)
     }
+    fn remove_kv_critical(&mut self, key: &str) -> std::result::Result<(), String> {
+        (**self).remove_kv_critical(key)
+    }
     fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
         (**self).list_kv(prefix)
+    }
+    fn list_kv_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Vec<(String, Vec<u8>)> {
+        (**self).list_kv_page(prefix, after, limit)
+    }
+    fn list_kv_page_bounded(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> std::result::Result<KvPage, String> {
+        (**self).list_kv_page_bounded(prefix, after, limit, max_bytes)
+    }
+    fn remove_kv_rows_critical(&mut self, rows: &[KvPageRow]) -> std::result::Result<(), String> {
+        (**self).remove_kv_rows_critical(rows)
+    }
+    fn durability_status(&self) -> DurabilityReadiness {
+        (**self).durability_status()
+    }
+    fn durability_handle(&self) -> Option<DurabilityHandle> {
+        (**self).durability_handle()
+    }
+    fn probe_durability(&mut self) -> std::result::Result<(), String> {
+        (**self).probe_durability()
     }
     fn flush(&self, timeout: std::time::Duration) -> bool {
         // Must forward: without this the trait default (`true`) wins by method resolution and a
@@ -171,7 +490,7 @@ pub const MAX_SEEN_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Row cap on the in-memory `seen` dedup set (F-07). Past this we evict nearest-to-expiry ids so a
 /// bundle flood can't grow it without bound. Matches hop-store-sqlite's MAX_SEEN_ROWS.
-const MAX_SEEN_ROWS: usize = 200_000;
+pub const MAX_SEEN_ROWS: usize = 200_000;
 
 /// Simple in-memory store for tests and the simulator.
 #[derive(Default, Clone)]
@@ -181,7 +500,7 @@ pub struct MemoryStore {
     seen: HashMap<BundleId, u64>,
     /// Durable key→bytes side store (sessions, prekey secrets). In-memory here, so it
     /// survives only for the process lifetime — a persistent backend overrides this.
-    kv: HashMap<String, Vec<u8>>,
+    kv: BTreeMap<String, Vec<u8>>,
 }
 
 impl MemoryStore {
@@ -316,16 +635,57 @@ impl Store for MemoryStore {
     fn put_kv(&mut self, key: &str, value: Vec<u8>) {
         self.kv.insert(key.to_string(), value);
     }
+    fn apply_kv_batch(&mut self, mutations: &[KvMutation]) -> std::result::Result<(), String> {
+        let mut candidate = self.clone();
+        let mut required_bundles = Vec::new();
+        for mutation in mutations {
+            match mutation {
+                KvMutation::Put { key, value } => {
+                    candidate.kv.insert(key.clone(), value.clone());
+                }
+                KvMutation::Remove { key } => {
+                    candidate.kv.remove(key);
+                }
+                KvMutation::PutBundle { bundle, now_ms } => {
+                    let id = bundle.id();
+                    if !candidate.put(bundle.as_ref().clone(), *now_ms) {
+                        return Err("critical batch bundle put was rejected".into());
+                    }
+                    required_bundles.push(id);
+                }
+                KvMutation::RemoveBundle { id } => {
+                    candidate.remove(id);
+                }
+            }
+        }
+        if required_bundles.iter().any(|id| !candidate.contains(id)) {
+            return Err("critical batch bundle custody was evicted before commit".into());
+        }
+        *self = candidate;
+        Ok(())
+    }
     fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
         self.kv.get(key).cloned()
     }
     fn remove_kv(&mut self, key: &str) {
         self.kv.remove(key);
     }
-    fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+    fn list_kv_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Vec<(String, Vec<u8>)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let start = after.unwrap_or(prefix);
         self.kv
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
+            .range(start.to_string()..)
+            .filter(|(key, _)| {
+                key.starts_with(prefix) && after.is_none_or(|cursor| key.as_str() > cursor)
+            })
+            .take(limit)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
@@ -336,6 +696,7 @@ mod tests {
     use super::*;
     use crate::bundle::{BundleOpts, Destination, Payload};
     use crate::crypto::Identity;
+    use proptest::prelude::*;
 
     fn bundle(lifetime_ms: u32) -> Bundle {
         let alice = Identity::generate();
@@ -485,6 +846,12 @@ mod tests {
                 0
             }
             fn set_copies(&mut self, _id: &BundleId, _c: u16) {}
+            fn apply_kv_batch(
+                &mut self,
+                _mutations: &[KvMutation],
+            ) -> std::result::Result<(), String> {
+                Err("critical kv persistence unsupported".into())
+            }
             fn flush(&self, _timeout: std::time::Duration) -> bool {
                 self.flushes.fetch_add(1, Ordering::SeqCst);
                 true
@@ -552,6 +919,28 @@ mod tests {
         );
         boxed.remove_kv("session/alice");
         assert_eq!(boxed.get_kv("session/alice"), None, "remove_kv forwards");
+        boxed
+            .put_kv_critical("session/alice", vec![8, 8])
+            .expect("put_kv_critical forwards");
+        assert_eq!(boxed.get_kv("session/alice"), Some(vec![8, 8]));
+        boxed
+            .remove_kv_critical("session/alice")
+            .expect("remove_kv_critical forwards");
+        assert_eq!(boxed.get_kv("session/alice"), None);
+        boxed
+            .apply_kv_batch(&[
+                KvMutation::Put {
+                    key: "a".into(),
+                    value: vec![1],
+                },
+                KvMutation::Put {
+                    key: "b".into(),
+                    value: vec![2],
+                },
+            ])
+            .expect("apply_kv_batch forwards");
+        assert_eq!(boxed.get_kv("a"), Some(vec![1]));
+        assert_eq!(boxed.get_kv("b"), Some(vec![2]));
 
         boxed.prune(u64::MAX);
         assert!(!boxed.contains(&b.id()), "prune forwards");
@@ -601,6 +990,12 @@ mod tests {
                 0
             }
             fn set_copies(&mut self, _id: &BundleId, _copies: u16) {}
+            fn apply_kv_batch(
+                &mut self,
+                _mutations: &[KvMutation],
+            ) -> std::result::Result<(), String> {
+                Err("critical kv persistence unsupported".into())
+            }
         }
 
         let b = bundle(1_000);
@@ -627,6 +1022,8 @@ mod tests {
             Vec::<(String, Vec<u8>)>::new(),
             "default list_kv is always empty"
         );
+        assert!(store.put_kv_critical("k", vec![1]).is_err());
+        assert!(store.remove_kv_critical("k").is_err());
         assert!(
             store.flush(std::time::Duration::from_millis(1)),
             "default flush reports done immediately, nothing is buffered"
@@ -675,5 +1072,45 @@ mod tests {
         // An id we've never stored can't be split; this must not panic.
         let missing = bundle(1_000);
         assert_eq!(store.split_copies(&missing.id()), 0);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(192))]
+
+        #[test]
+        fn mutation_sequences_preserve_dedup_and_atomic_failure(
+            operations in prop::collection::vec((any::<u8>(), any::<u16>(), any::<u32>()), 0..128)
+        ) {
+            let mut store = MemoryStore::new();
+            for (kind, value, now) in operations {
+                let mut token = [0u8; 32];
+                token[..2].copy_from_slice(&value.to_le_bytes());
+                let candidate = Bundle::create_vaccine(
+                    token,
+                    BundleOpts { lifetime_ms: u32::from(value), ..Default::default() },
+                );
+                match kind % 5 {
+                    0 => { store.put(candidate, u64::from(now)); }
+                    1 => { store.remove(&candidate.id()); }
+                    2 => store.prune(u64::from(now)),
+                    3 => store.set_copies(&candidate.id(), value.max(1)),
+                    _ => { store.split_copies(&candidate.id()); }
+                }
+                prop_assert!(store.seen.len() <= MAX_SEEN_ROWS);
+                prop_assert!(store.held.keys().all(|id| store.seen.contains_key(id)));
+            }
+
+            let existing = bundle(10_000);
+            prop_assert!(store.put(existing.clone(), 0));
+            let before = store.clone();
+            let failed = store.apply_kv_batch(&[
+                KvMutation::Put { key: "must-not-leak".into(), value: vec![1, 2, 3] },
+                KvMutation::PutBundle { bundle: Box::new(existing), now_ms: 0 },
+            ]);
+            prop_assert!(failed.is_err());
+            prop_assert_eq!(&store.kv, &before.kv, "failed batch exposed a KV prefix");
+            prop_assert_eq!(&store.held, &before.held, "failed batch changed bundle custody");
+            prop_assert_eq!(&store.seen, &before.seen, "failed batch changed dedup state");
+        }
     }
 }

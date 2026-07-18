@@ -47,6 +47,27 @@ const TOPIC_BEACON: &str = "_beacon";
 /// Default bound on the best-effort relay cache (number of adverts).
 pub const DEFAULT_RELAY_CACHE_CAP: usize = 256;
 
+/// Full-retention and auxiliary-index bounds. Subscribed/control adverts remain much larger than
+/// the relay cache, but no remote publisher can make any directory table grow without limit.
+pub const DEFAULT_SUBSCRIBED_CAP: usize = 4_096;
+pub const DEFAULT_SEEN_CAP: usize = 32_768;
+pub const DEFAULT_REVOKED_CAP: usize = 4_096;
+pub const DEFAULT_PREKEY_CAP: usize = 4_096;
+
+/// An advert may remain live for at most seven days. Core's own prekey and HPS adverts use this
+/// ceiling exactly, so ordinary discovery behavior is unchanged.
+pub const MAX_ADVERT_TTL_MS: u32 = 7 * 24 * 60 * 60 * 1_000;
+/// Publisher clocks may lead ours slightly, but not enough to pin an otherwise short-lived advert.
+pub const MAX_ADVERT_FUTURE_SKEW_MS: u64 = 5 * 60 * 1_000;
+/// Hard wire and field bounds checked before signature verification.
+pub const MAX_ADVERT_WIRE_BYTES: usize = 8 * 1_024;
+const MAX_SERVICE_BYTES: usize = 128;
+const MAX_TITLE_BYTES: usize = 256;
+const MAX_SUMMARY_BYTES: usize = 2 * 1_024;
+const MAX_TAGS: usize = 32;
+const MAX_TAG_BYTES: usize = 64;
+const MAX_HPS_TOPIC_BYTES: usize = 7 * 1_024;
+
 /// Hop cap on a §39 receiver-beacon (core-02). A beacon lays the routing gradient for the few nodes
 /// near the recipient, but past this many hops it is neither re-gossiped nor stored, so a recipient's
 /// cleartext-carrying beacon does NOT flood the whole connected component every refresh, honoring the
@@ -157,28 +178,35 @@ impl Advert {
         ttl_ms: u32,
         seq: u64,
     ) -> Result<Self> {
+        validate_kind_structure(&kind)?;
         let body = AdvertBody {
             version: ADVERT_VERSION,
             app,
             publisher: publisher.address(),
             kind,
             created_at,
-            ttl_ms,
+            ttl_ms: ttl_ms.min(MAX_ADVERT_TTL_MS),
             seq,
         };
         let bytes = postcard::to_allocvec(&body)?;
+        if bytes.len().saturating_add(96) > MAX_ADVERT_WIRE_BYTES {
+            return Err(Error::Other("advert exceeds wire-size limit".into()));
+        }
         let id = *blake3::hash(&bytes).as_bytes();
         let sig = publisher.sign(&bytes).to_vec();
-        Ok(Advert {
+        let advert = Advert {
             id,
             body,
             sig,
             hops: 0,
-        })
+        };
+        advert.validate_structure()?;
+        Ok(advert)
     }
 
     /// Verify the id matches the body and the publisher signature is valid.
     pub fn verify(&self) -> Result<()> {
+        self.validate_structure()?;
         // Reject an advert whose wire version this build doesn't speak, before trusting
         // any of its fields. Like [`Bundle::from_bytes`], this turns a silent misdecode
         // after a discriminant shift into a loud [`Error::UnsupportedVersion`].
@@ -200,7 +228,24 @@ impl Advert {
     }
 
     fn is_expired(&self, now_ms: u64) -> bool {
-        now_ms > self.body.created_at.saturating_add(self.body.ttl_ms as u64)
+        now_ms > self.expires_at()
+    }
+
+    fn expires_at(&self) -> u64 {
+        self.body.created_at.saturating_add(self.body.ttl_ms as u64)
+    }
+
+    /// Reject attacker-controlled allocation and signature work on malformed adverts. This runs
+    /// before cryptographic verification in [`Directory::ingest`].
+    fn validate_structure(&self) -> Result<()> {
+        if self.sig.len() != 64 {
+            return Err(Error::BadSignature);
+        }
+        validate_kind_structure(&self.body.kind)?;
+        if postcard::to_allocvec(self)?.len() > MAX_ADVERT_WIRE_BYTES {
+            return Err(Error::Other("advert exceeds wire-size limit".into()));
+        }
+        Ok(())
     }
 
     /// The subscription topic this advert belongs to. Service adverts use their
@@ -213,6 +258,31 @@ impl Advert {
             AdvertKind::HpsTopic { .. } => TOPIC_HPS,
             AdvertKind::RecvBeacon { .. } => TOPIC_BEACON,
         }
+    }
+}
+
+fn validate_kind_structure(kind: &AdvertKind) -> Result<()> {
+    let valid = match kind {
+        AdvertKind::Service {
+            service,
+            title,
+            summary,
+            tags,
+        } => {
+            service.len() <= MAX_SERVICE_BYTES
+                && title.len() <= MAX_TITLE_BYTES
+                && summary.len() <= MAX_SUMMARY_BYTES
+                && tags.len() <= MAX_TAGS
+                && tags.iter().all(|tag| tag.len() <= MAX_TAG_BYTES)
+        }
+        AdvertKind::PreKey { spk_sig, .. } => spk_sig.len() == 64,
+        AdvertKind::Tombstone { .. } | AdvertKind::RecvBeacon { .. } => true,
+        AdvertKind::HpsTopic { ct, .. } => ct.len() <= MAX_HPS_TOPIC_BYTES,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Other("advert exceeds structural limits".into()))
     }
 }
 
@@ -234,10 +304,11 @@ impl RelayCache {
         }
     }
 
-    fn put(&mut self, advert: &Advert) -> Result<()> {
+    fn put(&mut self, advert: &Advert) -> Result<Vec<AdvertId>> {
         if self.cap == 0 {
-            return Ok(());
+            return Ok(vec![advert.id]);
         }
+        let mut evicted = Vec::new();
         let blob = util::compress(&postcard::to_allocvec(advert)?);
         if self.blobs.insert(advert.id, blob).is_none() {
             self.order.push_back(advert.id);
@@ -245,11 +316,12 @@ impl RelayCache {
         while self.blobs.len() > self.cap {
             if let Some(evict) = self.order.pop_front() {
                 self.blobs.remove(&evict);
+                evicted.push(evict);
             } else {
                 break;
             }
         }
-        Ok(())
+        Ok(evicted)
     }
 
     fn get(&self, id: &AdvertId) -> Option<Advert> {
@@ -258,12 +330,55 @@ impl RelayCache {
         postcard::from_bytes(&bytes).ok()
     }
 
-    fn remove(&mut self, id: &AdvertId) {
+    fn remove(&mut self, id: &AdvertId) -> Option<Advert> {
+        let advert = self.get(id);
         self.blobs.remove(id);
+        self.order.retain(|queued| queued != id);
+        advert
     }
 
     fn adverts(&self) -> impl Iterator<Item = Advert> + '_ {
         self.blobs.keys().filter_map(|id| self.get(id))
+    }
+
+    fn expire(&mut self, now_ms: u64) -> Vec<AdvertId> {
+        let expired: Vec<AdvertId> = self
+            .adverts()
+            .filter(|advert| advert.is_expired(now_ms))
+            .map(|advert| advert.id)
+            .collect();
+        for id in &expired {
+            self.remove(id);
+        }
+        self.order.retain(|id| self.blobs.contains_key(id));
+        expired
+    }
+}
+
+#[derive(Clone)]
+struct PreKeyEntry {
+    advert_id: AdvertId,
+    created_at: u64,
+    expires_at: u64,
+    bundle: PreKeyBundle,
+}
+
+#[derive(Clone, Copy)]
+struct DirectoryLimits {
+    subscribed: usize,
+    seen: usize,
+    revoked: usize,
+    prekeys: usize,
+}
+
+impl Default for DirectoryLimits {
+    fn default() -> Self {
+        Self {
+            subscribed: DEFAULT_SUBSCRIBED_CAP,
+            seen: DEFAULT_SEEN_CAP,
+            revoked: DEFAULT_REVOKED_CAP,
+            prekeys: DEFAULT_PREKEY_CAP,
+        }
     }
 }
 
@@ -280,11 +395,17 @@ pub struct Directory {
     relay: RelayCache,
     /// Latest prekey bundle per publisher (for opening forward-secret sessions).
     /// One entry per device; newest `created_at` wins (DESIGN.md §25).
-    prekeys: HashMap<PubKeyBytes, (u64, PreKeyBundle)>,
-    /// Ids seen (even if since removed/revoked), so we don't re-accept gossip.
-    seen: HashSet<AdvertId>,
-    /// Revoked ids — a tombstone may arrive before the advert it revokes.
-    revoked: HashSet<AdvertId>,
+    prekeys: HashMap<PubKeyBytes, PreKeyEntry>,
+    /// Ids seen (even if since removed/revoked), with the advert's expiry for compaction.
+    seen: HashMap<AdvertId, u64>,
+    /// Revocation claims keyed by target, publisher, and app. Keeping the claimed owner is what
+    /// makes tombstone-first ordering safe: a later target is suppressed only when its signed
+    /// publisher and namespace match the earlier claim.
+    revoked: HashMap<(AdvertId, PubKeyBytes, AppId), u64>,
+    /// Held advert ids removed by capacity, expiry, or tombstone since the node last synchronized
+    /// per-link gossip metadata.
+    evicted: Vec<AdvertId>,
+    limits: DirectoryLimits,
     /// This node's app fingerprint (DESIGN.md §17). Adverts in this app or the open
     /// [`FABRIC_APP`] get full retention / are browsable; other apps' adverts are still relayed
     /// (the fabric is shared) but never surfaced locally.
@@ -304,13 +425,19 @@ impl Directory {
 
     /// Construct with an explicit relay-cache bound (0 disables best-effort carry).
     pub fn with_relay_cap(cap: usize) -> Self {
+        Self::with_limits(cap, DirectoryLimits::default())
+    }
+
+    fn with_limits(relay_cap: usize, limits: DirectoryLimits) -> Self {
         Self {
             subscriptions: HashSet::new(),
             subscribed: HashMap::new(),
-            relay: RelayCache::new(cap),
+            relay: RelayCache::new(relay_cap),
             prekeys: HashMap::new(),
-            seen: HashSet::new(),
-            revoked: HashSet::new(),
+            seen: HashMap::new(),
+            revoked: HashMap::new(),
+            evicted: Vec::new(),
+            limits,
             app: FABRIC_APP,
         }
     }
@@ -330,8 +457,8 @@ impl Directory {
             .filter(|a| a.topic() == topic)
             .collect();
         for a in promote {
-            self.relay.remove(&a.id);
-            self.subscribed.insert(a.id, a);
+            let _ = self.relay.remove(&a.id);
+            self.insert_subscribed(a);
         }
         self.subscriptions.insert(topic);
     }
@@ -349,10 +476,127 @@ impl Directory {
             || self.subscriptions.contains(topic)
     }
 
+    fn insert_subscribed(&mut self, advert: Advert) {
+        if self.limits.subscribed == 0 {
+            return;
+        }
+        self.subscribed.insert(advert.id, advert);
+        while self.subscribed.len() > self.limits.subscribed {
+            let victim = self
+                .subscribed
+                .iter()
+                .min_by_key(|(_, advert)| (advert.expires_at(), advert.body.created_at))
+                .map(|(id, _)| *id);
+            let Some(victim) = victim else { break };
+            self.subscribed.remove(&victim);
+            self.evicted.push(victim);
+        }
+    }
+
+    fn remember_seen(&mut self, id: AdvertId, expires_at: u64) {
+        if self.limits.seen == 0 {
+            return;
+        }
+        self.seen.insert(id, expires_at);
+        while self.seen.len() > self.limits.seen {
+            let victim = self
+                .seen
+                .iter()
+                .min_by_key(|(_, expiry)| **expiry)
+                .map(|(id, _)| *id);
+            let Some(victim) = victim else { break };
+            self.seen.remove(&victim);
+        }
+    }
+
+    fn remember_revocation(&mut self, advert: &Advert, revokes: AdvertId) {
+        if self.limits.revoked == 0 {
+            return;
+        }
+        let key = (revokes, advert.body.publisher, advert.body.app);
+        self.revoked.insert(key, advert.expires_at());
+        while self.revoked.len() > self.limits.revoked {
+            let victim = self
+                .revoked
+                .iter()
+                .min_by_key(|(_, expiry)| **expiry)
+                .map(|(key, _)| *key);
+            let Some(victim) = victim else { break };
+            self.revoked.remove(&victim);
+        }
+    }
+
+    fn held_advert(&self, id: &AdvertId) -> Option<Advert> {
+        self.subscribed
+            .get(id)
+            .cloned()
+            .or_else(|| self.relay.get(id))
+    }
+
+    fn remove_held_advert(&mut self, id: &AdvertId) -> Option<Advert> {
+        self.subscribed.remove(id).or_else(|| self.relay.remove(id))
+    }
+
+    fn remove_prekey_for_advert(&mut self, advert: &Advert) {
+        if self
+            .prekeys
+            .get(&advert.body.publisher)
+            .is_some_and(|entry| entry.advert_id == advert.id)
+        {
+            self.prekeys.remove(&advert.body.publisher);
+        }
+    }
+
+    fn index_prekey(&mut self, advert: &Advert, spk_pub: XPubKeyBytes, spk_sig: &[u8]) {
+        if self.limits.prekeys == 0 {
+            return;
+        }
+        let publisher = advert.body.publisher;
+        let newer = self
+            .prekeys
+            .get(&publisher)
+            .is_none_or(|entry| advert.body.created_at >= entry.created_at);
+        if !newer {
+            return;
+        }
+        self.prekeys.insert(
+            publisher,
+            PreKeyEntry {
+                advert_id: advert.id,
+                created_at: advert.body.created_at,
+                expires_at: advert.expires_at(),
+                bundle: PreKeyBundle {
+                    address: publisher,
+                    spk_pub,
+                    spk_sig: spk_sig.to_vec(),
+                },
+            },
+        );
+        while self.prekeys.len() > self.limits.prekeys {
+            let victim = self
+                .prekeys
+                .iter()
+                .min_by_key(|(_, entry)| (entry.expires_at, entry.created_at))
+                .map(|(publisher, _)| *publisher);
+            let Some(victim) = victim else { break };
+            self.prekeys.remove(&victim);
+        }
+    }
+
     /// Accept a gossiped advert. Verifies signature, dedups, applies tombstones,
     /// drops expired records, and routes to full retention or the relay cache by
     /// subscription. Returns true if newly accepted (worth re-gossiping).
     pub fn ingest(&mut self, advert: Advert, now_ms: u64) -> Result<bool> {
+        // Bound all attacker-controlled fields and allocations before the Ed25519 verification.
+        advert.validate_structure()?;
+        if advert.body.ttl_ms > MAX_ADVERT_TTL_MS {
+            return Err(Error::Other("advert TTL exceeds limit".into()));
+        }
+        if advert.body.created_at > now_ms.saturating_add(MAX_ADVERT_FUTURE_SKEW_MS) {
+            // Do not remember this id: once the receiver clock catches up, the same valid advert
+            // must still be admissible.
+            return Ok(false);
+        }
         advert.verify()?;
         if advert.is_expired(now_ms) {
             return Ok(false);
@@ -364,11 +608,15 @@ impl Directory {
         if matches!(advert.body.kind, AdvertKind::RecvBeacon { .. })
             && advert.hops > MAX_RECV_BEACON_HOPS
         {
-            self.seen.insert(advert.id);
+            self.remember_seen(advert.id, advert.expires_at());
             return Ok(false);
         }
 
-        if !self.seen.insert(advert.id) {
+        if self
+            .seen
+            .get(&advert.id)
+            .is_some_and(|expiry| *expiry >= now_ms)
+        {
             // Already seen — but a copy that travelled fewer hops means we found a
             // shorter path (e.g. a direct link after first hearing it via a relay).
             // Adopt the smaller hop count so "N hops away" reflects the closest path.
@@ -379,32 +627,54 @@ impl Directory {
             }
             return Ok(false); // dedup (don't re-gossip)
         }
+        self.seen.remove(&advert.id);
 
-        if let AdvertKind::Tombstone { revokes } = advert.body.kind {
-            self.revoked.insert(revokes);
-            self.subscribed.remove(&revokes);
-            self.relay.remove(&revokes);
+        // If the target is already held, a tombstone is authorized only in the same signed
+        // publisher/app namespace. An unauthorized record is not retained or re-gossiped.
+        let tombstone_target = match &advert.body.kind {
+            AdvertKind::Tombstone { revokes } => Some(*revokes),
+            _ => None,
+        };
+        if let Some(revokes) = tombstone_target {
+            if let Some(target) = self.held_advert(&revokes) {
+                if target.body.publisher != advert.body.publisher
+                    || target.body.app != advert.body.app
+                {
+                    self.remember_seen(advert.id, advert.expires_at());
+                    return Ok(false);
+                }
+            }
         }
-        if self.revoked.contains(&advert.id) {
-            return Ok(true); // seen for gossip, but don't store a revoked record
+
+        self.remember_seen(advert.id, advert.expires_at());
+
+        // A tombstone may have arrived before this target. Match the owner and namespace now that
+        // the target's signed body is known. Claims by anyone else are conclusively unauthorized.
+        let revocation_key = (advert.id, advert.body.publisher, advert.body.app);
+        let revoked = self
+            .revoked
+            .get(&revocation_key)
+            .is_some_and(|expiry| *expiry >= now_ms);
+        if revoked {
+            self.revoked.retain(|(id, publisher, app), _| {
+                *id != advert.id || (*publisher == advert.body.publisher && *app == advert.body.app)
+            });
+            return Ok(false); // matching earlier tombstone suppresses storage and local side effects
+        }
+        self.revoked.retain(|(id, _, _), _| *id != advert.id);
+
+        if let Some(revokes) = tombstone_target {
+            self.remember_revocation(&advert, revokes);
+            if let Some(target) = self.remove_held_advert(&revokes) {
+                self.evicted.push(revokes);
+                self.remove_prekey_for_advert(&target);
+            }
         }
 
         // Index prekey bundles by publisher (newest wins) for session bootstrap,
         // alongside storing the advert for re-gossip.
         if let AdvertKind::PreKey { spk_pub, spk_sig } = &advert.body.kind {
-            let pubk = advert.body.publisher;
-            let newer = self
-                .prekeys
-                .get(&pubk)
-                .is_none_or(|(at, _)| advert.body.created_at >= *at);
-            if newer {
-                let bundle = PreKeyBundle {
-                    address: pubk,
-                    spk_pub: *spk_pub,
-                    spk_sig: spk_sig.clone(),
-                };
-                self.prekeys.insert(pubk, (advert.body.created_at, bundle));
-            }
+            self.index_prekey(&advert, *spk_pub, spk_sig);
         }
 
         // App scoping (DESIGN.md §17): full retention only for our own app or the open fabric
@@ -413,9 +683,9 @@ impl Directory {
         // locally. This is what stops one app from discovering another app's hps topics.
         let our_app = advert.body.app == self.app || advert.body.app == FABRIC_APP;
         if our_app && self.is_subscribed(advert.topic()) {
-            self.subscribed.insert(advert.id, advert);
+            self.insert_subscribed(advert);
         } else {
-            self.relay.put(&advert)?; // best-effort carry for strangers / other apps
+            self.evicted.extend(self.relay.put(&advert)?); // best-effort carry for strangers / other apps
         }
         Ok(true)
     }
@@ -423,12 +693,17 @@ impl Directory {
     /// The latest known prekey bundle for `address`, if we've seen one — used to
     /// open a forward-secret session without a live round-trip (DESIGN.md §25).
     pub fn prekey(&self, address: &PubKeyBytes) -> Option<PreKeyBundle> {
-        self.prekeys.get(address).map(|(_, b)| b.clone())
+        self.prekeys.get(address).map(|entry| entry.bundle.clone())
     }
 
     /// Have we already seen this advert id (for gossip offer filtering)?
     pub fn seen(&self, id: &AdvertId) -> bool {
-        self.seen.contains(id)
+        self.seen.contains_key(id)
+    }
+
+    /// Whether this advert is still held for local use or re-gossip (not merely remembered in dedup).
+    pub fn contains(&self, id: &AdvertId) -> bool {
+        self.held_advert(id).is_some()
     }
 
     /// Every advert we currently hold, from both stores.
@@ -456,18 +731,26 @@ impl Directory {
             .collect()
     }
 
+    /// Advert ids that left all held directory stores since the previous call. Nodes use this to
+    /// expire per-link/per-peer `sent_adverts` metadata at the same boundary as the data itself.
+    pub fn take_evicted(&mut self) -> Vec<AdvertId> {
+        std::mem::take(&mut self.evicted)
+    }
+
     /// Drop expired service adverts. Call periodically (DESIGN.md §8, §23).
     pub fn expire(&mut self, now_ms: u64) {
-        self.subscribed.retain(|_, a| !a.is_expired(now_ms));
-        let expired: Vec<AdvertId> = self
-            .relay
-            .adverts()
-            .filter(|a| a.is_expired(now_ms))
-            .map(|a| a.id)
+        let expired_subscribed: Vec<_> = self
+            .subscribed
+            .iter()
+            .filter(|(_, advert)| advert.is_expired(now_ms))
+            .map(|(id, _)| *id)
             .collect();
-        for id in expired {
-            self.relay.remove(&id);
-        }
+        self.subscribed.retain(|_, a| !a.is_expired(now_ms));
+        self.evicted.extend(expired_subscribed);
+        self.evicted.extend(self.relay.expire(now_ms));
+        self.seen.retain(|_, expiry| *expiry >= now_ms);
+        self.revoked.retain(|_, expiry| *expiry >= now_ms);
+        self.prekeys.retain(|_, entry| entry.expires_at >= now_ms);
     }
 
     /// Browse a service namespace, optionally filtered by tag (e.g. service
@@ -681,6 +964,215 @@ mod tests {
         .unwrap();
         dir.ingest(tomb, 11).unwrap();
         assert!(dir.browse("market", None).is_empty()); // sold → gone
+    }
+
+    #[test]
+    fn tombstones_require_the_original_publisher_in_both_arrival_orders() {
+        let seller = Identity::generate();
+        let attacker = Identity::generate();
+        let first = listing(&seller, "first", 1);
+        let second = listing(&seller, "second", 2);
+        let third = listing(&seller, "third", 3);
+        let mut dir = Directory::new();
+
+        dir.ingest(first.clone(), 1).unwrap();
+        let forged_after = Advert::publish(
+            &attacker,
+            AdvertKind::Tombstone { revokes: first.id },
+            1,
+            600_000,
+            1,
+        )
+        .unwrap();
+        assert!(!dir.ingest(forged_after, 1).unwrap());
+        assert_eq!(dir.browse("market", None).len(), 1);
+
+        let forged_before = Advert::publish(
+            &attacker,
+            AdvertKind::Tombstone { revokes: second.id },
+            1,
+            600_000,
+            2,
+        )
+        .unwrap();
+        assert!(dir.ingest(forged_before, 1).unwrap());
+        assert!(dir.ingest(second, 1).unwrap());
+        assert_eq!(dir.browse("market", None).len(), 2);
+
+        let valid_before = Advert::publish(
+            &seller,
+            AdvertKind::Tombstone { revokes: third.id },
+            1,
+            600_000,
+            4,
+        )
+        .unwrap();
+        assert!(dir.ingest(valid_before, 1).unwrap());
+        assert!(!dir.ingest(third, 1).unwrap());
+        assert!(dir.browse("market", None).iter().all(|advert| !matches!(
+            &advert.body.kind,
+            AdvertKind::Service { title, .. } if title == "third"
+        )));
+    }
+
+    #[test]
+    fn tombstones_remove_only_the_matching_prekey_index() {
+        let publisher = Identity::generate();
+        let prekey = publisher.derive_prekey();
+        let first = Advert::publish(
+            &publisher,
+            AdvertKind::PreKey {
+                spk_pub: prekey.public,
+                spk_sig: prekey.sig.to_vec(),
+            },
+            0,
+            1_000,
+            1,
+        )
+        .unwrap();
+        let mut dir = Directory::new();
+        dir.ingest(first.clone(), 0).unwrap();
+        assert!(dir.prekey(&publisher.address()).is_some());
+
+        let tomb = Advert::publish(
+            &publisher,
+            AdvertKind::Tombstone { revokes: first.id },
+            0,
+            1_000,
+            2,
+        )
+        .unwrap();
+        dir.ingest(tomb, 0).unwrap();
+        assert!(dir.prekey(&publisher.address()).is_none());
+
+        let second = Advert::publish(
+            &publisher,
+            AdvertKind::PreKey {
+                spk_pub: prekey.public,
+                spk_sig: prekey.sig.to_vec(),
+            },
+            0,
+            1_000,
+            3,
+        )
+        .unwrap();
+        let tomb_first = Advert::publish(
+            &publisher,
+            AdvertKind::Tombstone { revokes: second.id },
+            0,
+            1_000,
+            4,
+        )
+        .unwrap();
+        dir.ingest(tomb_first, 0).unwrap();
+        assert!(!dir.ingest(second, 0).unwrap());
+        assert!(dir.prekey(&publisher.address()).is_none());
+    }
+
+    #[test]
+    fn future_skew_and_structural_limits_do_not_poison_seen() {
+        let publisher = Identity::generate();
+        let future = Advert::publish(
+            &publisher,
+            AdvertKind::Service {
+                service: "market".into(),
+                title: "future".into(),
+                summary: String::new(),
+                tags: vec![],
+            },
+            MAX_ADVERT_FUTURE_SKEW_MS + 1,
+            1_000,
+            1,
+        )
+        .unwrap();
+        let mut dir = Directory::new();
+        assert!(!dir.ingest(future.clone(), 0).unwrap());
+        assert!(!dir.seen(&future.id));
+        assert!(dir
+            .ingest(future.clone(), MAX_ADVERT_FUTURE_SKEW_MS + 1)
+            .unwrap());
+
+        let mut oversized = listing(&publisher, "small", 2);
+        oversized.body.kind = AdvertKind::Service {
+            service: "market".into(),
+            title: "x".repeat(MAX_TITLE_BYTES + 1),
+            summary: String::new(),
+            tags: vec![],
+        };
+        assert!(dir.ingest(oversized.clone(), 0).is_err());
+        assert!(!dir.seen(&oversized.id));
+
+        let capped = Advert::publish(
+            &publisher,
+            AdvertKind::RecvBeacon {
+                mailbox: [0u8; crypto::TAG_LEN],
+            },
+            0,
+            u32::MAX,
+            3,
+        )
+        .unwrap();
+        assert_eq!(capped.body.ttl_ms, MAX_ADVERT_TTL_MS);
+        let mut hostile_ttl = capped.clone();
+        hostile_ttl.body.ttl_ms = MAX_ADVERT_TTL_MS + 1;
+        assert!(dir.ingest(hostile_ttl.clone(), 0).is_err());
+        assert!(!dir.seen(&hostile_ttl.id));
+    }
+
+    #[test]
+    fn every_directory_index_is_bounded_and_expired() {
+        let limits = DirectoryLimits {
+            subscribed: 2,
+            seen: 4,
+            revoked: 2,
+            prekeys: 2,
+        };
+        let mut dir = Directory::with_limits(1, limits);
+        for seq in 0..6 {
+            let publisher = Identity::generate();
+            let prekey = publisher.derive_prekey();
+            let advert = Advert::publish(
+                &publisher,
+                AdvertKind::PreKey {
+                    spk_pub: prekey.public,
+                    spk_sig: prekey.sig.to_vec(),
+                },
+                0,
+                10,
+                seq,
+            )
+            .unwrap();
+            dir.ingest(advert, 0).unwrap();
+        }
+        assert_eq!(dir.subscribed.len(), limits.subscribed);
+        assert_eq!(dir.prekeys.len(), limits.prekeys);
+        assert_eq!(dir.seen.len(), limits.seen);
+
+        let publisher = Identity::generate();
+        for seq in 0..5 {
+            let tomb = Advert::publish(
+                &publisher,
+                AdvertKind::Tombstone {
+                    revokes: [seq as u8; 32],
+                },
+                0,
+                10,
+                seq,
+            )
+            .unwrap();
+            dir.ingest(tomb, 0).unwrap();
+        }
+        assert_eq!(dir.revoked.len(), limits.revoked);
+        assert_eq!(dir.seen.len(), limits.seen);
+        assert!(dir.subscribed.len() <= limits.subscribed);
+
+        dir.expire(11);
+        assert!(dir.subscribed.is_empty());
+        assert!(dir.relay.blobs.is_empty());
+        assert!(dir.relay.order.is_empty());
+        assert!(dir.prekeys.is_empty());
+        assert!(dir.seen.is_empty());
+        assert!(dir.revoked.is_empty());
     }
 
     #[test]

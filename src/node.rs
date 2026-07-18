@@ -15,13 +15,16 @@
 //! link packet; MTU fragmentation (`link::fragment`) wraps this when a bearer
 //! needs it — a TODO for the BLE shim.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
 use crate::access::{AccessPolicy, Admit, Stamper, TenantId, Usage};
 use crate::app::AppKeys;
-use crate::bundle::{Bundle, BundleFlags, BundleId, BundleOpts, Destination, Payload, StreamId};
+use crate::bundle::{
+    Bundle, BundleFlags, BundleId, BundleOpts, Destination, Payload, StreamId, TraceHop,
+    MAX_BUNDLE_WIRE_BYTES,
+};
 use crate::crypto::{
     self, short_addr, Identity, PubKeyBytes, ShortAddr, SignedPreKey, Tag, XPubKeyBytes,
 };
@@ -32,14 +35,14 @@ use crate::link::{BearerEvent, LinkHandshake, LinkId, LinkSession, Role};
 use crate::route::RouteTable;
 use crate::routing::{BundleMeta, ForwardDecision, Router, SprayAndWait};
 use crate::session::Session;
-use crate::store::{MemoryStore, Store};
+use crate::store::{KvMutation, KvPageRow, MemoryStore, Store, MAX_SEEN_LIFETIME_MS};
 use crate::stream::StreamReassembler;
 use crate::telemetry::TelemetryBatch;
 use crate::{short_app, AppId, ShortApp, FABRIC_APP};
 
 /// A link packet on the wire: a Noise handshake message, or an encrypted record.
-#[derive(Serialize, Deserialize)]
-enum LinkPacket {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum LinkPacket {
     Handshake(Vec<u8>),
     Data(Vec<u8>),
     /// One fragment of a record too large for a single Noise message (max 65535 bytes).
@@ -61,13 +64,16 @@ const MAX_RECORD_PLAINTEXT: usize = 60_000;
 /// carrier-stream layer splits them into 48 KiB bundles before they reach link framing.
 const MAX_REASSEMBLED_RECORD: usize = 1 << 20;
 const MAX_RECORD_FRAGMENTS: usize = MAX_REASSEMBLED_RECORD.div_ceil(MAX_RECORD_PLAINTEXT);
+/// Aggregate cap applied before decoding an attacker-controlled postcard link packet.
+pub const MAX_LINK_PACKET_BYTES: usize = 64 * 1024;
+const MAX_HANDSHAKE_MESSAGE_BYTES: usize = 1024;
 
 /// Claims the peer's hop address during the Noise handshake. No signature needed:
 /// the sealing key is derived from the address (Montgomery), so the peer is bound to
 /// the address iff `address_to_x(address)` equals the static key Noise authenticated.
-#[derive(Serialize, Deserialize)]
-struct LinkAuth {
-    address: PubKeyBytes,
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LinkAuth {
+    pub(crate) address: PubKeyBytes,
 }
 
 /// An application record exchanged over an established link.
@@ -76,7 +82,7 @@ struct LinkAuth {
 /// custody beacon (a node tells this peer what it already holds so the peer stops re-offering it);
 /// added within the v8 wire bump.
 #[derive(Serialize, Deserialize)]
-enum Wire {
+pub(crate) enum Wire {
     Bundle(Bundle),
     Advert(Advert),
     /// §35 custody beacon: "I already hold these ids, do not offer them to me." Mode-1 only:
@@ -84,6 +90,13 @@ enum Wire {
     /// peer's own truthful claim about its own store (no forgery/censorship surface, unlike a
     /// flooded beacon). Cuts duplicate-ingress COGS.
     Have(crate::store::HaveSet),
+}
+
+/// Postcard encodes this two-variant enum with a one-byte discriminant (`Bundle = 0`, `Advert = 1`).
+/// Pinning that below lets us reject an oversized advert before deserializing attacker-sized strings
+/// and vectors. A unit test asserts the discriminant assumption against the actual serializer.
+fn advert_record_exceeds_limit(plaintext: &[u8]) -> bool {
+    plaintext.first() == Some(&1) && plaintext.len() > MAX_ADVERT_LINK_BYTES
 }
 
 struct Handshaking {
@@ -114,6 +127,7 @@ struct Established {
 struct PeerSent {
     adverts: HashSet<crate::discover::AdvertId>,
     bundles: HashSet<crate::bundle::BundleId>,
+    last_seen_ms: u64,
 }
 
 // Boxed because a Noise handshake state is much larger than an established session.
@@ -278,6 +292,12 @@ const MAX_METERED_ATTRIBUTION: usize = 16_384;
 /// Bounds the beacon's link bandwidth (a full held set can be large) and the per-link `peer_has`
 /// memory; a relay that holds more than this simply advertises its most-recent slice.
 const MAX_HAVE_ADVERTISE: usize = 4_096;
+const ADVERT_VERIFY_WINDOW_MS: u64 = 1_000;
+const MAX_ADVERTS_PER_LINK_WINDOW: u32 = 64;
+const MAX_ADVERTS_GLOBAL_WINDOW: u32 = 512;
+const MAX_ADVERT_LINK_BYTES: usize = crate::discover::MAX_ADVERT_WIRE_BYTES + 8;
+const MAX_PEER_SENT: usize = 1_024;
+const PEER_SENT_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Cap on the soft-state gradient table (bounds a Sybil flooding fake mailbox-tags; signed
 /// beacons stop *hijack*, this stops *bloat*). On overflow the nearest-to-expiry entry is evicted.
 pub const MAX_RECV_GRADIENT: usize = 4_096;
@@ -404,12 +424,82 @@ struct PendingContent {
     private: bool, // §39: send untraceably (no cleartext src/dst, floods, recognized by tag)
 }
 
-/// A decrypted user message ready for the inbox — uniform across static-sealed and
+/// The response variant an outstanding directed request is allowed to consume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum RequestKind {
+    Http,
+    Service,
+}
+
+/// Durable authorization context for one outbound HTTP/service request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct OutstandingRequest {
+    responder: PubKeyBytes,
+    kind: RequestKind,
+    expires_at_ms: u64,
+    custody_ids: Vec<BundleId>,
+}
+
+/// A decrypted user message ready for the inbox, uniform across static-sealed and
 /// forward-secret session messages.
+#[derive(Clone)]
 pub struct ReadMessage {
     pub from: PubKeyBytes,
     pub content_type: String,
     pub body: Vec<u8>,
+}
+
+/// A durable, already-authenticated inbox item. The bundle id is also the stable host dedup id.
+/// Polling clones these records without removing them; only [`Node::accept_inbox`] deletes one and
+/// releases its delivery acknowledgement.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub id: BundleId,
+    pub from: PubKeyBytes,
+    pub content_type: String,
+    pub body: Vec<u8>,
+    pub hops: u8,
+    pub created_at: u64,
+    pub trace: Vec<TraceHop>,
+    received_at: u64,
+    acknowledgement: InboxAcknowledgement,
+    /// Retained only for the legacy low-level `take_inbox`/`read_message` test seam. Redelivery and
+    /// all public host APIs use the decrypted fields above and never consume the ratchet again.
+    original: Bundle,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+enum InboxAcknowledgement {
+    None,
+    Traced {
+        to: PubKeyBytes,
+        for_bundle_id: BundleId,
+        delivery_hops: u8,
+        delivery_ms: u32,
+        lifetime_ms: u32,
+        priority: u8,
+    },
+    Private {
+        to: PubKeyBytes,
+        for_bundle_id: BundleId,
+        delivery_hops: u8,
+        delivery_ms: u32,
+        proof: Option<[u8; 32]>,
+        vaccine: Option<[u8; 32]>,
+        lifetime_ms: u32,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ReceiverSeen {
+    expires_at_ms: u64,
+    acknowledgement: InboxAcknowledgement,
+}
+
+struct PreparedInbound {
+    message: Option<ReadMessage>,
+    session: Option<PeerSession>,
+    flush_pending: bool,
 }
 
 /// An internet-egress HTTP request a gateway should fulfill (Use Case A, §9).
@@ -456,8 +546,11 @@ pub enum HnsLookup {
 }
 
 /// An HTTP response a gateway sealed back to the requester.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HttpRespItem {
     pub from: PubKeyBytes,
+    /// The response bundle id used for local queue acceptance.
+    pub id: BundleId,
     pub for_id: BundleId,
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -507,8 +600,11 @@ pub struct ServiceReqItem {
 }
 
 /// A service response sealed back to us (as the caller).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServiceRespItem {
     pub from: PubKeyBytes,
+    /// The response bundle id used for local queue acceptance.
+    pub id: BundleId,
     pub for_id: BundleId,
     pub status: u16,
     pub body: Vec<u8>,
@@ -526,6 +622,114 @@ pub struct TelemetryIn {
     pub tenant: Option<TenantId>,
 }
 
+/// Memory admission for host-facing queues. Limits apply per queue, across all host queues, and per
+/// authenticated sender. Peer-message inbox rows remain durable and non-destructive after admission.
+#[derive(Clone, Copy, Debug)]
+pub struct AppQueueLimits {
+    pub max_items_per_queue: usize,
+    pub max_bytes_per_queue: usize,
+    pub max_total_items: usize,
+    pub max_total_bytes: usize,
+    pub max_item_bytes: usize,
+    pub max_sender_items: usize,
+    pub max_sender_bytes: usize,
+}
+
+impl Default for AppQueueLimits {
+    fn default() -> Self {
+        Self {
+            max_items_per_queue: 256,
+            max_bytes_per_queue: 64 * 1024 * 1024,
+            max_total_items: 1_024,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_item_bytes: 36 * 1024 * 1024,
+            max_sender_items: 64,
+            max_sender_bytes: 36 * 1024 * 1024,
+        }
+    }
+}
+
+const APP_QUEUE_KINDS: usize = 11;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum AppQueueKind {
+    PeerInbox = 0,
+    GenericInbox = 1,
+    HttpRequest = 2,
+    HttpResponse = 3,
+    ServiceRequest = 4,
+    ServiceResponse = 5,
+    HnsLookup = 6,
+    HnsResult = 7,
+    HpsMessage = 8,
+    HpsInvite = 9,
+    Telemetry = 10,
+}
+
+#[derive(Clone, Copy)]
+struct AppQueueCharge {
+    kind: AppQueueKind,
+    source: Option<PubKeyBytes>,
+    bytes: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct AppSenderUsage {
+    items: usize,
+    bytes: usize,
+}
+
+struct AppQueueUsage {
+    items: usize,
+    bytes: usize,
+    counts: [usize; APP_QUEUE_KINDS],
+    queue_bytes: [usize; APP_QUEUE_KINDS],
+    senders: HashMap<PubKeyBytes, AppSenderUsage>,
+}
+
+impl Default for AppQueueUsage {
+    fn default() -> Self {
+        Self {
+            items: 0,
+            bytes: 0,
+            counts: [0; APP_QUEUE_KINDS],
+            queue_bytes: [0; APP_QUEUE_KINDS],
+            senders: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AppPayloadPolicy(u16);
+
+impl AppPayloadPolicy {
+    const fn all() -> Self {
+        Self((1 << APP_QUEUE_KINDS) - 1)
+    }
+
+    const fn for_kind(kind: NodeKind) -> Self {
+        let bits = match kind {
+            NodeKind::Device => Self::all().0,
+            NodeKind::Relay => 0,
+            NodeKind::Gateway => 1 << AppQueueKind::HttpRequest as usize,
+            NodeKind::Endpoint => {
+                (1 << AppQueueKind::HttpRequest as usize) | (1 << AppQueueKind::HpsMessage as usize)
+            }
+        };
+        Self(bits)
+    }
+
+    fn supports(self, kind: AppQueueKind) -> bool {
+        self.0 & (1 << kind as usize) != 0
+    }
+}
+
+struct PendingAppDelivery {
+    bundle: Bundle,
+    charge: AppQueueCharge,
+}
+
 /// In-progress reassembly of an inbound **carrier stream** (DESIGN.md §20): a bundle too
 /// large to send in one shot is split into ordered chunks; when they're all here the
 /// original bundle bytes are reconstructed and re-processed as if received whole. Keyed
@@ -533,13 +737,166 @@ pub struct TelemetryIn {
 struct IncomingStream {
     reassembler: StreamReassembler,
     data: Vec<u8>,
-    at: u64, // last activity, for pruning abandoned transfers
+    chunks: HashMap<u64, IncomingChunk>,
+    bytes: usize,
+    started_at: u64, // absolute lifetime anchor; arrivals never refresh it
+    at: u64,         // last activity, for pruning abandoned transfers
+}
+
+#[derive(Clone, Copy)]
+struct IncomingChunk {
+    hash: [u8; 32],
+    fin: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedCarrierChunk {
+    started_at: u64,
+    received_at: u64,
+    fin: bool,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct OutgoingCarrier {
+    original: Bundle,
+    chunks: Vec<BundleId>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHttpResponse {
+    item: HttpRespItem,
+    received_at_ms: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedServiceResponse {
+    item: ServiceRespItem,
+    received_at_ms: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct IncomingStreamUsage {
+    streams: usize,
+    bytes: usize,
+}
+
+enum StreamChunkAcceptance {
+    Retained,
+    Complete(Vec<u8>),
+    Rejected,
+}
+
+enum CarrierChunkOrigin {
+    Live,
+    Persisted { started_at: u64, received_at: u64 },
+}
+
+struct CarrierChunkInput {
+    bytes: Vec<u8>,
+    fin: bool,
+    origin: CarrierChunkOrigin,
 }
 
 /// A bundle whose encoding exceeds this is carried as a stream of `STREAM_CHUNK`-sized
 /// chunks (transparently); anything smaller goes as one bundle. Sized to fit comfortably
 /// in one link record on every bearer (well under the 1 MiB frame cap).
 const STREAM_CHUNK: usize = 48 * 1024;
+
+const MAX_CARRIER_STREAM_BYTES: usize = MAX_BUNDLE_WIRE_BYTES;
+const MAX_CARRIER_STREAM_CHUNKS: usize = MAX_CARRIER_STREAM_BYTES.div_ceil(STREAM_CHUNK);
+const MAX_CARRIER_CONTENT_BYTES: usize = MAX_CARRIER_STREAM_BYTES - 64 * 1024;
+const MAX_CARRIER_STREAMS_PER_SENDER: usize = 4;
+const MAX_CARRIER_BYTES_PER_SENDER: usize = 32 * 1024 * 1024;
+const MAX_CARRIER_STREAMS_GLOBAL: usize = 32;
+const MAX_CARRIER_BYTES_GLOBAL: usize = 64 * 1024 * 1024;
+const CARRIER_STREAM_IDLE_MS: u64 = 3_600_000;
+const CARRIER_STREAM_LIFETIME_MS: u64 = 24 * 60 * 60 * 1_000;
+const CARRIER_PERSISTED_PAGE_ROWS: usize = 16;
+const CARRIER_REHYDRATE_MAX_ROWS: usize = 64;
+const CARRIER_REHYDRATE_MAX_BYTES: usize = 96 * 1024 * 1024;
+const CARRIER_REHYDRATE_MAX_PAGES: usize = 4;
+const CARRIER_REHYDRATE_MAX_CLEANUP_OPERATIONS: usize = 128;
+const CARRIER_CLEANUP_BATCH_ROWS: usize = 128;
+const _: () = assert!(CARRIER_CLEANUP_BATCH_ROWS < 400);
+
+#[derive(Clone, Copy)]
+struct CarrierLimits {
+    chunk_bytes: usize,
+    stream_bytes: usize,
+    stream_chunks: usize,
+    sender_streams: usize,
+    sender_bytes: usize,
+    global_streams: usize,
+    global_bytes: usize,
+}
+
+impl Default for CarrierLimits {
+    fn default() -> Self {
+        Self {
+            chunk_bytes: STREAM_CHUNK,
+            stream_bytes: MAX_CARRIER_STREAM_BYTES,
+            stream_chunks: MAX_CARRIER_STREAM_CHUNKS,
+            sender_streams: MAX_CARRIER_STREAMS_PER_SENDER,
+            sender_bytes: MAX_CARRIER_BYTES_PER_SENDER,
+            global_streams: MAX_CARRIER_STREAMS_GLOBAL,
+            global_bytes: MAX_CARRIER_BYTES_GLOBAL,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CarrierRehydrateState {
+    cursor: Option<String>,
+    rejected_stream: Option<(PubKeyBytes, StreamId)>,
+    cleanup: VecDeque<KvPageRow>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CarrierRehydrateUsage {
+    rows: usize,
+    bytes: usize,
+    pages: usize,
+    cleanup_operations: usize,
+}
+
+const HPS_SUBSCRIBE_PENDING_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_HPS_SUBSCRIBE_PENDING: usize = 256;
+const MAX_HPS_PATH_BYTES: usize = 512;
+const MAX_HPS_REPLAYS_PER_TOPIC: usize = 1_024;
+const MAX_HPS_REPLAYS_GLOBAL: usize = 4_096;
+const MAX_HPS_ACKED: usize = 4_096;
+const HPS_REHYDRATE_PAGE: usize = 256;
+const MAX_OUTSTANDING_REQUESTS: usize = 256;
+const MAX_DURABLE_RESPONSES: usize = 256;
+const MAX_DURABLE_HPS_MESSAGES: usize = 256;
+const DURABLE_HOST_DELIVERY_TTL_MS: u64 = MAX_SEEN_LIFETIME_MS;
+
+type HpsReplayTable = HashMap<([u8; 16], u32), Vec<(BundleId, u64)>>;
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct PendingHpsSubscription {
+    host: PubKeyBytes,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHpsReplay {
+    topic_tag: [u8; 16],
+    epoch: u32,
+    entries: Vec<(BundleId, u64)>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHpsInbox {
+    message: HpsMessage,
+    topic_tag: [u8; 16],
+    epoch: u32,
+    received_at_ms: u64,
+    expires_at_ms: u64,
+}
 
 /// Reserved content-type for a content-less re-establishment ping sent to heal a desynced
 /// ratchet (DESIGN.md §25). The receiver rebuilds the session as a side effect and does not
@@ -554,6 +911,9 @@ pub struct Node<S: Store = MemoryStore> {
     router: SprayAndWait,
     pub directory: Directory,
     now_ms: u64,
+    /// A non-zero host clock has been supplied. Response-bearing requests are refused before this
+    /// anchor because their durable authorization expiry must never be based on the zero origin.
+    clock_anchored: bool,
     /// Last time we re-gossiped adverts to all live links (so prekeys/presence propagate over
     /// STABLE links, not just at link-up — see the re-gossip in `tick`).
     last_regossip_ms: u64,
@@ -567,7 +927,14 @@ pub struct Node<S: Store = MemoryStore> {
     /// Per-peer gossip dedup, preserved across link flaps so a reconnect doesn't re-flood the directory.
     peer_sent: HashMap<PubKeyBytes, PeerSent>,
     outgoing: Vec<(LinkId, Vec<u8>)>,
+    /// Legacy raw-bundle view used by core tests. Public hosts poll [`Self::inbox_items`] instead.
     inbox: Vec<Bundle>,
+    /// Decrypted messages durably staged before host delivery, keyed by their stable bundle id.
+    durable_inbox: HashMap<BundleId, InboxItem>,
+    inbox_order: Vec<BundleId>,
+    /// Receiver-only dedup, separate from relay `Store::seen` so an unrecognized private-header
+    /// chimera cannot suppress the genuine copy. The retained acknowledgement enables safe re-ACK.
+    receiver_seen: HashMap<BundleId, ReceiverSeen>,
     /// Locally-originated bundles awaiting an ACK, retransmitted until acked/expired.
     pending: HashMap<BundleId, PendingTx>,
     retx_interval_ms: u64,
@@ -592,6 +959,10 @@ pub struct Node<S: Store = MemoryStore> {
     /// Per-link fixed-window counter for inbound §39 private-bundle rate limiting (F-07):
     /// `link → (window_start_ms, count)`. Bounds an unsigned-bundle flood per peer.
     priv_ingest: HashMap<LinkId, (u64, u32)>,
+    /// Signature-verification admission, bounded per link and globally so fresh Sybil identities
+    /// cannot multiply expensive advert work without bound.
+    advert_ingest: HashMap<LinkId, (u64, u32)>,
+    advert_ingest_global: (u64, u32),
     /// §39 P4 soft-state routing gradient: mailbox-tag → the next hop *toward* that recipient.
     /// Laid by recipients' signed [`AdvertKind::RecvBeacon`]s as they flood a few hops; a node
     /// then forwards a matching **private** bundle down `inbound` instead of blind-flooding. Soft
@@ -606,8 +977,12 @@ pub struct Node<S: Store = MemoryStore> {
     sessions: HashMap<PubKeyBytes, PeerSession>,
     /// Last time (ms) each session was used or (re)established. Sessions idle past
     /// [`SESSION_MAX_IDLE_MS`] are GC'd in [`Node::tick`] so `session/` doesn't leak entries for
-    /// peers we never talk to again (a slow storage growth). In-memory; seeded to now on rehydrate.
+    /// peers we never talk to again (a slow storage growth). Restored sessions are anchored on their
+    /// first real tick because this timestamp is intentionally not part of persisted PeerSession.
     session_touch: HashMap<PubKeyBytes, u64>,
+    /// Restored sessions have no persisted last-use timestamp. Anchor these to the first real tick
+    /// before idle GC so an epoch-scale clock does not immediately reap every restored ratchet.
+    unanchored_sessions: HashSet<PubKeyBytes>,
     /// Bundle ids we've been "vaccinated" against by a passing delivery ACK — we
     /// drop them on sight so a delivered message stops propagating (epidemic
     /// recovery, DESIGN.md §6). Pruned by age in [`Node::tick`].
@@ -639,10 +1014,22 @@ pub struct Node<S: Store = MemoryStore> {
     sends_delivered: Vec<BundleId>,
     default_lifetime_ms: u32,
     beaconed_tick: bool,
+    app_queue_limits: AppQueueLimits,
+    app_queue_usage: AppQueueUsage,
+    app_payload_policy: AppPayloadPolicy,
+    pending_app_deliveries: HashMap<BundleId, PendingAppDelivery>,
+    durable_inbox_charges: HashMap<BundleId, AppQueueCharge>,
     /// Egress HTTP requests addressed to us (as a gateway) awaiting fulfillment (§9).
     http_requests: Vec<HttpReqItem>,
     /// HTTP responses sealed back to us (as a requester).
     http_responses: Vec<HttpRespItem>,
+    http_response_expires: HashMap<BundleId, u64>,
+    http_response_charges: HashMap<BundleId, AppQueueCharge>,
+    /// Outbound HTTP/service request id to the only authenticated signer and response kind allowed
+    /// to complete it. Persisted independently of the request bundle for restart-safe authorization.
+    outstanding_requests: HashMap<BundleId, OutstandingRequest>,
+    /// Restored authorizations remain unusable until a real tick validates their absolute expiry.
+    unanchored_outstanding_requests: HashSet<BundleId>,
     /// Learned reachability per endpoint, from observed deliveries (DESIGN.md §27):
     /// orders transmissions (best first) and eviction (flush unknown-dst first).
     routes: RouteTable,
@@ -674,8 +1061,18 @@ pub struct Node<S: Store = MemoryStore> {
     /// Telemetry batches received via `hop.telemetry` (OTel-over-Hop, §40), decoded + bounded, for
     /// the embedding collector to drain and forward.
     telemetry_in: Vec<TelemetryIn>,
+    telemetry_charges: Vec<AppQueueCharge>,
+    service_response_expires: HashMap<BundleId, u64>,
+    service_response_charges: HashMap<BundleId, AppQueueCharge>,
     /// In-progress inbound carrier-stream reassembly, keyed by `(sender, stream_id)` (§20).
     incoming_streams: HashMap<(PubKeyBytes, StreamId), IncomingStream>,
+    incoming_stream_bytes: usize,
+    incoming_sender_usage: HashMap<PubKeyBytes, IncomingStreamUsage>,
+    carrier_limits: CarrierLimits,
+    /// Startup carrier rows are scanned and cleaned in bounded rounds. While this is present, live
+    /// carrier admission fails closed and tick maintenance resumes from the retained cursor.
+    carrier_rehydrate: Option<CarrierRehydrateState>,
+    carrier_rehydrate_usage: CarrierRehydrateUsage,
     /// Monotonic counter for our outbound stream ids.
     stream_seq: u64,
     /// Delivery-ACKs we originated, → the distinct peers we've handed each to. The ACK
@@ -689,6 +1086,8 @@ pub struct Node<S: Store = MemoryStore> {
     /// message report real relay progress ("Sent N") and ownership under its *original* id,
     /// even though the bytes travel as separate carrier bundles.
     carrier_owner: HashMap<BundleId, BundleId>,
+    /// Exact reconstructed originals retained outside the forwarding queue until their own ACK arrives.
+    outgoing_carriers: HashMap<BundleId, OutgoingCarrier>,
     /// Content awaiting a forward-secret session (DESIGN.md §25): device-to-device content is
     /// **never** static-sealed — if we don't yet hold the peer's prekey it's queued here and
     /// sent the moment one arrives, so every content message is ratcheted (always a 🔒).
@@ -711,9 +1110,11 @@ pub struct Node<S: Store = MemoryStore> {
     /// Domains we need the host to look up in real DNS (drained by [`Node::take_dns_lookups`]),
     /// with the in-flight set so we ask for each only once.
     dns_lookups: Vec<String>,
+    dns_lookup_charges: Vec<AppQueueCharge>,
     dns_inflight: HashSet<String>,
     /// Completed HNS resolutions for the app to consume ([`Node::take_hns_results`]).
     hns_results: Vec<HnsResult>,
+    hns_result_charges: Vec<AppQueueCharge>,
     /// Domains we're still trying to resolve (DESIGN.md §30). Resolution is delay-tolerant:
     /// if no internet/peer can answer right now, the domain stays here and is re-attempted as
     /// peers connect, when we gain internet, and periodically — until it resolves or the caller
@@ -725,22 +1126,33 @@ pub struct Node<S: Store = MemoryStore> {
     services: HashMap<String, hps::ServiceConfig>,
     /// `hps://` topics we've subscribed to, by path → the keys we were handed.
     subscriptions: HashMap<String, HpsSubscription>,
+    /// Join/invite handshakes awaiting HpsKeys, by path to the exact host allowed to send them.
+    hps_subscribe_pending: HashMap<String, PendingHpsSubscription>,
+    /// Restored expectations are held but cannot authorize keys before the first real clock tick.
+    unanchored_hps_subscribe_pending: HashSet<String>,
     /// Received, decrypted, sender-verified pub/sub messages for the app to drain.
     hps_inbox: Vec<HpsMessage>,
+    hps_inbox_charges: Vec<AppQueueCharge>,
+    hps_inbox_expires: HashMap<BundleId, u64>,
     /// Pending join requests for RequestToJoin topics we host: path → requester addresses.
     hps_pending: HashMap<String, Vec<PubKeyBytes>>,
     /// Invites we (host) have sent and await acceptance: (path, dest) → sent_at.
     hps_invites_out: HashMap<(String, PubKeyBytes), u64>,
     /// Invites we (member) have received and not yet accepted.
     hps_invites_in: Vec<HpsInviteItem>,
+    hps_invite_charges: Vec<AppQueueCharge>,
     /// Reach tally for topics we host: path → unique acking addresses (current epoch).
     hps_reach: HashMap<String, std::collections::HashSet<PubKeyBytes>>,
     /// Retained-member set for rekey: path → member addresses (joins/approvals/invites/acks).
     hps_members: HashMap<String, std::collections::HashSet<PubKeyBytes>>,
     /// Live discovery advert id per hosted Discoverable path (for tombstoning on rekey).
     hps_adverts: HashMap<String, crate::discover::AdvertId>,
-    /// (topic_tag, epoch) we've already reach-acked, so a flood of broadcasts doesn't ack-storm.
-    hps_acked: std::collections::HashSet<([u8; 16], u32)>,
+    /// (topic_tag, epoch) we've already reach-acked, with a bounded receiver-anchored expiry.
+    hps_acked: HashMap<([u8; 16], u32), u64>,
+    /// Authenticated publication content ids accepted per topic generation. This survives global
+    /// bundle-dedup churn and restart, so rewrapping a signed publication in a fresh outer bundle id
+    /// cannot replay it to the app.
+    hps_replays: HpsReplayTable,
     /// Persisted records that failed to decode on the last [`Node::rehydrate`] (F-03). A
     /// non-empty report means an upgrade changed a struct's postcard layout and silently
     /// dropped state (this ate the deferred-send queue when `PendingContent` gained a field —
@@ -818,7 +1230,10 @@ pub struct HpsSubscription {
 }
 
 /// A received `hps://` message, after decryption + sender verification.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HpsMessage {
+    /// Stable authenticated publication id used for host deduplication and explicit acceptance.
+    pub id: BundleId,
     pub path: String,
     pub sender: PubKeyBytes,
     pub body: Vec<u8>,
@@ -896,6 +1311,7 @@ impl<S: Store> Node<S> {
             router: SprayAndWait::new(),
             directory: Directory::new(),
             now_ms: 0,
+            clock_anchored: false,
             last_regossip_ms: 0,
             last_recv_beacon_ms: 0,
             route_to_me: true,
@@ -903,6 +1319,9 @@ impl<S: Store> Node<S> {
             peer_sent: HashMap::new(),
             outgoing: Vec::new(),
             inbox: Vec::new(),
+            durable_inbox: HashMap::new(),
+            inbox_order: Vec::new(),
+            receiver_seen: HashMap::new(),
             pending: HashMap::new(),
             retx_interval_ms: DEFAULT_RETX_INTERVAL_MS,
             advert_seq: 0,
@@ -917,6 +1336,7 @@ impl<S: Store> Node<S> {
             wanted_mailboxes: Vec::new(),
             sessions: HashMap::new(),
             session_touch: HashMap::new(),
+            unanchored_sessions: HashSet::new(),
             immune: HashMap::new(),
             delivered_private: HashSet::new(),
             seen_vaccine_tokens: HashMap::new(),
@@ -925,8 +1345,17 @@ impl<S: Store> Node<S> {
             sends_delivered: Vec::new(),
             default_lifetime_ms: BundleOpts::default().lifetime_ms,
             beaconed_tick: false,
+            app_queue_limits: AppQueueLimits::default(),
+            app_queue_usage: AppQueueUsage::default(),
+            app_payload_policy: AppPayloadPolicy::all(),
+            pending_app_deliveries: HashMap::new(),
+            durable_inbox_charges: HashMap::new(),
             http_requests: Vec::new(),
             http_responses: Vec::new(),
+            http_response_expires: HashMap::new(),
+            http_response_charges: HashMap::new(),
+            outstanding_requests: HashMap::new(),
+            unanchored_outstanding_requests: HashSet::new(),
             routes: RouteTable::new(DEFAULT_MAX_ROUTES),
             forwarded: HashMap::new(),
             app: AppKeys::fabric(),
@@ -936,11 +1365,20 @@ impl<S: Store> Node<S> {
             service_requests: Vec::new(),
             service_responses: Vec::new(),
             telemetry_in: Vec::new(),
+            telemetry_charges: Vec::new(),
+            service_response_expires: HashMap::new(),
+            service_response_charges: HashMap::new(),
             incoming_streams: HashMap::new(),
+            incoming_stream_bytes: 0,
+            incoming_sender_usage: HashMap::new(),
+            carrier_limits: CarrierLimits::default(),
+            carrier_rehydrate: Some(CarrierRehydrateState::default()),
+            carrier_rehydrate_usage: CarrierRehydrateUsage::default(),
             stream_seq: 0,
             ack_replicate: HashMap::new(),
             last_ack: HashMap::new(),
             carrier_owner: HashMap::new(),
+            outgoing_carriers: HashMap::new(),
             pending_content: Vec::new(),
             tx_alias: HashMap::new(),
             pending_seq: 0,
@@ -948,21 +1386,31 @@ impl<S: Store> Node<S> {
             internet: false,
             hns_cache: HashMap::new(),
             dns_lookups: Vec::new(),
+            dns_lookup_charges: Vec::new(),
             dns_inflight: HashSet::new(),
             hns_results: Vec::new(),
+            hns_result_charges: Vec::new(),
             pending_resolves: HashSet::new(),
             last_resolve_retry_ms: 0,
             services: HashMap::new(),
             subscriptions: HashMap::new(),
+            hps_subscribe_pending: HashMap::new(),
+            unanchored_hps_subscribe_pending: HashSet::new(),
             hps_inbox: Vec::new(),
+            hps_inbox_charges: Vec::new(),
+            hps_inbox_expires: HashMap::new(),
             hps_pending: HashMap::new(),
             hps_invites_out: HashMap::new(),
             hps_invites_in: Vec::new(),
+            hps_invite_charges: Vec::new(),
             hps_reach: HashMap::new(),
             hps_members: HashMap::new(),
             hps_adverts: HashMap::new(),
-            hps_acked: std::collections::HashSet::new(),
+            hps_acked: HashMap::new(),
+            hps_replays: HashMap::new(),
             priv_ingest: HashMap::new(),
+            advert_ingest: HashMap::new(),
+            advert_ingest_global: (0, 0),
             rehydrate_report: RehydrateReport::default(),
             stamper: None,
             access_policy: AccessPolicy::Open,
@@ -1015,6 +1463,29 @@ impl<S: Store> Node<S> {
                 Err(_) => self.rehydrate_report.note("hps/sub"),
             }
         }
+        // Restore join/invite handshakes that are still waiting for keys. Their absolute expiries are
+        // untrusted until the first real tick anchors the clock, so no restored row can authorize keys
+        // during startup network processing.
+        for (key, bytes) in self.store.list_kv("hps/sub-pending/") {
+            let Some(path) = key.strip_prefix("hps/sub-pending/").map(str::to_string) else {
+                continue;
+            };
+            if path.len() > MAX_HPS_PATH_BYTES || self.subscriptions.contains_key(&path) {
+                let _ = self.store.remove_kv_critical(&key);
+                continue;
+            }
+            match postcard::from_bytes::<PendingHpsSubscription>(&bytes) {
+                Ok(pending) => {
+                    self.unanchored_hps_subscribe_pending.insert(path.clone());
+                    self.hps_subscribe_pending.insert(path, pending);
+                }
+                Err(_) => {
+                    let _ = self.store.remove_kv_critical(&key);
+                    self.rehydrate_report.note("hps/sub-pending");
+                }
+            }
+        }
+        let _ = self.enforce_hps_subscribe_pending_limit();
         // Restore pending join requests + the retained-member set for topics we host, so an
         // approval (and a later rekey) still works after a restart (DESIGN.md §32).
         for (key, bytes) in self.store.list_kv("hps/pending/") {
@@ -1035,21 +1506,203 @@ impl<S: Store> Node<S> {
                 self.hps_members.insert(path, m.into_iter().collect());
             }
         }
+        // Bound the durable inbox before admitting replay rows. Its stable ids must survive replay
+        // pressure, or restart could discard an unaccepted message after evicting its replay marker.
+        let mut restored_hps = Vec::new();
+        let mut inbox_after: Option<String> = None;
+        loop {
+            let page =
+                self.store
+                    .list_kv_page("hps/inbox/", inbox_after.as_deref(), HPS_REHYDRATE_PAGE);
+            if page.is_empty() {
+                break;
+            }
+            let next = page.last().map(|(key, _)| key.clone());
+            let short = page.len() < HPS_REHYDRATE_PAGE;
+            for (key, bytes) in page {
+                let Ok(inbox) = postcard::from_bytes::<PersistedHpsInbox>(&bytes) else {
+                    let _ = self.store.remove_kv_critical(&key);
+                    self.rehydrate_report.note("hps/inbox");
+                    continue;
+                };
+                if key != Self::hps_inbox_key(&inbox.message.id) {
+                    let _ = self.store.remove_kv_critical(&key);
+                    self.rehydrate_report.note("hps/inbox-key");
+                    continue;
+                }
+                if restored_hps.len() < MAX_DURABLE_HPS_MESSAGES {
+                    restored_hps.push(inbox);
+                    continue;
+                }
+                let (latest_index, latest_at) = restored_hps
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, item)| item.received_at_ms)
+                    .map(|(index, item)| (index, item.received_at_ms))
+                    .expect("non-empty bounded HPS inbox");
+                if inbox.received_at_ms < latest_at {
+                    let evicted = std::mem::replace(&mut restored_hps[latest_index], inbox);
+                    let _ = self
+                        .store
+                        .remove_kv_critical(&Self::hps_inbox_key(&evicted.message.id));
+                } else {
+                    let _ = self.store.remove_kv_critical(&key);
+                }
+            }
+            if short || next == inbox_after {
+                break;
+            }
+            inbox_after = next;
+        }
+
+        let protected_hps: HashSet<(([u8; 16], u32), BundleId)> = restored_hps
+            .iter()
+            .map(|inbox| ((inbox.topic_tag, inbox.epoch), inbox.message.id))
+            .collect();
+        let unprotected_budget = MAX_HPS_REPLAYS_GLOBAL.saturating_sub(protected_hps.len());
+
+        // Replay rows are attacker-influenced and partitioned by topic generation. Walk bounded
+        // pages and enforce one global budget while admitting them, deleting malformed or excess
+        // rows as we go so a restart cannot materialize an unbounded generation table set.
+        let mut replay_after: Option<String> = None;
+        let mut unprotected_count = 0usize;
+        loop {
+            let page =
+                self.store
+                    .list_kv_page("hps/replay/", replay_after.as_deref(), HPS_REHYDRATE_PAGE);
+            if page.is_empty() {
+                break;
+            }
+            let next = page.last().map(|(key, _)| key.clone());
+            let short = page.len() < HPS_REHYDRATE_PAGE;
+            for (key, bytes) in page {
+                let Ok(mut replay) = postcard::from_bytes::<PersistedHpsReplay>(&bytes) else {
+                    let _ = self.store.remove_kv_critical(&key);
+                    self.rehydrate_report.note("hps/replay");
+                    continue;
+                };
+                let topic = (replay.topic_tag, replay.epoch);
+                if key != Self::hps_replay_key(&replay.topic_tag, replay.epoch)
+                    || self.hps_replays.contains_key(&topic)
+                {
+                    let _ = self.store.remove_kv_critical(&key);
+                    self.rehydrate_report.note("hps/replay-key");
+                    continue;
+                }
+
+                let original_len = replay.entries.len();
+                replay.entries.sort_by_key(|(_, expires_at)| *expires_at);
+                let mut ids = HashSet::new();
+                replay.entries.retain(|(id, _)| ids.insert(*id));
+                let is_protected = |id: &BundleId| protected_hps.contains(&(topic, *id));
+
+                let protected_count = replay
+                    .entries
+                    .iter()
+                    .filter(|(id, _)| is_protected(id))
+                    .count();
+                let topic_unprotected_budget =
+                    MAX_HPS_REPLAYS_PER_TOPIC.saturating_sub(protected_count);
+                let topic_unprotected = replay.entries.len().saturating_sub(protected_count);
+                let mut drop_unprotected =
+                    topic_unprotected.saturating_sub(topic_unprotected_budget);
+                replay.entries.retain(|(id, _)| {
+                    if drop_unprotected > 0 && !is_protected(id) {
+                        drop_unprotected -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                let remaining = unprotected_budget.saturating_sub(unprotected_count);
+                let row_unprotected = replay
+                    .entries
+                    .iter()
+                    .filter(|(id, _)| !is_protected(id))
+                    .count();
+                let mut drop_unprotected = row_unprotected.saturating_sub(remaining);
+                replay.entries.retain(|(id, _)| {
+                    if drop_unprotected > 0 && !is_protected(id) {
+                        drop_unprotected -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if replay.entries.is_empty() {
+                    let _ = self.store.remove_kv_critical(&key);
+                    continue;
+                }
+                let normalized = replay.entries.len() != original_len;
+                unprotected_count += replay
+                    .entries
+                    .iter()
+                    .filter(|(id, _)| !is_protected(id))
+                    .count();
+                if normalized {
+                    if let Ok(value) = postcard::to_allocvec(&replay) {
+                        let _ = self.store.put_kv_critical(&key, value);
+                    }
+                }
+                self.hps_replays.insert(topic, replay.entries);
+            }
+            if short || next == replay_after {
+                break;
+            }
+            replay_after = next;
+        }
+
+        restored_hps.retain(|inbox| {
+            let valid = self
+                .hps_replays
+                .get(&(inbox.topic_tag, inbox.epoch))
+                .is_some_and(|entries| entries.iter().any(|(id, _)| *id == inbox.message.id));
+            if !valid {
+                let _ = self
+                    .store
+                    .remove_kv_critical(&Self::hps_inbox_key(&inbox.message.id));
+                self.rehydrate_report.note("hps/inbox-orphan");
+            }
+            valid
+        });
+        restored_hps.sort_by_key(|inbox| inbox.received_at_ms);
+        for inbox in restored_hps {
+            let message = inbox.message;
+            let Some(charge) = self.reserve_app_queue(
+                AppQueueKind::HpsMessage,
+                Some(message.sender),
+                Self::hps_message_bytes(&message),
+            ) else {
+                continue;
+            };
+            self.hps_inbox_expires
+                .insert(message.id, inbox.expires_at_ms);
+            self.hps_inbox.push(message);
+            self.hps_inbox_charges.push(charge);
+        }
         // Restore received/outstanding invites (§32).
         if let Some(b) = self.store.get_kv("hps/invites_in") {
             if let Ok(v) = postcard::from_bytes::<Vec<(String, PubKeyBytes, bool)>>(&b) {
-                self.hps_invites_in = v
-                    .into_iter()
-                    .map(|(path, host, ch)| HpsInviteItem {
+                for (path, host, channel) in v {
+                    let Some(charge) = self.reserve_app_queue(
+                        AppQueueKind::HpsInvite,
+                        Some(host),
+                        path.len().saturating_add(64),
+                    ) else {
+                        continue;
+                    };
+                    self.hps_invites_in.push(HpsInviteItem {
                         path,
                         host,
-                        kind: if ch {
+                        kind: if channel {
                             hps::ServiceKind::Channel
                         } else {
                             hps::ServiceKind::Service
                         },
-                    })
-                    .collect();
+                    });
+                    self.hps_invite_charges.push(charge);
+                }
             }
         }
         if let Some(b) = self.store.get_kv("hps/invites_out") {
@@ -1058,6 +1711,85 @@ impl<S: Store> Node<S> {
                     self.hps_invites_out.insert(k, 0);
                 }
             }
+        }
+        if let Some(bytes) = self.store.get_kv("outstanding_requests") {
+            match postcard::from_bytes::<Vec<(BundleId, OutstandingRequest)>>(&bytes) {
+                Ok(requests) => {
+                    for (id, request) in requests.into_iter().take(MAX_OUTSTANDING_REQUESTS) {
+                        for custody_id in &request.custody_ids {
+                            if custody_id != &id {
+                                self.carrier_owner.insert(*custody_id, id);
+                            }
+                        }
+                        self.unanchored_outstanding_requests.insert(id);
+                        self.outstanding_requests.insert(id, request);
+                    }
+                }
+                Err(_) => self.rehydrate_report.note("outstanding_requests"),
+            }
+        }
+        for (key, bytes) in self.store.list_kv("carrier-out/") {
+            match postcard::from_bytes::<OutgoingCarrier>(&bytes) {
+                Ok(carrier) => {
+                    let original_id = carrier.original.id();
+                    if key != Self::outgoing_carrier_key(&original_id) {
+                        self.rehydrate_report.note("carrier-out/key");
+                        continue;
+                    }
+                    for chunk in &carrier.chunks {
+                        self.carrier_owner.insert(*chunk, original_id);
+                    }
+                    self.tx.entry(original_id).or_default();
+                    self.outgoing_carriers.insert(original_id, carrier);
+                }
+                Err(_) => self.rehydrate_report.note("carrier-out"),
+            }
+        }
+
+        let mut restored_http = Vec::new();
+        for (_, bytes) in self.store.list_kv("response/http/") {
+            match postcard::from_bytes::<PersistedHttpResponse>(&bytes) {
+                Ok(response) => restored_http.push(response),
+                Err(_) => self.rehydrate_report.note("response/http"),
+            }
+        }
+        restored_http.sort_by_key(|response| response.received_at_ms);
+        for response in restored_http.into_iter().take(MAX_DURABLE_RESPONSES) {
+            let item = response.item;
+            let Some(charge) = self.reserve_app_queue(
+                AppQueueKind::HttpResponse,
+                Some(item.from),
+                Self::http_response_bytes(&item),
+            ) else {
+                continue;
+            };
+            self.http_response_expires
+                .insert(item.id, response.expires_at_ms);
+            self.http_response_charges.insert(item.id, charge);
+            self.http_responses.push(item);
+        }
+
+        let mut restored_service = Vec::new();
+        for (_, bytes) in self.store.list_kv("response/service/") {
+            match postcard::from_bytes::<PersistedServiceResponse>(&bytes) {
+                Ok(response) => restored_service.push(response),
+                Err(_) => self.rehydrate_report.note("response/service"),
+            }
+        }
+        restored_service.sort_by_key(|response| response.received_at_ms);
+        for response in restored_service.into_iter().take(MAX_DURABLE_RESPONSES) {
+            let item = response.item;
+            let Some(charge) = self.reserve_app_queue(
+                AppQueueKind::ServiceResponse,
+                Some(item.from),
+                Self::service_response_bytes(&item),
+            ) else {
+                continue;
+            };
+            self.service_response_expires
+                .insert(item.id, response.expires_at_ms);
+            self.service_response_charges.insert(item.id, charge);
+            self.service_responses.push(item);
         }
         // Restore the deferred-content queue (sent messages awaiting a prekey, §25).
         if let Some(b) = self.store.get_kv("pending_content") {
@@ -1090,51 +1822,76 @@ impl<S: Store> Node<S> {
             match postcard::from_bytes::<PeerSession>(&bytes) {
                 Ok(ps) => {
                     self.sessions.insert(addr, ps);
-                    self.session_touch.insert(addr, self.now_ms); // seed so GC doesn't nuke on restart
+                    self.unanchored_sessions.insert(addr);
                 }
                 Err(_) => self.rehydrate_report.note("session"),
             }
         }
 
-        // Re-feed persisted carrier chunks so a partial large transfer (an image whose
-        // in-memory reassembly was lost to a background suspend/relaunch) resumes instead of
-        // restarting — the relay only still holds the chunks we hadn't yet received (§20, §22).
-        #[allow(clippy::type_complexity)] // transient reassembly map, local to rehydrate
-        let mut by_stream: std::collections::HashMap<
-            (PubKeyBytes, StreamId),
-            Vec<(u64, bool, Vec<u8>)>,
-        > = std::collections::HashMap::new();
-        for (key, val) in self.store.list_kv("strm/") {
-            if val.is_empty() {
-                continue;
-            }
-            if let Some((from, sid, seq)) = parse_stream_key(&key) {
-                by_stream.entry((from, sid)).or_default().push((
-                    seq,
-                    val[0] != 0,
-                    val[1..].to_vec(),
-                ));
-            }
-        }
-        for ((from, sid), mut chunks) in by_stream {
-            chunks.sort_by_key(|c| c.0);
-            for (seq, fin, bytes) in chunks {
-                if let Some(inner_bytes) = self.accept_stream_chunk(from, sid, seq, bytes, fin) {
-                    if let Ok(inner) = Bundle::from_bytes(&inner_bytes) {
-                        self.on_bundle(LOCAL_LINK, inner); // completed while we were away → deliver
-                    }
+        // Restore receiver-only dedup before the decrypted inbox. The two records and any receive
+        // session advance were committed in one Store batch, so a valid inbox row always has its
+        // matching seen row and can be redelivered without touching the ratchet.
+        for (_, bytes) in self.store.list_kv("inbox-seen/") {
+            match postcard::from_bytes::<(BundleId, ReceiverSeen)>(&bytes) {
+                Ok((id, seen)) => {
+                    self.receiver_seen.insert(id, seen);
                 }
+                Err(_) => self.rehydrate_report.note("inbox-seen"),
             }
         }
+        let mut restored_inbox = Vec::new();
+        for (_, bytes) in self.store.list_kv("inbox/") {
+            match postcard::from_bytes::<InboxItem>(&bytes) {
+                Ok(item) if self.receiver_seen.contains_key(&item.id) => restored_inbox.push(item),
+                Ok(_) => self.rehydrate_report.note("inbox/orphan"),
+                Err(_) => self.rehydrate_report.note("inbox"),
+            }
+        }
+        restored_inbox.sort_by(|a, b| {
+            a.received_at
+                .cmp(&b.received_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        for item in restored_inbox {
+            let wire_bytes = item
+                .original
+                .to_bytes()
+                .map(|bytes| bytes.len())
+                .unwrap_or(0);
+            let Some(charge) = self.reserve_app_queue(
+                AppQueueKind::PeerInbox,
+                Some(item.from),
+                Self::inbox_item_bytes(&item).saturating_add(wire_bytes),
+            ) else {
+                // Keep the durable row untouched. It was never ACKed and remains recoverable from the
+                // store; only the bounded in-memory working set is withheld under pressure.
+                continue;
+            };
+            self.inbox.push(item.original.clone());
+            self.inbox_order.push(item.id);
+            self.durable_inbox_charges.insert(item.id, charge);
+            self.durable_inbox.insert(item.id, item);
+        }
+
+        // Re-feed persisted carrier chunks in one bounded startup round. If the namespace is larger
+        // or cleanup fails, tick maintenance resumes from the retained cursor and live carrier work
+        // remains closed until every examined rejection is durably removed.
+        let _ = self.continue_carrier_rehydrate();
 
         let me = self.address();
         for id in self.store.have().ids {
-            let Some(b) = self.store.get(&id) else {
+            let Some(mut b) = self.store.get(&id) else {
                 continue;
             };
+            if b.is_private() && !b.env.trace.is_empty() {
+                b.env.trace.clear();
+                self.store.remove(&id);
+                self.store.rehydrate(b.clone(), self.now_ms);
+            }
             if b.inner.src == me && !b.inner.flags.is_ack {
                 // Our own message that wasn't yet ACKed (delivered ones were purged).
-                self.tx.entry(id).or_default();
+                let display = self.carrier_owner.get(&id).copied().unwrap_or(id);
+                self.tx.entry(display).or_default();
                 if b.inner.flags.request_ack {
                     self.pending.insert(
                         id,
@@ -1166,12 +1923,19 @@ impl<S: Store> Node<S> {
     /// Advance the node's advisory clock (used for advert expiry/discovery).
     pub fn set_time(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+        self.clock_anchored |= now_ms != 0;
     }
 
     /// The node's current clock (last value passed to [`tick`](Self::tick) or
     /// [`set_time`](Self::set_time)).
     pub fn now_ms(&self) -> u64 {
         self.now_ms
+    }
+
+    /// Whether persisted carrier admission and required cleanup have reached a safe startup state.
+    /// Live carrier chunks fail closed while this is false.
+    pub fn carrier_startup_ready(&self) -> bool {
+        self.carrier_rehydrate.is_none()
     }
 
     /// Raise (or lower) the learned-route table capacity (DESIGN.md §27). Cloud nodes
@@ -1184,7 +1948,7 @@ impl<S: Store> Node<S> {
     /// policy this is a *sliding window* of concurrent custody, not a transfer-size limit,
     /// so a cloud relay can run a large window for many in-flight chunked transfers.
     pub fn set_max_relayed(&mut self, cap: usize) {
-        self.max_relayed = cap.max(1);
+        self.max_relayed = cap;
         self.evict_relayed_if_needed();
     }
 
@@ -1306,19 +2070,26 @@ impl<S: Store> Node<S> {
 
     /// Submit a locally-originated bundle for delivery; offers it to live links.
     /// If it requests an ACK, it's tracked for retransmission until acked/expired.
-    pub fn submit(&mut self, mut bundle: Bundle) {
-        // §35: stamp everything we originate when a tenant stamper is configured. The id is
-        // stamp-independent (the stamp rides the unsigned envelope, excluded from both id
-        // derivations), so stamping after id computation is sound. A bundle that already
-        // carries a stamp keeps it.
-        if let Some(stamper) = &self.stamper {
-            // Vaccines are exempt: they are anonymous anti-packets (stamping leaks the recipient),
-            // and keyed relays admit them unstamped.
-            let is_vaccine = matches!(bundle.inner.dst, Destination::Vaccine(_));
-            if bundle.env.access.is_none() && !is_vaccine {
-                bundle.env.access = Some(Box::new(stamper.stamp(&bundle.id(), self.now_ms)));
-            }
+    pub fn submit(&mut self, bundle: Bundle) {
+        let _ = self.submit_checked(bundle);
+    }
+
+    /// Store a locally-originated bundle before exposing it to any bearer. Public send APIs use
+    /// this checked path so a store rejection is an error rather than a false successful send.
+    fn submit_checked(&mut self, bundle: Bundle) -> Result<BundleId> {
+        let id = self.store_submitted_bundle(bundle)?;
+        self.offer_bundle_to_all_except(id, LOCAL_LINK);
+        Ok(id)
+    }
+
+    /// Store and track a local bundle without offering it yet. Carrier streams stage every chunk
+    /// through this path before exposing the first one, so a later chunk failure cannot emit a
+    /// partial prefix.
+    fn store_submitted_bundle(&mut self, mut bundle: Bundle) -> Result<BundleId> {
+        if bundle.is_private() {
+            bundle.env.trace.clear();
         }
+        self.stamp_originated_bundle(&mut bundle);
         let id = bundle.id();
         let track = bundle.inner.flags.request_ack && !bundle.inner.flags.is_ack;
         let pend = PendingTx {
@@ -1328,13 +2099,23 @@ impl<S: Store> Node<S> {
             next_retx_at: self.now_ms.saturating_add(self.retx_interval_ms),
             retx_interval: self.retx_interval_ms,
         };
-        if self.store.put(bundle, self.now_ms) {
-            if track {
-                self.pending.insert(id, pend);
+        if !self.store.put(bundle, self.now_ms) {
+            return Err(Error::Other(
+                "store rejected locally-originated bundle".into(),
+            ));
+        }
+        if track {
+            self.pending.insert(id, pend);
+        }
+        Ok(id)
+    }
+
+    fn stamp_originated_bundle(&self, bundle: &mut Bundle) {
+        if let Some(stamper) = &self.stamper {
+            let is_vaccine = matches!(bundle.inner.dst, Destination::Vaccine(_));
+            if bundle.env.access.is_none() && !is_vaccine {
+                bundle.env.access = Some(Box::new(stamper.stamp(&bundle.id(), self.now_ms)));
             }
-            // F-09: offer just this newly-submitted bundle to all links, not the whole store.
-            // LOCAL_LINK means "no real link to skip" (submit came from us, not a bearer).
-            self.offer_bundle_to_all_except(id, LOCAL_LINK);
         }
     }
 
@@ -1362,19 +2143,22 @@ impl<S: Store> Node<S> {
         body: Vec<u8>,
         request_ack: bool,
     ) -> Result<BundleId> {
+        if content_type.len().saturating_add(body.len()) > MAX_CARRIER_CONTENT_BYTES {
+            return Err(Error::Other("message exceeds carrier stream limit".into()));
+        }
         // Resolve the prekey BEFORE encrypting so we never advance the ratchet only to defer
         // (which would silently drop a real ciphertext and desync the session).
         let spk_pub = match self.directory.prekey(&dst) {
             Some(pb) => pb.spk_pub,
-            None => return Ok(self.defer_content(dst, content_type, body, request_ack, true)),
+            None => return self.defer_content(dst, content_type, body, request_ack, true),
         };
         match self.session_payload(&dst, content_type.clone(), body.clone())? {
-            Some(inner) => {
-                let id = self.dispatch_private(dst, spk_pub, inner, request_ack, None)?;
+            Some((inner, session)) => {
+                let id = self.dispatch_private(dst, spk_pub, inner, session, request_ack, None)?;
                 self.flush_pending_content(); // a session may have just opened — flush deferrals
                 Ok(id)
             }
-            None => Ok(self.defer_content(dst, content_type, body, request_ack, true)),
+            None => self.defer_content(dst, content_type, body, request_ack, true),
         }
     }
 
@@ -1390,12 +2174,15 @@ impl<S: Store> Node<S> {
         body: Vec<u8>,
         request_ack: bool,
     ) -> Result<BundleId> {
+        if content_type.len().saturating_add(body.len()) > MAX_CARRIER_CONTENT_BYTES {
+            return Err(Error::Other("message exceeds carrier stream limit".into()));
+        }
         // Require ratcheting device-to-device (DESIGN.md §25): if we can build a forward-secret
         // payload now, send it; otherwise we have no prekey yet — DON'T static-seal, queue the
         // content and return a stable handle. It flushes the moment a prekey arrives.
         match self.session_payload(&dst, content_type.clone(), body.clone())? {
-            Some(payload) => {
-                let id = self.dispatch_content(dst, payload, request_ack, None)?;
+            Some((payload, session)) => {
+                let id = self.dispatch_content(dst, payload, session, request_ack, None)?;
                 // Sending this may have just established a session to `dst` (the prekey path in
                 // session_payload). Any EARLIER content deferred for the same peer ("Securing…")
                 // can ratchet now — flush it immediately instead of waiting for the next tick,
@@ -1404,7 +2191,7 @@ impl<S: Store> Node<S> {
                 self.flush_pending_content();
                 Ok(id)
             }
-            None => Ok(self.defer_content(dst, content_type, body, request_ack, false)),
+            None => self.defer_content(dst, content_type, body, request_ack, false),
         }
     }
 
@@ -1418,29 +2205,34 @@ impl<S: Store> Node<S> {
         body: Vec<u8>,
         request_ack: bool,
         private: bool,
-    ) -> BundleId {
-        self.pending_seq += 1;
+    ) -> Result<BundleId> {
+        let pending_seq = self.pending_seq.saturating_add(1);
         let h = blake3::hash(
             &[
                 &dst[..],
                 content_type.as_bytes(),
                 &body,
-                &self.pending_seq.to_be_bytes(),
+                &pending_seq.to_be_bytes(),
             ]
             .concat(),
         );
         let display_id: BundleId = *h.as_bytes();
-        self.tx.entry(display_id).or_default(); // shows as Sending… until ratcheted
-        self.pending_content.push(PendingContent {
+        let pending = PendingContent {
             display_id,
             dst,
             content_type,
             body,
             request_ack,
             private,
-        });
-        self.persist_pending_content(); // a sent-but-deferred message must survive restart
-        display_id
+        };
+        let mut candidate = self.pending_content.clone();
+        candidate.push(pending);
+        self.persist_pending_content(&candidate)?;
+
+        self.pending_seq = pending_seq;
+        self.pending_content = candidate;
+        self.tx.entry(display_id).or_default(); // shows as Sending… until ratcheted
+        Ok(display_id)
     }
 
     /// Build + submit a ratcheted content bundle. `display_id` is `Some` when this content was
@@ -1450,6 +2242,7 @@ impl<S: Store> Node<S> {
         &mut self,
         dst: PubKeyBytes,
         payload: Payload,
+        session: PeerSession,
         request_ack: bool,
         display_id: Option<BundleId>,
     ) -> Result<BundleId> {
@@ -1467,16 +2260,21 @@ impl<S: Store> Node<S> {
                 ..Default::default()
             },
         )?;
+        self.ensure_delivery_within_limits(&bundle)?;
         let real = bundle.id();
         let display = display_id.unwrap_or(real);
+        let offer = self.store_session_delivery(dst, session, bundle)?;
         if display != real {
             self.tx_alias.insert(real, display);
         }
-        self.tx.entry(display).or_default(); // track delivery status for the UI
-                                             // Remember our own send so the returning delivery-ACK teaches us the route (§27).
+        // Track delivery status for the UI.
+        self.tx.entry(display).or_default();
+        // Remember our own send so the returning delivery-ACK teaches us the route (§27).
         self.forwarded
             .insert(real, (self.identity.address(), dst, self.now_ms));
-        self.deliver(bundle);
+        for id in offer {
+            self.offer_bundle_to_all_except(id, LOCAL_LINK);
+        }
         Ok(display)
     }
 
@@ -1492,6 +2290,7 @@ impl<S: Store> Node<S> {
         dst: PubKeyBytes,
         spk_pub: XPubKeyBytes,
         inner: Payload,
+        session: PeerSession,
         request_ack: bool,
         display_id: Option<BundleId>,
     ) -> Result<BundleId> {
@@ -1525,11 +2324,14 @@ impl<S: Store> Node<S> {
         )?;
         let real = bundle.id();
         let display = display_id.unwrap_or(real);
+        let offer = self.store_session_delivery(dst, session, bundle)?;
         if display != real {
             self.tx_alias.insert(real, display);
         }
         self.tx.entry(display).or_default(); // track delivery for the UI (private ACK flips it)
-        self.submit(bundle); // Broadcast → floods to every link; recognized only by `dst`
+        for id in offer {
+            self.offer_bundle_to_all_except(id, LOCAL_LINK);
+        }
         Ok(display)
     }
 
@@ -1539,8 +2341,9 @@ impl<S: Store> Node<S> {
         if self.pending_content.is_empty() {
             return;
         }
+        let original = std::mem::take(&mut self.pending_content);
         let mut still = Vec::new();
-        for pc in std::mem::take(&mut self.pending_content) {
+        for pc in original.iter().cloned() {
             // A §39 private send also needs the recipient's prekey for its recognition tag —
             // resolve it before encrypting so we never advance the ratchet only to re-defer.
             let spk_pub = if pc.private {
@@ -1552,25 +2355,44 @@ impl<S: Store> Node<S> {
                 still.push(pc); // no prekey yet → keep waiting (it gossips, §25)
                 continue;
             }
-            match self.session_payload(&pc.dst, pc.content_type.clone(), pc.body.clone()) {
-                Ok(Some(payload)) if pc.private => {
-                    let _ = self.dispatch_private(
+            let dispatched =
+                match self.session_payload(&pc.dst, pc.content_type.clone(), pc.body.clone()) {
+                    Ok(Some((payload, session))) if pc.private => self.dispatch_private(
                         pc.dst,
                         spk_pub.unwrap(),
                         payload,
+                        session,
                         pc.request_ack,
                         Some(pc.display_id),
-                    );
-                }
-                Ok(Some(payload)) => {
-                    let _ =
-                        self.dispatch_content(pc.dst, payload, pc.request_ack, Some(pc.display_id));
-                }
-                _ => still.push(pc), // still no prekey → keep waiting (it gossips, §25)
+                    ),
+                    Ok(Some((payload, session))) => self.dispatch_content(
+                        pc.dst,
+                        payload,
+                        session,
+                        pc.request_ack,
+                        Some(pc.display_id),
+                    ),
+                    Ok(None) => {
+                        still.push(pc);
+                        continue;
+                    }
+                    Err(_) => {
+                        still.push(pc);
+                        continue;
+                    }
+                };
+            if dispatched.is_err() {
+                // The session may already be durably advanced. Keep the content and retry under the
+                // next send key; never roll the persisted candidate backward or lose the queue item.
+                still.push(pc);
             }
         }
-        self.pending_content = still;
-        self.persist_pending_content(); // some flushed → update the durable copy
+        if self.persist_pending_content(&still).is_ok() {
+            self.pending_content = still;
+        } else {
+            // A failed queue-state write cannot make already-accepted deferred content disappear.
+            self.pending_content = original;
+        }
     }
 
     /// Resolve a bundle id to the UI-facing id its status should land on: a carrier chunk maps
@@ -1588,13 +2410,13 @@ impl<S: Store> Node<S> {
         dst: &PubKeyBytes,
         content_type: String,
         body: Vec<u8>,
-    ) -> Result<Option<Payload>> {
+    ) -> Result<Option<(Payload, PeerSession)>> {
         // Established session: ratchet-encrypt. Re-send as SessionInit until the peer
         // has replied (init_material present) so any copy can bootstrap them.
-        if let Some(ps) = self.sessions.get_mut(dst) {
+        if let Some(mut candidate) = self.sessions.get(dst).cloned() {
             let inner = postcard::to_allocvec(&SessionInner { content_type, body })?;
-            let msg = ps.session.encrypt(&inner)?;
-            let out = match ps.init_material {
+            let msg = candidate.session.encrypt(&inner)?;
+            let out = match candidate.init_material {
                 Some((ek_pub, spk_pub)) => Payload::SessionInit {
                     ek_pub,
                     spk_pub,
@@ -1602,8 +2424,7 @@ impl<S: Store> Node<S> {
                 },
                 None => Payload::SessionMessage { msg },
             };
-            self.persist_session(dst); // ratchet advanced — save it (survives restart)
-            return Ok(Some(out));
+            return Ok(Some((out, candidate)));
         }
         // No session yet: open one if the peer has published a prekey we've seen.
         if let Some(bundle) = self.directory.prekey(dst) {
@@ -1611,20 +2432,19 @@ impl<S: Store> Node<S> {
             let (ek_pub, root) = crypto::x3dh_initiate(&self.identity, &bundle)?;
             let mut session = Session::init_initiator(root, bundle.spk_pub);
             let msg = session.encrypt(&inner)?;
-            self.sessions.insert(
-                *dst,
-                PeerSession {
-                    session,
-                    init_material: Some((ek_pub, bundle.spk_pub)),
-                    established_by: Some(ek_pub),
+            let candidate = PeerSession {
+                session,
+                init_material: Some((ek_pub, bundle.spk_pub)),
+                established_by: Some(ek_pub),
+            };
+            return Ok(Some((
+                Payload::SessionInit {
+                    ek_pub,
+                    spk_pub: bundle.spk_pub,
+                    msg,
                 },
-            );
-            self.persist_session(dst);
-            return Ok(Some(Payload::SessionInit {
-                ek_pub,
-                spk_pub: bundle.spk_pub,
-                msg,
-            }));
+                candidate,
+            )));
         }
         // No prekey yet → defer (never static-seal content).
         Ok(None)
@@ -1633,6 +2453,17 @@ impl<S: Store> Node<S> {
     /// Durable KV key for a peer's forward-secret session (DESIGN.md §25).
     fn session_kv_key(peer: &PubKeyBytes) -> String {
         format!("session/{}", bs58::encode(peer).into_string())
+    }
+
+    /// Record session activity only after the host supplies a real clock. Zero-time sends and
+    /// receives remain unanchored so the first epoch tick establishes their idle-GC baseline.
+    fn touch_session(&mut self, peer: PubKeyBytes) {
+        if self.now_ms == 0 {
+            self.unanchored_sessions.insert(peer);
+            return;
+        }
+        self.session_touch.insert(peer, self.now_ms);
+        self.unanchored_sessions.remove(&peer);
     }
 
     /// GC forward-secret sessions idle past [`SESSION_MAX_IDLE_MS`] — drop them from memory AND the
@@ -1650,31 +2481,32 @@ impl<S: Store> Node<S> {
             .copied()
             .collect();
         for p in stale {
-            self.sessions.remove(&p);
-            self.session_touch.remove(&p);
-            self.persist_session(&p); // None → clears the persisted `session/<b58>` entry
+            let _ = self.delete_session(&p);
         }
     }
 
-    /// Persist (or, if absent, clear) a peer's ratchet session to the store so it survives a
-    /// restart / beacon-mode background-kill. Best-effort: a serialization slip mustn't break
-    /// sending.
-    fn persist_session(&mut self, peer: &PubKeyBytes) {
-        let key = Self::session_kv_key(peer);
-        match self.sessions.get(peer) {
-            Some(ps) => {
-                // D6: persist happens on establish + every ratchet advance, i.e. every session use,
-                // so this is the natural place to record "recently used" for the idle-session GC.
-                self.session_touch.insert(*peer, self.now_ms);
-                if let Ok(bytes) = postcard::to_allocvec(ps) {
-                    self.store.put_kv(&key, bytes);
-                }
-            }
-            None => {
-                self.session_touch.remove(peer);
-                self.store.remove_kv(&key);
-            }
-        }
+    /// Durably write a candidate ratchet before replacing the live in-memory session. Once this
+    /// succeeds the old send state must never be restored, even if later bundle storage fails.
+    fn commit_session(&mut self, peer: PubKeyBytes, candidate: PeerSession) -> Result<()> {
+        let bytes = postcard::to_allocvec(&candidate)?;
+        self.store
+            .put_kv_critical(&Self::session_kv_key(&peer), bytes)
+            .map_err(|e| Error::Other(format!("session persistence failed: {e}")))?;
+        self.sessions.insert(peer, candidate);
+        self.touch_session(peer);
+        Ok(())
+    }
+
+    /// Delete the durable session first. A failed delete leaves the live ratchet and its idle-GC
+    /// bookkeeping untouched, so restart and in-process state cannot diverge.
+    fn delete_session(&mut self, peer: &PubKeyBytes) -> Result<()> {
+        self.store
+            .remove_kv_critical(&Self::session_kv_key(peer))
+            .map_err(|e| Error::Other(format!("session deletion failed: {e}")))?;
+        self.sessions.remove(peer);
+        self.session_touch.remove(peer);
+        self.unanchored_sessions.remove(peer);
+        Ok(())
     }
 
     /// Publish (and gossip) this node's signed prekey so peers can open forward-secret
@@ -1892,26 +2724,145 @@ impl<S: Store> Node<S> {
         crypto::recognition_tag_from_shared(&token, &content_id) == tag
     }
 
-    /// core-protocol-r11-01: is `id` one of OUR OWN outstanding sends? A response bundle
-    /// (HttpResponse/ServiceResponse) purges + immune-poisons the id it names, so that id
-    /// MUST be authorized the same way an ACK is: only a request we actually sent (still tracked in
-    /// `pending` while unacked, or in `tx` for the UI) may be dropped by an inbound response. Otherwise
-    /// an attacker who seals a forged response to us naming a real §39 private message's cleartext id
-    /// could purge + immune-poison that message at a relay, a network-wide delivery-denial. This is the
-    /// same authorization gate the traced-ACK paths use, applied to the response-cleanup handlers.
-    fn is_our_outstanding_send(&self, id: &BundleId) -> bool {
-        self.pending.contains_key(id) || self.tx.contains_key(id)
+    fn outstanding_requests_mutation(
+        requests: &HashMap<BundleId, OutstandingRequest>,
+    ) -> Result<KvMutation> {
+        if requests.is_empty() {
+            return Ok(KvMutation::Remove {
+                key: "outstanding_requests".into(),
+            });
+        }
+        let persisted: Vec<(BundleId, OutstandingRequest)> = requests
+            .iter()
+            .map(|(id, request)| (*id, request.clone()))
+            .collect();
+        Ok(KvMutation::Put {
+            key: "outstanding_requests".into(),
+            value: postcard::to_allocvec(&persisted)?,
+        })
+    }
+
+    /// A response may consume a request only when its signed outer source and payload kind match the
+    /// durable authorization context recorded when that exact request id was created.
+    fn response_authorized(&self, id: &BundleId, signer: &PubKeyBytes, kind: RequestKind) -> bool {
+        self.outstanding_requests.get(id).is_some_and(|request| {
+            !self.unanchored_outstanding_requests.contains(id)
+                && request.responder == *signer
+                && request.kind == kind
+                && request.expires_at_ms > self.now_ms
+        })
+    }
+
+    fn expire_outstanding_requests(&mut self) -> Result<()> {
+        let expired: Vec<BundleId> = self
+            .outstanding_requests
+            .iter()
+            .filter(|(_, request)| request.expires_at_ms <= self.now_ms)
+            .map(|(id, _)| *id)
+            .collect();
+        if expired.is_empty() {
+            return Ok(());
+        }
+        let mut candidate = self.outstanding_requests.clone();
+        let mut custody = Vec::new();
+        for id in &expired {
+            if let Some(request) = candidate.remove(id) {
+                custody.extend(request.custody_ids);
+            }
+        }
+        let mut mutations = vec![Self::outstanding_requests_mutation(&candidate)?];
+        mutations.extend(expired.iter().map(|id| KvMutation::Remove {
+            key: Self::outgoing_carrier_key(id),
+        }));
+        mutations.extend(
+            custody
+                .iter()
+                .copied()
+                .map(|id| KvMutation::RemoveBundle { id }),
+        );
+        self.store
+            .apply_kv_batch(&mutations)
+            .map_err(|e| Error::Other(format!("request expiry persistence failed: {e}")))?;
+        self.outstanding_requests = candidate;
+        for id in expired {
+            self.unanchored_outstanding_requests.remove(&id);
+            self.outgoing_carriers.remove(&id);
+            self.tx.remove(&id);
+        }
+        for id in custody {
+            self.pending.remove(&id);
+            self.carrier_owner.remove(&id);
+        }
+        Ok(())
+    }
+
+    /// Atomically commit response authorization with the exact custody records that carry its request.
+    /// No live send state, success return, or bearer output is exposed until this batch succeeds.
+    fn deliver_authorized_request(
+        &mut self,
+        bundle: Bundle,
+        responder: PubKeyBytes,
+        kind: RequestKind,
+    ) -> Result<BundleId> {
+        if !self.clock_anchored {
+            return Err(Error::Other(
+                "response-bearing request requires a real clock anchor".into(),
+            ));
+        }
+        self.expire_outstanding_requests()?;
+        if self.outstanding_requests.len() >= MAX_OUTSTANDING_REQUESTS {
+            return Err(Error::Other("outstanding request limit reached".into()));
+        }
+        let lifetime_ms = bundle.inner.lifetime_ms;
+        let (id, custody, carrier) = self.prepare_delivery_custody(bundle)?;
+        let custody_ids: Vec<BundleId> = custody.iter().map(Bundle::id).collect();
+        let mut candidate = self.outstanding_requests.clone();
+        candidate.insert(
+            id,
+            OutstandingRequest {
+                responder,
+                kind,
+                expires_at_ms: self.now_ms.saturating_add(lifetime_ms as u64),
+                custody_ids: custody_ids.clone(),
+            },
+        );
+        let mut mutations = Vec::with_capacity(custody.len() + 2);
+        mutations.push(Self::outstanding_requests_mutation(&candidate)?);
+        if let Some(carrier) = &carrier {
+            mutations.push(KvMutation::Put {
+                key: Self::outgoing_carrier_key(&id),
+                value: postcard::to_allocvec(carrier)?,
+            });
+        }
+        mutations.extend(custody.iter().cloned().map(|bundle| KvMutation::PutBundle {
+            bundle: Box::new(bundle),
+            now_ms: self.now_ms,
+        }));
+        self.store
+            .apply_kv_batch(&mutations)
+            .map_err(|e| Error::Other(format!("request persistence failed: {e}")))?;
+
+        self.outstanding_requests = candidate;
+        self.unanchored_outstanding_requests.remove(&id);
+        self.tx.entry(id).or_default();
+        self.forwarded
+            .insert(id, (self.identity.address(), responder, self.now_ms));
+        let stored = self.activate_delivery_custody(id, &custody, carrier);
+        for custody_id in stored {
+            self.offer_bundle_to_all_except(custody_id, LOCAL_LINK);
+        }
+        Ok(id)
     }
 
     /// §39 (sec-priv-07): flood a delivery vaccine revealing only `token`, so every node carrying a copy
     /// recovers the delivered bundle itself (`recognition_tag_from_shared(token, held_id) == held_tag`)
     /// and drops it. No plaintext delivered id on the wire. Outlives the message to chase the tail.
-    fn emit_vaccine(&mut self, token: [u8; 32]) {
+    fn emit_vaccine(&mut self, token: [u8; 32], lifetime_ms: u32) {
         let bundle = Bundle::create_vaccine(
             token,
             BundleOpts {
                 created_at: self.now_ms,
-                lifetime_ms: self.default_lifetime_ms,
+                lifetime_ms,
                 ..Default::default()
             },
         );
@@ -1929,11 +2880,11 @@ impl<S: Store> Node<S> {
     /// including a same-id chimera whose recognition header was rewritten (the id binds only the sealed
     /// payload). Gating on `seen` let such a chimera mark the id seen, so the genuine copy saw
     /// `first == false` and its `inbox.push` was skipped — a silent delivery denial plus a false ACK.
-    fn deliver_private(&mut self, bundle: &Bundle, id: &BundleId) {
+    fn deliver_private(&mut self, bundle: &Bundle, id: &BundleId) -> bool {
         let first = !self.delivered_private.contains(id);
         let (sender, inner) = match bundle.open(&self.identity) {
             Ok(Payload::Private { sender, inner }) => (sender, inner),
-            _ => return, // recognized but not a well-formed private payload — ignore
+            _ => return false, // recognized but not a well-formed private payload
         };
         match *inner {
             // A private delivery ACK for one of OUR sends: stop carrying/tracking it and mark
@@ -1957,7 +2908,7 @@ impl<S: Store> Node<S> {
                 // strand a real message on a false "Delivered". A genuine ACK whose original we already
                 // cleared (e.g. the vaccine beat it) is idempotent — nothing left to mutate.
                 if !self.private_ack_proof_ok(&for_bundle_id, proof) {
-                    return;
+                    return false;
                 }
                 // r12-01: only a proof-valid ACK counts as handled — a bad-proof forgery returns above
                 // without marking the id, so a genuine ACK that arrives later is still treated as first.
@@ -1976,48 +2927,20 @@ impl<S: Store> Node<S> {
                 if newly && self.observe {
                     self.sends_delivered.push(display);
                 }
+                true
             }
-            Payload::Ack { .. } => {} // a duplicate ACK — already handled
+            Payload::Ack { .. } => true, // a duplicate ACK, already handled
             // sec-priv-01/core-01: a bare PeerMessage inside an unsigned Private seal is a sender
             // spoof (no ratchet proves `sender`). Drop it here so we neither inbox nor ACK it —
             // read_message would refuse to surface it anyway, but not inboxing avoids emitting a
             // private ACK to the impersonated address.
-            Payload::PeerMessage { .. } => {}
-            // Ratcheted user content addressed to us (SessionInit/SessionMessage authenticate the
-            // sender): deliver once (read_message re-opens + ratchets), then ACK back if requested.
-            _ => {
-                if first {
-                    self.inbox.push(bundle.clone());
-                    // r12-01: mark delivered HERE (recognized copy only) so a same-id chimera that
-                    // marked `store.seen` can never make this genuine copy look already-delivered.
-                    self.delivered_private.insert(*id);
-                }
-                if bundle.inner.flags.request_ack {
-                    let due = match self.last_ack.get(id) {
-                        Some(&t) => self.now_ms.saturating_sub(t) >= REACK_MIN_INTERVAL_MS,
-                        None => true,
-                    };
-                    if due {
-                        // Report the forward-path (A→B) latency we observed, not a round trip.
-                        let fwd = forward_ms(self.now_ms, bundle.inner.created_at);
-                        // core-protocol-r2-04: bind the private ACK with a recipient-only CDH proof —
-                        // the recognition token for THIS bundle, which only we (holding the matching SPK
-                        // secret) can compute. The sender re-derives the expected tag from it and refuses
-                        // to mark Delivered on an ACK whose proof doesn't match the original bundle.
-                        let proof = self.vaccine_token_for(bundle);
-                        self.emit_private_ack(sender, *id, bundle.env.hops, fwd, proof);
-                        // §39 vaccine (ack-requested only, on first delivery): reveal the recognition
-                        // token so every relay still carrying a copy verifies + drops it. A fire-and-
-                        // forget (no-ack) send has no vaccine and clears by TTL — matches the design:
-                        // "clear on a long TTL, OR when an ack reaches a holder."
-                        if first {
-                            if let Some(token) = self.vaccine_token_for(bundle) {
-                                self.emit_vaccine(token);
-                            }
-                        }
-                    }
-                }
-            }
+            Payload::PeerMessage { .. } => false,
+            // Ratcheted content authenticates the claimed private sender. Decrypt and atomically
+            // stage it now; persistence/authentication failure stops this copy before ACK or seen.
+            payload @ (Payload::SessionInit { .. } | Payload::SessionMessage { .. }) => self
+                .stage_inbound_message(bundle, sender, payload, false, true)
+                .is_ok(),
+            _ => true,
         }
     }
 
@@ -2033,10 +2956,11 @@ impl<S: Store> Node<S> {
         delivery_hops: u8,
         delivery_ms: u32,
         proof: Option<[u8; 32]>,
-    ) {
+        lifetime_ms: u32,
+    ) -> bool {
         let spk_pub = match self.directory.prekey(&to) {
             Some(b) => b.spk_pub,
-            None => return,
+            None => return false,
         };
         let ack = Payload::Ack {
             for_bundle_id,
@@ -2061,20 +2985,262 @@ impl<S: Store> Node<S> {
             ))),
             BundleOpts {
                 created_at: self.now_ms,
-                lifetime_ms: self.default_lifetime_ms,
+                lifetime_ms,
                 ..Default::default()
             },
         ) {
-            self.last_ack.insert(for_bundle_id, self.now_ms); // throttle re-ACKs by the acked id
             self.submit(b);
+            true
+        } else {
+            false
         }
     }
 
-    /// Read a user message addressed to this node — uniform across static-sealed
-    /// (`PeerMessage`) and forward-secret session payloads. Establishes the responder
-    /// side of a session on first `SessionInit`. Returns `None` for non-user payloads
-    /// (HTTP/stream/ack). Mutates session state, so it must be called once per bundle.
+    /// Emit a persisted inbox item's deferred ACK and private vaccine, throttling duplicate-copy
+    /// re-ACKs exactly as the old immediate-receipt path did.
+    fn emit_inbox_ack(&mut self, acknowledgement: &InboxAcknowledgement) {
+        let for_bundle_id = match acknowledgement {
+            InboxAcknowledgement::None => return,
+            InboxAcknowledgement::Traced { for_bundle_id, .. }
+            | InboxAcknowledgement::Private { for_bundle_id, .. } => *for_bundle_id,
+        };
+        if self
+            .last_ack
+            .get(&for_bundle_id)
+            .is_some_and(|last| self.now_ms.saturating_sub(*last) < REACK_MIN_INTERVAL_MS)
+        {
+            return;
+        }
+
+        let emitted = match acknowledgement {
+            InboxAcknowledgement::None => false,
+            InboxAcknowledgement::Traced {
+                to,
+                for_bundle_id,
+                delivery_hops,
+                delivery_ms,
+                lifetime_ms,
+                priority,
+            } => {
+                let ack = Bundle::create(
+                    &self.identity,
+                    Destination::AckTo(*to, *for_bundle_id),
+                    to,
+                    &Payload::Ack {
+                        for_bundle_id: *for_bundle_id,
+                        status: 0,
+                        delivery_hops: *delivery_hops,
+                        delivery_ms: *delivery_ms,
+                        proof: None,
+                    },
+                    BundleOpts {
+                        created_at: self.now_ms,
+                        lifetime_ms: *lifetime_ms,
+                        priority: *priority,
+                        flags: BundleFlags {
+                            is_ack: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                if let Ok(ack) = ack {
+                    self.ack_replicate.entry(ack.id()).or_default();
+                    self.submit(ack);
+                    true
+                } else {
+                    false
+                }
+            }
+            InboxAcknowledgement::Private {
+                to,
+                for_bundle_id,
+                delivery_hops,
+                delivery_ms,
+                proof,
+                vaccine,
+                lifetime_ms,
+            } => {
+                let acked = self.emit_private_ack(
+                    *to,
+                    *for_bundle_id,
+                    *delivery_hops,
+                    *delivery_ms,
+                    *proof,
+                    *lifetime_ms,
+                );
+                if let Some(token) = vaccine {
+                    self.emit_vaccine(*token, *lifetime_ms);
+                }
+                acked || vaccine.is_some()
+            }
+        };
+        if emitted {
+            self.last_ack.insert(for_bundle_id, self.now_ms);
+        }
+    }
+
+    fn inbox_kv_key(id: &BundleId) -> String {
+        format!("inbox/{}", bs58::encode(id).into_string())
+    }
+
+    fn receiver_seen_kv_key(id: &BundleId) -> String {
+        format!("inbox-seen/{}", bs58::encode(id).into_string())
+    }
+
+    fn inbox_acknowledgement(
+        &self,
+        bundle: &Bundle,
+        from: PubKeyBytes,
+        private: bool,
+    ) -> InboxAcknowledgement {
+        if !bundle.inner.flags.request_ack {
+            return InboxAcknowledgement::None;
+        }
+        let delivery_ms = forward_ms(self.now_ms, bundle.inner.created_at);
+        if private {
+            let token = self.vaccine_token_for(bundle);
+            InboxAcknowledgement::Private {
+                to: from,
+                for_bundle_id: bundle.id(),
+                delivery_hops: bundle.env.hops,
+                delivery_ms,
+                proof: token,
+                vaccine: token,
+                lifetime_ms: self.default_lifetime_ms,
+            }
+        } else {
+            InboxAcknowledgement::Traced {
+                to: from,
+                for_bundle_id: bundle.id(),
+                delivery_hops: bundle.env.hops,
+                delivery_ms,
+                lifetime_ms: bundle.inner.lifetime_ms.min(MAX_ACK_LIFETIME_MS),
+                priority: bundle.inner.priority.saturating_add(1),
+            }
+        }
+    }
+
+    /// Decrypt, authenticate, and durably stage one inbound user payload. Any receive-session
+    /// advance, the decrypted inbox row, and receiver-only dedup are one atomic Store commit. The
+    /// live ratchet and host-visible queue change only after that commit succeeds.
+    fn stage_inbound_message(
+        &mut self,
+        bundle: &Bundle,
+        from: PubKeyBytes,
+        payload: Payload,
+        authenticated: bool,
+        private: bool,
+    ) -> Result<()> {
+        if !self.app_payload_policy.supports(AppQueueKind::PeerInbox) {
+            return Err(Error::Other(
+                "peer inbox disabled for this node role".into(),
+            ));
+        }
+        let id = bundle.id();
+        if let Some(seen) = self.receiver_seen.get(&id).cloned() {
+            if !self.durable_inbox.contains_key(&id) {
+                self.emit_inbox_ack(&seen.acknowledgement);
+            }
+            return Ok(());
+        }
+
+        let prepared = self.prepare_inbound_message(from, payload, authenticated)?;
+        let acknowledgement = self.inbox_acknowledgement(bundle, from, private);
+        let seen = ReceiverSeen {
+            expires_at_ms: self
+                .now_ms
+                .saturating_add((bundle.inner.lifetime_ms as u64).min(MAX_SEEN_LIFETIME_MS)),
+            acknowledgement: acknowledgement.clone(),
+        };
+        let item = prepared.message.as_ref().map(|message| InboxItem {
+            id,
+            from: message.from,
+            content_type: message.content_type.clone(),
+            body: message.body.clone(),
+            hops: bundle.env.hops,
+            created_at: bundle.inner.created_at,
+            trace: bundle.trace().to_vec(),
+            received_at: self.now_ms,
+            acknowledgement: acknowledgement.clone(),
+            original: bundle.clone(),
+        });
+        let item_charge = if let Some(item) = &item {
+            let wire_bytes = bundle.to_bytes()?.len();
+            Some(
+                self.reserve_app_queue(
+                    AppQueueKind::PeerInbox,
+                    Some(item.from),
+                    Self::inbox_item_bytes(item).saturating_add(wire_bytes),
+                )
+                .ok_or_else(|| Error::Other("peer inbox admission limit reached".into()))?,
+            )
+        } else {
+            None
+        };
+
+        let mut mutations = Vec::with_capacity(3);
+        if let Some(candidate) = &prepared.session {
+            mutations.push(KvMutation::Put {
+                key: Self::session_kv_key(&from),
+                value: postcard::to_allocvec(candidate)?,
+            });
+        }
+        mutations.push(KvMutation::Put {
+            key: Self::receiver_seen_kv_key(&id),
+            value: postcard::to_allocvec(&(id, seen.clone()))?,
+        });
+        if let Some(item) = &item {
+            mutations.push(KvMutation::Put {
+                key: Self::inbox_kv_key(&id),
+                value: postcard::to_allocvec(item)?,
+            });
+        }
+        if let Err(error) = self.store.apply_kv_batch(&mutations) {
+            if let Some(charge) = item_charge {
+                self.release_app_queue(charge);
+            }
+            return Err(Error::Other(format!("inbox persistence failed: {error}")));
+        }
+
+        if let Some(candidate) = prepared.session {
+            self.sessions.insert(from, candidate);
+            self.touch_session(from);
+        }
+        self.receiver_seen.insert(id, seen);
+        if let Some(item) = item {
+            self.inbox.push(bundle.clone());
+            self.inbox_order.push(id);
+            self.durable_inbox.insert(id, item);
+            self.durable_inbox_charges.insert(
+                id,
+                item_charge.expect("durable inbox item has an admission charge"),
+            );
+        } else {
+            // The authenticated session-establishment ping is protocol control, not host content.
+            // Once its session+seen commit succeeds there is no host acceptance to wait for.
+            self.emit_inbox_ack(&acknowledgement);
+        }
+        if prepared.flush_pending {
+            self.flush_pending_content();
+        }
+        Ok(())
+    }
+
+    /// Read a user message addressed to this node. Network ingress already decrypted and staged it;
+    /// this legacy low-level seam returns that durable plaintext without accepting it. Hosts must call
+    /// [`Self::accept_inbox`] explicitly. Direct unit-test bundles that bypass ingress retain the old
+    /// one-shot decrypt behavior.
     pub fn read_message(&mut self, bundle: &Bundle) -> Result<Option<ReadMessage>> {
+        let id = bundle.id();
+        if let Some(item) = self.durable_inbox.get(&id).cloned() {
+            let message = ReadMessage {
+                from: item.from,
+                content_type: item.content_type,
+                body: item.body,
+            };
+            return Ok(Some(message));
+        }
         match bundle.open(&self.identity)? {
             // §39 untraceable: the *real* sender rode inside the seal (the envelope src is
             // zeroed). The seal is NOT identity-signed, so `sender` is an unauthenticated claim
@@ -2100,6 +3266,25 @@ impl<S: Store> Node<S> {
         payload: Payload,
         authenticated: bool,
     ) -> Result<Option<ReadMessage>> {
+        let prepared = self.prepare_inbound_message(from, payload, authenticated)?;
+        if let Some(candidate) = prepared.session {
+            self.commit_session(from, candidate)?;
+        }
+        if prepared.flush_pending {
+            self.flush_pending_content();
+        }
+        Ok(prepared.message)
+    }
+
+    /// Build a candidate receive state without mutating the live ratchet. Ingress persists this
+    /// candidate together with the decrypted inbox record; the legacy direct-read path commits it
+    /// afterward through `commit_session`.
+    fn prepare_inbound_message(
+        &mut self,
+        from: PubKeyBytes,
+        payload: Payload,
+        authenticated: bool,
+    ) -> Result<PreparedInbound> {
         match payload {
             Payload::PeerMessage { content_type, body } => {
                 if !authenticated {
@@ -2108,28 +3293,35 @@ impl<S: Store> Node<S> {
                     // <victim>". Device-to-device content is always forward-secret (a send
                     // without a ratchet is an error), so a private static PeerMessage is never
                     // legitimate — drop it rather than attribute it.
-                    return Ok(None);
+                    return Ok(PreparedInbound {
+                        message: None,
+                        session: None,
+                        flush_pending: false,
+                    });
                 }
-                Ok(Some(ReadMessage {
-                    from,
-                    content_type,
-                    body,
-                }))
+                Ok(PreparedInbound {
+                    message: Some(ReadMessage {
+                        from,
+                        content_type,
+                        body,
+                    }),
+                    session: None,
+                    flush_pending: false,
+                })
             }
             Payload::SessionInit {
                 ek_pub,
                 spk_pub,
                 msg,
             } => {
-                // Build (or rebuild) the responder session when this is a *fresh* handshake:
-                // no session yet, or one established by a different ephemeral — i.e. the peer
-                // reinstalled / lost its ratchet and is re-initiating. Rebuilding lets us
-                // re-sync instead of failing forever against stale state (DESIGN.md §25).
+                // Build (or rebuild) a candidate responder session off-map. A private envelope's
+                // `from` is only a claim until this AEAD succeeds, so a forged fresh ephemeral must
+                // neither replace an established ratchet nor trigger control traffic at the victim.
                 let fresh = match self.sessions.get(&from) {
                     None => true,
                     Some(ps) => ps.established_by != Some(ek_pub),
                 };
-                if fresh {
+                let mut candidate = if fresh {
                     let secret = self
                         .spk_secrets
                         .get(&spk_pub)
@@ -2137,60 +3329,71 @@ impl<S: Store> Node<S> {
                         .clone();
                     let root = crypto::x3dh_respond(&self.identity, &secret, &from, &ek_pub)?;
                     let session = Session::init_responder(root, *secret, spk_pub);
-                    self.sessions.insert(
-                        from,
-                        PeerSession {
-                            session,
-                            init_material: None,
-                            established_by: Some(ek_pub),
-                        },
-                    );
-                }
-                let decrypted = {
-                    let ps = self.sessions.get_mut(&from).expect("just inserted");
-                    ps.init_material = None; // we've received from them → session confirmed
-                    ps.session.decrypt(&msg)
+                    PeerSession {
+                        session,
+                        init_material: None,
+                        established_by: Some(ek_pub),
+                    }
+                } else {
+                    self.sessions.get(&from).expect("existing session").clone()
                 };
+                candidate.init_material = None;
+                let decrypted = candidate.session.decrypt(&msg);
                 match decrypted {
                     Ok(inner) => {
-                        self.persist_session(&from); // ratchet advanced — save it
-                                                     // A peer initiating to us establishes a session both ways — so content we'd
-                                                     // deferred to them (no prekey yet → "Securing…") can ratchet now. Flush it
-                                                     // here too, not just on the prekey-advert/tick paths.
-                        self.flush_pending_content();
-                        self.surface_session_inner(from, &inner)
+                        let message = self.surface_session_inner(from, &inner)?;
+                        Ok(PreparedInbound {
+                            message,
+                            session: Some(candidate),
+                            // A peer initiating to us establishes a session both ways, so content
+                            // deferred to them can ratchet immediately after the atomic commit.
+                            flush_pending: true,
+                        })
                     }
                     Err(e) => {
-                        self.request_session_reset(from); // ask them to re-establish
+                        if authenticated {
+                            self.request_session_reset(from); // signed sender can safely be asked to reset
+                        }
                         Err(e)
                     }
                 }
             }
             Payload::SessionMessage { msg } => {
-                let decrypted = match self.sessions.get_mut(&from) {
-                    Some(ps) => {
-                        ps.init_material = None;
-                        ps.session.decrypt(&msg)
-                    }
+                let mut candidate = match self.sessions.get(&from).cloned() {
+                    Some(ps) => ps,
                     // We lost our session (uninstall / lost p2p data) but they kept theirs:
                     // ask them to reset so a fresh handshake re-syncs the ratchet.
                     None => {
-                        self.request_session_reset(from);
+                        if authenticated {
+                            self.request_session_reset(from);
+                        }
                         return Err(Error::Crypto("no session for peer"));
                     }
                 };
+                candidate.init_material = None;
+                let decrypted = candidate.session.decrypt(&msg);
                 match decrypted {
                     Ok(inner) => {
-                        self.persist_session(&from);
-                        self.surface_session_inner(from, &inner)
+                        let message = self.surface_session_inner(from, &inner)?;
+                        Ok(PreparedInbound {
+                            message,
+                            session: Some(candidate),
+                            flush_pending: false,
+                        })
                     }
                     Err(e) => {
-                        self.request_session_reset(from);
+                        if authenticated {
+                            self.request_session_reset(from);
+                        }
                         Err(e)
                     }
                 }
             }
-            _ => Ok(None),
+            _ => Ok(PreparedInbound {
+                message: None,
+                session: None,
+                flush_pending: false,
+            }),
         }
     }
 
@@ -2243,11 +3446,12 @@ impl<S: Store> Node<S> {
     /// proactively re-establish so the ratchet heals immediately — even before the next user
     /// message. The next `SessionInit` rebuilds the peer's side too (DESIGN.md §25).
     fn handle_session_reset(&mut self, peer: PubKeyBytes) {
-        self.sessions.remove(&peer);
-        self.persist_session(&peer); // None → clears the persisted entry
-                                     // Re-establish now if we know their prekey; otherwise the next content send re-inits.
-                                     // A directed control ping to heal the ratchet with a peer who already knows us — the
-                                     // traced path (not the §39 default), so it's a unicast, not a flood.
+        if self.delete_session(&peer).is_err() {
+            return;
+        }
+        // Re-establish now if we know their prekey; otherwise the next content send re-inits.
+        // A directed control ping to heal the ratchet with a peer who already knows us uses the
+        // traced path (not the §39 default), so it's a unicast, not a flood.
         if self.directory.prekey(&peer).is_some() {
             let _ =
                 self.send_message_traced(peer, SESSION_ESTABLISH_CT.to_string(), Vec::new(), false);
@@ -2288,12 +3492,8 @@ impl<S: Store> Node<S> {
                 ..Default::default()
             },
         )?;
-        let id = bundle.id();
-        self.tx.entry(id).or_default();
-        self.forwarded
-            .insert(id, (self.identity.address(), endpoint, self.now_ms));
-        self.deliver(bundle);
-        Ok(id)
+        self.ensure_delivery_within_limits(&bundle)?;
+        self.deliver_authorized_request(bundle, endpoint, RequestKind::Http)
     }
 
     // ---- HNS: the Hop Name System (DESIGN.md §30) ----------------------------------------
@@ -2377,7 +3577,11 @@ impl<S: Store> Node<S> {
     /// Domains the host must resolve by fetching `https://<domain>/.well-known/hop`, clearing the
     /// queue. The host feeds each fetched reach record back via [`Node::provide_reach_record`].
     pub fn take_dns_lookups(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.dns_lookups)
+        let lookups = std::mem::take(&mut self.dns_lookups);
+        for charge in std::mem::take(&mut self.dns_lookup_charges) {
+            self.release_app_queue(charge);
+        }
+        lookups
     }
 
     /// §39 P5: mailbox-tags that just received a want-beacon (a recipient's [`AdvertKind::RecvBeacon`]
@@ -2396,8 +3600,6 @@ impl<S: Store> Node<S> {
     /// expired, malformed) caches a short negative.
     pub fn provide_reach_record(&mut self, domain: &str, record: Vec<u8>) {
         let key = normalize_domain(domain);
-        self.dns_inflight.remove(&key);
-        self.pending_resolves.remove(&key);
         let now_ms = self.now_ms;
         let (address, expires_at_ms) =
             match crate::reach::ReachRecord::verify(&record, Some(now_ms / 1000)) {
@@ -2421,6 +3623,14 @@ impl<S: Store> Node<S> {
                 }
                 None => (None, now_ms.saturating_add(60_000)), // unverifiable → short (60s) negative cache
             };
+        let Some(charge) =
+            self.reserve_app_queue(AppQueueKind::HnsResult, None, key.len().saturating_add(40))
+        else {
+            self.dns_inflight.remove(&key);
+            return;
+        };
+        self.dns_inflight.remove(&key);
+        self.pending_resolves.remove(&key);
         self.hns_cache.insert(
             key.clone(),
             HnsEntry {
@@ -2432,6 +3642,7 @@ impl<S: Store> Node<S> {
             domain: key.clone(),
             address,
         });
+        self.hns_result_charges.push(charge);
     }
 
     /// Test-only: inject a pre-trusted resolution result, bypassing the reach-record fetch +
@@ -2445,6 +3656,12 @@ impl<S: Store> Node<S> {
         ttl_secs: u32,
     ) {
         let key = normalize_domain(domain);
+        let Some(charge) =
+            self.reserve_app_queue(AppQueueKind::HnsResult, None, key.len().saturating_add(40))
+        else {
+            self.dns_inflight.remove(&key);
+            return;
+        };
         self.dns_inflight.remove(&key);
         self.pending_resolves.remove(&key); // resolved (positive or negative) — stop retrying
         let ttl_ms = (ttl_secs as u64).clamp(MIN_HNS_TTL_MS / 1000, MAX_HNS_TTL_MS / 1000) * 1000;
@@ -2459,11 +3676,16 @@ impl<S: Store> Node<S> {
             domain: key.clone(),
             address,
         });
+        self.hns_result_charges.push(charge);
     }
 
     /// Finished HNS resolutions (positive or negative), clearing the queue.
     pub fn take_hns_results(&mut self) -> Vec<HnsResult> {
-        std::mem::take(&mut self.hns_results)
+        let results = std::mem::take(&mut self.hns_results);
+        for charge in std::mem::take(&mut self.hns_result_charges) {
+            self.release_app_queue(charge);
+        }
+        results
     }
 
     /// Sign a self-certifying reachability record for THIS node's address, binding it to `endpoint`
@@ -2515,10 +3737,122 @@ impl<S: Store> Node<S> {
                 .verify_join_proof(proof, path, &bundle.inner.src, self.join_bucket())
     }
 
+    fn expire_hps_subscribe_pending(&mut self) -> Result<()> {
+        let stale: Vec<String> = self
+            .hps_subscribe_pending
+            .iter()
+            .filter(|(_, pending)| pending.expires_at_ms <= self.now_ms)
+            .map(|(path, _)| path.clone())
+            .collect();
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let mutations: Vec<KvMutation> = stale
+            .iter()
+            .map(|path| KvMutation::Remove {
+                key: Self::hps_subscribe_pending_key(path),
+            })
+            .collect();
+        self.store
+            .apply_kv_batch(&mutations)
+            .map_err(|e| Error::Other(format!("subscription expiry persistence failed: {e}")))?;
+        for path in stale {
+            self.hps_subscribe_pending.remove(&path);
+            self.unanchored_hps_subscribe_pending.remove(&path);
+        }
+        Ok(())
+    }
+
+    fn enforce_hps_subscribe_pending_limit(&mut self) -> Result<()> {
+        let excess = self
+            .hps_subscribe_pending
+            .len()
+            .saturating_sub(MAX_HPS_SUBSCRIBE_PENDING);
+        if excess == 0 {
+            return Ok(());
+        }
+        let mut by_expiry: Vec<(String, u64)> = self
+            .hps_subscribe_pending
+            .iter()
+            .map(|(path, pending)| (path.clone(), pending.expires_at_ms))
+            .collect();
+        by_expiry.sort_by_key(|(_, expiry)| *expiry);
+        let victims: Vec<String> = by_expiry
+            .into_iter()
+            .take(excess)
+            .map(|(path, _)| path)
+            .collect();
+        let mutations: Vec<KvMutation> = victims
+            .iter()
+            .map(|path| KvMutation::Remove {
+                key: Self::hps_subscribe_pending_key(path),
+            })
+            .collect();
+        self.store
+            .apply_kv_batch(&mutations)
+            .map_err(|e| Error::Other(format!("subscription cap persistence failed: {e}")))?;
+        for victim in victims {
+            self.hps_subscribe_pending.remove(&victim);
+            self.unanchored_hps_subscribe_pending.remove(&victim);
+        }
+        Ok(())
+    }
+
+    fn expect_hps_keys(&mut self, host: PubKeyBytes, path: &str) -> Result<()> {
+        if path.len() > MAX_HPS_PATH_BYTES {
+            return Err(Error::Other("subscription path exceeds limit".into()));
+        }
+        self.expire_hps_subscribe_pending()?;
+        if self.subscriptions.contains_key(path) {
+            return Err(Error::Other("already subscribed to this path".into()));
+        }
+        if let Some(expected) = self.hps_subscribe_pending.get(path) {
+            if expected.host != host {
+                return Err(Error::Other(
+                    "subscription path is already pending from another host".into(),
+                ));
+            }
+        }
+        let pending = PendingHpsSubscription {
+            host,
+            expires_at_ms: self.now_ms.saturating_add(HPS_SUBSCRIBE_PENDING_TTL_MS),
+        };
+        let mut mutations = vec![KvMutation::Put {
+            key: Self::hps_subscribe_pending_key(path),
+            value: postcard::to_allocvec(&pending)?,
+        }];
+        let victim = if !self.hps_subscribe_pending.contains_key(path)
+            && self.hps_subscribe_pending.len() >= MAX_HPS_SUBSCRIBE_PENDING
+        {
+            self.hps_subscribe_pending
+                .iter()
+                .min_by_key(|(_, candidate)| candidate.expires_at_ms)
+                .map(|(candidate, _)| candidate.clone())
+        } else {
+            None
+        };
+        if let Some(victim) = &victim {
+            mutations.push(KvMutation::Remove {
+                key: Self::hps_subscribe_pending_key(victim),
+            });
+        }
+        self.store.apply_kv_batch(&mutations).map_err(|e| {
+            Error::Other(format!("subscription expectation persistence failed: {e}"))
+        })?;
+        if let Some(victim) = victim {
+            self.hps_subscribe_pending.remove(&victim);
+            self.unanchored_hps_subscribe_pending.remove(&victim);
+        }
+        self.hps_subscribe_pending.insert(path.to_string(), pending);
+        self.unanchored_hps_subscribe_pending.remove(path);
+        Ok(())
+    }
+
     /// Subscribe to `hps://{host}/{path}`: send a sealed, proof-carrying join request to `host`.
     /// For an Open topic the keys come straight back; RequestToJoin queues for host approval;
     /// Invite topics can't be self-joined (wait for an invite).
     pub fn hps_subscribe(&mut self, host: PubKeyBytes, path: &str) -> Result<BundleId> {
+        self.expect_hps_keys(host, path)?;
         let proof = self.hps_proof(path, &self.identity.address());
         self.send_to_host(
             host,
@@ -2553,8 +3887,8 @@ impl<S: Store> Node<S> {
 
     /// Member → host: accept an invite we received, which prompts the host to seal us the keys.
     pub fn hps_accept_invite(&mut self, host: PubKeyBytes, path: &str) -> Result<BundleId> {
-        self.hps_invites_in
-            .retain(|i| !(i.path == path && i.host == host));
+        self.expect_hps_keys(host, path)?;
+        self.remove_hps_invite_item(host, path);
         self.persist_invites();
         let proof = self.hps_proof(path, &self.identity.address());
         self.send_to_host(
@@ -2568,19 +3902,99 @@ impl<S: Store> Node<S> {
 
     /// Member → host: leave a topic (drop from the retained set so we're not re-keyed).
     pub fn hps_leave(&mut self, path: &str) -> Result<Option<BundleId>> {
-        let Some(sub) = self.subscriptions.remove(path) else {
+        let Some(sub) = self.subscriptions.get(path).cloned() else {
             return Ok(None);
         };
-        self.directory.unsubscribe(path);
-        self.store.remove_kv(&Self::hps_sub_key(path));
         let proof = self.hps_proof(path, &self.identity.address());
-        Ok(Some(self.send_to_host(
-            sub.host,
-            Payload::HpsLeave {
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Device(sub.host),
+            &sub.host,
+            &Payload::HpsLeave {
                 path: path.to_string(),
                 proof,
             },
-        )?))
+            BundleOpts {
+                app: self.app.id,
+                created_at: self.now_ms,
+                ..Default::default()
+            },
+        )?;
+        self.ensure_delivery_within_limits(&bundle)?;
+        let (id, custody, carrier) = self.prepare_delivery_custody(bundle)?;
+
+        let replay_topics: Vec<_> = self
+            .hps_replays
+            .keys()
+            .copied()
+            .filter(|(topic_tag, _)| *topic_tag == sub.topic_tag)
+            .collect();
+        let inbox_ids: Vec<_> = self
+            .hps_inbox
+            .iter()
+            .filter(|message| message.path == path)
+            .map(|message| message.id)
+            .collect();
+        let mut mutations = Vec::with_capacity(
+            2 + replay_topics.len()
+                + inbox_ids.len()
+                + custody.len()
+                + usize::from(carrier.is_some()),
+        );
+        mutations.push(KvMutation::Remove {
+            key: Self::hps_sub_key(path),
+        });
+        mutations.extend(
+            replay_topics
+                .iter()
+                .map(|(topic_tag, epoch)| KvMutation::Remove {
+                    key: Self::hps_replay_key(topic_tag, *epoch),
+                }),
+        );
+        mutations.extend(inbox_ids.iter().map(|message_id| KvMutation::Remove {
+            key: Self::hps_inbox_key(message_id),
+        }));
+        if let Some(carrier) = &carrier {
+            mutations.push(KvMutation::Put {
+                key: Self::outgoing_carrier_key(&id),
+                value: postcard::to_allocvec(carrier)?,
+            });
+        }
+        mutations.extend(custody.iter().cloned().map(|bundle| KvMutation::PutBundle {
+            bundle: Box::new(bundle),
+            now_ms: self.now_ms,
+        }));
+        self.store
+            .apply_kv_batch(&mutations)
+            .map_err(|e| Error::Other(format!("leave persistence failed: {e}")))?;
+
+        self.subscriptions.remove(path);
+        self.directory.unsubscribe(path);
+        for topic in replay_topics {
+            self.hps_replays.remove(&topic);
+        }
+        self.hps_acked
+            .retain(|(topic_tag, _), _| *topic_tag != sub.topic_tag);
+        let messages = std::mem::take(&mut self.hps_inbox);
+        let charges = std::mem::take(&mut self.hps_inbox_charges);
+        for (message, charge) in messages.into_iter().zip(charges) {
+            if message.path == path {
+                self.hps_inbox_expires.remove(&message.id);
+                self.release_app_queue(charge);
+            } else {
+                self.hps_inbox.push(message);
+                self.hps_inbox_charges.push(charge);
+            }
+        }
+
+        self.tx.entry(id).or_default();
+        self.forwarded
+            .insert(id, (self.identity.address(), sub.host, self.now_ms));
+        let stored = self.activate_delivery_custody(id, &custody, carrier);
+        for custody_id in stored {
+            self.offer_bundle_to_all_except(custody_id, LOCAL_LINK);
+        }
+        Ok(Some(id))
     }
 
     /// Host: pending join requests for a RequestToJoin topic.
@@ -2623,14 +4037,34 @@ impl<S: Store> Node<S> {
     pub fn take_hps_invites(&mut self) -> Vec<HpsInviteItem> {
         // Drain the in-memory display queue but DON'T touch the durable copy — an unaccepted
         // invite must survive a restart (persistence updates only on arrival / accept / decline).
-        std::mem::take(&mut self.hps_invites_in)
+        let invites = std::mem::take(&mut self.hps_invites_in);
+        for charge in std::mem::take(&mut self.hps_invite_charges) {
+            self.release_app_queue(charge);
+        }
+        invites
     }
 
     /// Decline an invite (member side) — drop it from the durable set so it doesn't reappear.
     pub fn hps_decline_invite(&mut self, host: PubKeyBytes, path: &str) {
-        self.hps_invites_in
-            .retain(|i| !(i.path == path && i.host == host));
+        self.remove_hps_invite_item(host, path);
         self.persist_invites();
+    }
+
+    fn remove_hps_invite_item(&mut self, host: PubKeyBytes, path: &str) {
+        let mut kept_items = Vec::with_capacity(self.hps_invites_in.len());
+        let mut kept_charges = Vec::with_capacity(self.hps_invite_charges.len());
+        let items = std::mem::take(&mut self.hps_invites_in);
+        let charges = std::mem::take(&mut self.hps_invite_charges);
+        for (item, charge) in items.into_iter().zip(charges) {
+            if item.path == path && item.host == host {
+                self.release_app_queue(charge);
+            } else {
+                kept_items.push(item);
+                kept_charges.push(charge);
+            }
+        }
+        self.hps_invites_in = kept_items;
+        self.hps_invite_charges = kept_charges;
     }
 
     /// Host: selective forward rotation (revocation, DESIGN.md §32). Mint a fresh key (and,
@@ -2643,15 +4077,26 @@ impl<S: Store> Node<S> {
         new_path: Option<&str>,
         remove: &[PubKeyBytes],
     ) -> Result<Vec<BundleId>> {
+        self.expire_hps_subscribe_pending()?;
+        let new_path = new_path.unwrap_or(path).to_string();
+        if new_path != path
+            && (self.services.contains_key(&new_path)
+                || self.subscriptions.contains_key(&new_path)
+                || self.hps_members.contains_key(&new_path)
+                || self.hps_pending.contains_key(&new_path)
+                || self.hps_subscribe_pending.contains_key(&new_path))
+        {
+            return Err(Error::Other("rekey destination path already exists".into()));
+        }
         let mut cfg = self
             .services
             .get(path)
             .cloned()
             .ok_or_else(|| Error::Other("not a topic we host".into()))?;
         cfg.rotate();
-        let new_path = new_path.unwrap_or(path).to_string();
         let svc_pk = cfg.service_pubkey();
         let epoch = cfg.epoch;
+        let discoverable = cfg.visibility == hps::Visibility::Discoverable;
 
         // Retained = current members + reach acks, minus the removed set.
         let removed: std::collections::HashSet<PubKeyBytes> = remove.iter().copied().collect();
@@ -2662,6 +4107,37 @@ impl<S: Store> Node<S> {
         }
         retained.retain(|a| !removed.contains(a) && *a != self.identity.address());
 
+        // Commit the new generation, reduced member set, and every old-path deletion in one Store
+        // transaction. A crash or injected failure can expose either the old complete generation or
+        // the new complete generation, never a mix that resurrects a revoked member on restart.
+        let members: Vec<PubKeyBytes> = retained.iter().copied().collect();
+        let mut mutations = vec![
+            KvMutation::Put {
+                key: Self::hps_svc_key(&new_path),
+                value: postcard::to_allocvec(&cfg)?,
+            },
+            KvMutation::Put {
+                key: Self::hps_members_key(&new_path),
+                value: postcard::to_allocvec(&members)?,
+            },
+        ];
+        if path != new_path {
+            mutations.extend([
+                KvMutation::Remove {
+                    key: Self::hps_svc_key(path),
+                },
+                KvMutation::Remove {
+                    key: Self::hps_members_key(path),
+                },
+                KvMutation::Remove {
+                    key: Self::hps_pending_key(path),
+                },
+            ]);
+        }
+        self.store
+            .apply_kv_batch(&mutations)
+            .map_err(|e| Error::Other(format!("hps generation persistence failed: {e}")))?;
+
         // Tombstone old discovery advert and clear reach for the fresh epoch.
         if let Some(old_id) = self.hps_adverts.remove(path) {
             self.tombstone_advert(old_id);
@@ -2669,19 +4145,18 @@ impl<S: Store> Node<S> {
         self.hps_reach.remove(path);
 
         // Move state to the new path.
-        self.services.remove(path);
-        self.store.remove_kv(&Self::hps_svc_key(path));
-        self.hps_members.insert(new_path.clone(), retained.clone());
         if path != new_path {
+            self.services.remove(path);
             self.hps_members.remove(path);
             self.hps_pending.remove(path);
         }
-        if cfg.visibility == hps::Visibility::Discoverable {
-            self.publish_topic_advert(&new_path, &cfg);
-        }
-        self.persist_service(&new_path, &cfg);
         let content_key = cfg.content_key;
         self.services.insert(new_path.clone(), cfg);
+        self.hps_members.insert(new_path.clone(), retained.clone());
+        if discoverable {
+            let cfg = self.services[&new_path].clone();
+            self.publish_topic_advert(&new_path, &cfg);
+        }
 
         // Re-key each retained member.
         let mut ids = Vec::new();
@@ -2723,18 +4198,25 @@ impl<S: Store> Node<S> {
     }
 
     pub fn hps_publish(&mut self, path: &str, plaintext: &[u8]) -> Result<BundleId> {
+        let app = self.app.id;
+        let sender = self.identity.address();
+        let topic_tag = self.app.topic_tag(path);
         let (content_key, epoch) = if let Some(cfg) = self.services.get(path) {
             let content_key = cfg.content_key;
             let epoch = cfg.epoch;
             let (nonce, ct) = hps::seal_content(&content_key, plaintext);
             let sig = match cfg.signing_seed {
-                Some(seed) => hps::sign_publish(&seed, path, &nonce, &ct).to_vec(),
+                Some(seed) => {
+                    hps::sign_publish(&seed, &app, &sender, &topic_tag, epoch, &nonce, &ct).to_vec()
+                }
                 None => self
                     .identity
-                    .sign(&hps::publish_signing_bytes(path, &nonce, &ct))
+                    .sign(&hps::publish_signing_bytes(
+                        &app, &sender, &topic_tag, epoch, &nonce, &ct,
+                    ))
                     .to_vec(),
             };
-            return self.broadcast_publish(path, epoch, nonce, ct, sig);
+            return self.broadcast_publish(topic_tag, epoch, nonce, ct, sig);
         } else if let Some(sub) = self.subscriptions.get(path) {
             if sub.service_pubkey.is_some() {
                 return Err(Error::Other(
@@ -2749,22 +4231,23 @@ impl<S: Store> Node<S> {
         let (nonce, ct) = hps::seal_content(&content_key, plaintext);
         let signature = self
             .identity
-            .sign(&hps::publish_signing_bytes(path, &nonce, &ct))
+            .sign(&hps::publish_signing_bytes(
+                &app, &sender, &topic_tag, epoch, &nonce, &ct,
+            ))
             .to_vec();
-        self.broadcast_publish(path, epoch, nonce, ct, signature)
+        self.broadcast_publish(topic_tag, epoch, nonce, ct, signature)
     }
 
     /// Seal an [`Payload::HpsPublish`] to the shared broadcast key and flood it. The wire form
     /// carries the opaque `topic_tag` (not the path) so a foreign app can't tell which topic.
     fn broadcast_publish(
         &mut self,
-        path: &str,
+        topic_tag: [u8; 16],
         epoch: u32,
         nonce: [u8; 12],
         ciphertext: Vec<u8>,
         sig: Vec<u8>,
     ) -> Result<BundleId> {
-        let topic_tag = self.app.topic_tag(path);
         let bundle = Bundle::create(
             &self.identity,
             Destination::Broadcast,
@@ -2782,20 +4265,49 @@ impl<S: Store> Node<S> {
                 ..Default::default()
             },
         )?;
+        self.ensure_delivery_within_limits(&bundle)?;
         let id = bundle.id();
-        self.submit(bundle);
+        self.submit_checked(bundle)?;
         Ok(id)
     }
 
-    /// Drain received pub/sub messages (decrypted + sender-verified).
-    pub fn take_hps_messages(&mut self) -> Vec<HpsMessage> {
-        std::mem::take(&mut self.hps_inbox)
+    /// Poll received pub/sub messages without consuming them. Stable publication ids are returned
+    /// until [`Self::accept_hps_message`] durably removes each row.
+    pub fn take_hps_messages(&self) -> Vec<HpsMessage> {
+        self.hps_inbox
+            .iter()
+            .filter(|message| {
+                self.hps_inbox_expires
+                    .get(&message.id)
+                    .is_some_and(|expiry| *expiry > self.now_ms)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Explicitly accept one host-persisted HPS publication. A failed critical delete leaves the
+    /// row live and pollable, so a crash or storage fault cannot turn replay protection into loss.
+    pub fn accept_hps_message(&mut self, id: &BundleId) -> Result<bool> {
+        let Some(index) = self.hps_inbox.iter().position(|message| &message.id == id) else {
+            return Ok(false);
+        };
+        self.store
+            .remove_kv_critical(&Self::hps_inbox_key(id))
+            .map_err(|e| Error::Other(format!("hps inbox acceptance failed: {e}")))?;
+        self.hps_inbox.remove(index);
+        self.hps_inbox_expires.remove(id);
+        let charge = self.hps_inbox_charges.remove(index);
+        self.release_app_queue(charge);
+        Ok(true)
     }
 
     /// Process a broadcast `HpsPublish`: match its `topic_tag` to a subscription, verify the
     /// sender's signature against the known path, decrypt, surface it, and reach-ack the host.
     /// Drops stale-epoch messages (post-rekey) and anything we can't verify/decrypt.
-    fn process_broadcast(&mut self, bundle: &Bundle) {
+    fn process_broadcast(&mut self, bundle: &Bundle) -> bool {
+        if bundle.inner.app != self.app.id {
+            return true;
+        }
         let Ok(Payload::HpsPublish {
             topic_tag,
             epoch,
@@ -2804,13 +4316,13 @@ impl<S: Store> Node<S> {
             sig,
         }) = bundle.open(&hps::broadcast_identity())
         else {
-            return;
+            return true;
         };
         let (Ok(nonce12), Ok(sig64)) = (
             <[u8; 12]>::try_from(nonce.as_slice()),
             <[u8; 64]>::try_from(sig.as_slice()),
         ) else {
-            return;
+            return true;
         };
         // Match the tag to a topic we follow (subscription) OR a channel we host. The host must
         // receive members' posts too — a channel is group chat, and the host keeps it in
@@ -2833,29 +4345,88 @@ impl<S: Store> Node<S> {
         {
             (p, cfg.content_key, None, cfg.epoch, None) // None host = we are the host
         } else {
-            return; // not a topic we follow or host (or another app's broadcast)
+            return true; // not a topic we follow or host (or another app's broadcast)
         };
-        if epoch < my_epoch {
-            return; // stale generation (we've been re-keyed past it)
+        if epoch != my_epoch {
+            return true; // only the exact installed generation may be opened
+        }
+        if service_pubkey.is_some() && host != Some(bundle.inner.src) {
+            return true; // a service publication must come from the host stored with the subscription
         }
         // Service → verify against the service key; channel → against the sender's address.
         let signer = service_pubkey.unwrap_or(bundle.inner.src);
-        if !hps::verify_publish(&signer, &path, &nonce12, &ciphertext, &sig64) {
-            return;
+        if !hps::verify_publish(
+            &signer,
+            &bundle.inner.app,
+            &bundle.inner.src,
+            &topic_tag,
+            epoch,
+            &nonce12,
+            &ciphertext,
+            &sig64,
+        ) {
+            return true;
         }
         let Some(body) = hps::open_content(&content_key, &nonce12, &ciphertext) else {
-            return;
+            return true;
         };
-        self.hps_inbox.push(HpsMessage {
+        let publication_id = hps::publication_id(
+            &bundle.inner.app,
+            &bundle.inner.src,
+            &topic_tag,
+            epoch,
+            &nonce12,
+            &ciphertext,
+            &sig64,
+        );
+        let replay_expires_at = self
+            .now_ms
+            .saturating_add((bundle.inner.lifetime_ms as u64).min(MAX_SEEN_LIFETIME_MS));
+        if self.hps_publication_recorded(&topic_tag, epoch, &publication_id) {
+            return true;
+        }
+        if !self.app_payload_policy.supports(AppQueueKind::HpsMessage) {
+            return true;
+        }
+        let Some(charge) = self.reserve_app_queue(
+            AppQueueKind::HpsMessage,
+            Some(bundle.inner.src),
+            path.len().saturating_add(body.len()).saturating_add(64),
+        ) else {
+            return false;
+        };
+        let message = HpsMessage {
+            id: publication_id,
             path: path.clone(),
             sender: bundle.inner.src,
             body,
-        });
+        };
+        match self.accept_hps_publication(topic_tag, epoch, message, replay_expires_at, charge) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.release_app_queue(charge);
+                return true;
+            }
+            Err(_) => {
+                self.release_app_queue(charge);
+                return false;
+            }
+        }
         match host {
             Some(h) => {
                 // We're a member: reach-ack the host once per (topic, epoch) so it tallies us.
-                if self.hps_acked.insert((topic_tag, epoch)) {
-                    let _ = self.send_to_host(h, Payload::HpsReachAck { topic_tag, epoch });
+                if self.record_hps_ack((topic_tag, epoch), replay_expires_at) {
+                    let member = self.identity.address();
+                    let mac =
+                        hps::reach_ack_mac(&content_key, &self.app.id, &member, &topic_tag, epoch);
+                    let _ = self.send_to_host(
+                        h,
+                        Payload::HpsReachAck {
+                            topic_tag,
+                            epoch,
+                            mac,
+                        },
+                    );
                 }
             }
             None => {
@@ -2867,6 +4438,7 @@ impl<S: Store> Node<S> {
                     .insert(bundle.inner.src);
             }
         }
+        true
     }
 
     // --- hps internal helpers --------------------------------------------------------------
@@ -2884,11 +4456,12 @@ impl<S: Store> Node<S> {
                 ..Default::default()
             },
         )?;
+        self.ensure_delivery_within_limits(&bundle)?;
         let id = bundle.id();
         self.tx.entry(id).or_default();
         self.forwarded
             .insert(id, (self.identity.address(), to, self.now_ms));
-        self.deliver(bundle);
+        self.deliver(bundle)?;
         Ok(id)
     }
 
@@ -2920,6 +4493,7 @@ impl<S: Store> Node<S> {
     }
 
     /// Store a subscription we've been handed (Open keys, invite/approve keys, or a rekey).
+    #[cfg(test)]
     fn install_subscription(
         &mut self,
         path: &str,
@@ -3029,6 +4603,9 @@ impl<S: Store> Node<S> {
     fn hps_sub_key(path: &str) -> String {
         format!("hps/sub/{path}")
     }
+    fn hps_subscribe_pending_key(path: &str) -> String {
+        format!("hps/sub-pending/{path}")
+    }
 
     fn hps_pending_key(path: &str) -> String {
         format!("hps/pending/{path}")
@@ -3036,12 +4613,320 @@ impl<S: Store> Node<S> {
     fn hps_members_key(path: &str) -> String {
         format!("hps/members/{path}")
     }
+    fn hps_replay_key(topic_tag: &[u8; 16], epoch: u32) -> String {
+        format!(
+            "hps/replay/{}/{epoch:010}",
+            bs58::encode(topic_tag).into_string()
+        )
+    }
+    fn hps_inbox_key(id: &BundleId) -> String {
+        format!("hps/inbox/{}", bs58::encode(id).into_string())
+    }
+    fn http_response_key(id: &BundleId) -> String {
+        format!("response/http/{}", bs58::encode(id).into_string())
+    }
+    fn service_response_key(id: &BundleId) -> String {
+        format!("response/service/{}", bs58::encode(id).into_string())
+    }
+    fn outgoing_carrier_key(id: &BundleId) -> String {
+        format!("carrier-out/{}", bs58::encode(id).into_string())
+    }
+
+    fn hps_publication_recorded(
+        &self,
+        topic_tag: &[u8; 16],
+        epoch: u32,
+        publication_id: &BundleId,
+    ) -> bool {
+        self.hps_inbox
+            .iter()
+            .any(|message| &message.id == publication_id)
+            || self
+                .hps_replays
+                .get(&(*topic_tag, epoch))
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|(id, expiry)| id == publication_id && *expiry > self.now_ms)
+                })
+    }
+
+    fn record_hps_ack(&mut self, topic: ([u8; 16], u32), expires_at: u64) -> bool {
+        self.hps_acked.retain(|_, expiry| *expiry > self.now_ms);
+        if self.hps_acked.contains_key(&topic) {
+            return false;
+        }
+        if self.hps_acked.len() >= MAX_HPS_ACKED {
+            if let Some(victim) = self
+                .hps_acked
+                .iter()
+                .min_by_key(|(_, expiry)| **expiry)
+                .map(|(topic, _)| *topic)
+            {
+                self.hps_acked.remove(&victim);
+            }
+        }
+        self.hps_acked.insert(topic, expires_at);
+        true
+    }
+
+    fn expire_outgoing_carriers(&mut self) {
+        let expired: Vec<BundleId> = self
+            .outgoing_carriers
+            .iter()
+            .filter(|(_, carrier)| {
+                let lifetime_ended = carrier
+                    .original
+                    .inner
+                    .created_at
+                    .saturating_add(carrier.original.inner.lifetime_ms as u64)
+                    <= self.now_ms;
+                let unacked_transfer_finished = !carrier.original.inner.flags.request_ack
+                    && carrier
+                        .chunks
+                        .iter()
+                        .all(|chunk| !self.store.contains(chunk));
+                lifetime_ended || unacked_transfer_finished
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let mutations: Vec<KvMutation> = expired
+            .iter()
+            .map(|id| KvMutation::Remove {
+                key: Self::outgoing_carrier_key(id),
+            })
+            .collect();
+        if self.store.apply_kv_batch(&mutations).is_err() {
+            return;
+        }
+        for id in expired {
+            self.outgoing_carriers.remove(&id);
+        }
+    }
+
+    fn accept_hps_publication(
+        &mut self,
+        topic_tag: [u8; 16],
+        epoch: u32,
+        message: HpsMessage,
+        expires_at: u64,
+        charge: AppQueueCharge,
+    ) -> Result<bool> {
+        let publication_id = message.id;
+        let topic = (topic_tag, epoch);
+        if self.hps_publication_recorded(&topic_tag, epoch, &publication_id) {
+            return Ok(false);
+        }
+        if self.hps_inbox.len() >= MAX_DURABLE_HPS_MESSAGES {
+            return Err(Error::Other("durable hps inbox limit reached".into()));
+        }
+        let mut candidate = self.hps_replays.clone();
+        let mut protected: HashSet<BundleId> =
+            self.hps_inbox.iter().map(|message| message.id).collect();
+        protected.insert(publication_id);
+        let entries = candidate.entry(topic).or_default();
+        entries.retain(|(id, expiry)| *expiry > self.now_ms || protected.contains(id));
+        entries.push((publication_id, expires_at));
+        entries.sort_by_key(|(_, expiry)| *expiry);
+        while entries.len() > MAX_HPS_REPLAYS_PER_TOPIC {
+            let Some(index) = entries.iter().position(|(id, _)| !protected.contains(id)) else {
+                return Err(Error::Other(
+                    "hps replay topic limit is fully retained".into(),
+                ));
+            };
+            entries.remove(index);
+        }
+        while candidate.values().map(Vec::len).sum::<usize>() > MAX_HPS_REPLAYS_GLOBAL {
+            let victim = candidate
+                .iter()
+                .flat_map(|(candidate_topic, entries)| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (id, _))| !protected.contains(id))
+                        .map(move |(index, (_, expiry))| (*expiry, *candidate_topic, index))
+                })
+                .min_by_key(|(expiry, _, _)| *expiry);
+            let Some((_, victim_topic, victim_index)) = victim else {
+                return Err(Error::Other(
+                    "global hps replay limit is fully retained".into(),
+                ));
+            };
+            if let Some(entries) = candidate.get_mut(&victim_topic) {
+                entries.remove(victim_index);
+            }
+        }
+        candidate.retain(|_, entries| !entries.is_empty());
+
+        let inbox = PersistedHpsInbox {
+            message: message.clone(),
+            topic_tag,
+            epoch,
+            received_at_ms: self.now_ms,
+            expires_at_ms: expires_at,
+        };
+        let mut changed_topics: HashSet<_> = self.hps_replays.keys().copied().collect();
+        changed_topics.extend(candidate.keys().copied());
+        let mut changed_topics: Vec<_> = changed_topics
+            .into_iter()
+            .filter(|topic| self.hps_replays.get(topic) != candidate.get(topic))
+            .collect();
+        changed_topics.sort_unstable();
+        let mut mutations = Vec::with_capacity(changed_topics.len() + 1);
+        for (changed_tag, changed_epoch) in changed_topics {
+            match candidate.get(&(changed_tag, changed_epoch)) {
+                Some(entries) => mutations.push(KvMutation::Put {
+                    key: Self::hps_replay_key(&changed_tag, changed_epoch),
+                    value: postcard::to_allocvec(&PersistedHpsReplay {
+                        topic_tag: changed_tag,
+                        epoch: changed_epoch,
+                        entries: entries.clone(),
+                    })?,
+                }),
+                None => mutations.push(KvMutation::Remove {
+                    key: Self::hps_replay_key(&changed_tag, changed_epoch),
+                }),
+            }
+        }
+        mutations.push(KvMutation::Put {
+            key: Self::hps_inbox_key(&publication_id),
+            value: postcard::to_allocvec(&inbox)?,
+        });
+        self.store
+            .apply_kv_batch(&mutations)
+            .map_err(|e| Error::Other(format!("hps replay persistence failed: {e}")))?;
+        self.hps_replays = candidate;
+        self.hps_inbox_expires.insert(publication_id, expires_at);
+        self.hps_inbox.push(message);
+        self.hps_inbox_charges.push(charge);
+        Ok(true)
+    }
+
+    fn expire_hps_replays(&mut self) {
+        let topics: Vec<_> = self.hps_replays.keys().copied().collect();
+        for (topic_tag, epoch) in topics {
+            let Some(current) = self.hps_replays.get(&(topic_tag, epoch)) else {
+                continue;
+            };
+            let entries: Vec<_> = current
+                .iter()
+                .copied()
+                .filter(|(id, expiry)| {
+                    *expiry > self.now_ms || self.hps_inbox.iter().any(|message| message.id == *id)
+                })
+                .collect();
+            if entries.len() == current.len() {
+                continue;
+            }
+            let key = Self::hps_replay_key(&topic_tag, epoch);
+            let mutation = if entries.is_empty() {
+                KvMutation::Remove { key }
+            } else {
+                let persisted = PersistedHpsReplay {
+                    topic_tag,
+                    epoch,
+                    entries: entries.clone(),
+                };
+                let Ok(value) = postcard::to_allocvec(&persisted) else {
+                    continue;
+                };
+                KvMutation::Put { key, value }
+            };
+            if self.store.apply_kv_batch(&[mutation]).is_ok() {
+                if entries.is_empty() {
+                    self.hps_replays.remove(&(topic_tag, epoch));
+                } else {
+                    self.hps_replays.insert((topic_tag, epoch), entries);
+                }
+            }
+        }
+    }
+
+    fn expire_hps_inbox(&mut self) {
+        let expired: HashSet<BundleId> = self
+            .hps_inbox_expires
+            .iter()
+            .filter(|(_, expiry)| **expiry <= self.now_ms)
+            .map(|(id, _)| *id)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let mutations: Vec<KvMutation> = expired
+            .iter()
+            .map(|id| KvMutation::Remove {
+                key: Self::hps_inbox_key(id),
+            })
+            .collect();
+        if self.store.apply_kv_batch(&mutations).is_err() {
+            return;
+        }
+        let messages = std::mem::take(&mut self.hps_inbox);
+        let charges = std::mem::take(&mut self.hps_inbox_charges);
+        for (message, charge) in messages.into_iter().zip(charges) {
+            if expired.contains(&message.id) {
+                self.hps_inbox_expires.remove(&message.id);
+                self.release_app_queue(charge);
+            } else {
+                self.hps_inbox.push(message);
+                self.hps_inbox_charges.push(charge);
+            }
+        }
+    }
+
+    fn expire_durable_responses(&mut self) {
+        let expired_http: HashSet<BundleId> = self
+            .http_response_expires
+            .iter()
+            .filter(|(_, expiry)| **expiry <= self.now_ms)
+            .map(|(id, _)| *id)
+            .collect();
+        let expired_service: HashSet<BundleId> = self
+            .service_response_expires
+            .iter()
+            .filter(|(_, expiry)| **expiry <= self.now_ms)
+            .map(|(id, _)| *id)
+            .collect();
+        if expired_http.is_empty() && expired_service.is_empty() {
+            return;
+        }
+        let mut mutations = Vec::with_capacity(expired_http.len() + expired_service.len());
+        mutations.extend(expired_http.iter().map(|id| KvMutation::Remove {
+            key: Self::http_response_key(id),
+        }));
+        mutations.extend(expired_service.iter().map(|id| KvMutation::Remove {
+            key: Self::service_response_key(id),
+        }));
+        if self.store.apply_kv_batch(&mutations).is_err() {
+            return;
+        }
+        self.http_responses
+            .retain(|item| !expired_http.contains(&item.id));
+        self.service_responses
+            .retain(|item| !expired_service.contains(&item.id));
+        for id in expired_http {
+            self.http_response_expires.remove(&id);
+            if let Some(charge) = self.http_response_charges.remove(&id) {
+                self.release_app_queue(charge);
+            }
+        }
+        for id in expired_service {
+            self.service_response_expires.remove(&id);
+            if let Some(charge) = self.service_response_charges.remove(&id) {
+                self.release_app_queue(charge);
+            }
+        }
+    }
 
     fn persist_service(&mut self, path: &str, cfg: &hps::ServiceConfig) {
         if let Ok(bytes) = postcard::to_allocvec(cfg) {
             self.store.put_kv(&Self::hps_svc_key(path), bytes);
         }
     }
+    #[cfg(test)]
     fn persist_subscription(&mut self, path: &str, sub: &HpsSubscription) {
         if let Ok(bytes) = postcard::to_allocvec(sub) {
             self.store.put_kv(&Self::hps_sub_key(path), bytes);
@@ -3054,11 +4939,11 @@ impl<S: Store> Node<S> {
         }
     }
     fn persist_members(&mut self, path: &str) {
-        let m: Vec<PubKeyBytes> = self
-            .hps_members
-            .get(path)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default();
+        let members = self.hps_members.get(path).cloned().unwrap_or_default();
+        self.persist_member_set(path, &members);
+    }
+    fn persist_member_set(&mut self, path: &str, members: &HashSet<PubKeyBytes>) {
+        let m: Vec<PubKeyBytes> = members.iter().copied().collect();
         if let Ok(bytes) = postcard::to_allocvec(&m) {
             self.store.put_kv(&Self::hps_members_key(path), bytes);
         }
@@ -3066,10 +4951,11 @@ impl<S: Store> Node<S> {
 
     /// Persist the deferred-content queue (messages the user sent that are waiting on a prekey)
     /// so a restart before the prekey arrives doesn't silently drop them (DESIGN.md §25).
-    fn persist_pending_content(&mut self) {
-        if let Ok(bytes) = postcard::to_allocvec(&self.pending_content) {
-            self.store.put_kv("pending_content", bytes);
-        }
+    fn persist_pending_content(&mut self, pending: &[PendingContent]) -> Result<()> {
+        let bytes = postcard::to_allocvec(&pending)?;
+        self.store
+            .put_kv_critical("pending_content", bytes)
+            .map_err(|e| Error::Other(format!("deferred content persistence failed: {e}")))
     }
 
     /// Persist received + outstanding `hps://` invites so they survive a restart (§32).
@@ -3104,8 +4990,19 @@ impl<S: Store> Node<S> {
 
     /// Queue a real-DNS lookup for the host, deduped while one is in flight.
     fn queue_dns_lookup(&mut self, key: &str) {
+        if self.dns_inflight.contains(key) {
+            return;
+        }
+        let Some(charge) =
+            self.reserve_app_queue(AppQueueKind::HnsLookup, None, key.len().saturating_add(16))
+        else {
+            return;
+        };
         if self.dns_inflight.insert(key.to_string()) {
             self.dns_lookups.push(key.to_string());
+            self.dns_lookup_charges.push(charge);
+        } else {
+            self.release_app_queue(charge);
         }
     }
 
@@ -3133,19 +5030,191 @@ impl<S: Store> Node<S> {
                 ..Default::default()
             },
         )?;
+        self.ensure_delivery_within_limits(&bundle)?;
         let id = bundle.id();
-        self.deliver(bundle);
+        self.deliver(bundle)?;
         Ok(id)
+    }
+
+    fn finish_outstanding_response(&mut self, request_id: BundleId, request: &OutstandingRequest) {
+        self.outstanding_requests.remove(&request_id);
+        self.unanchored_outstanding_requests.remove(&request_id);
+        for custody_id in &request.custody_ids {
+            self.pending.remove(custody_id);
+            self.carrier_owner.remove(custody_id);
+            self.relay_order.retain(|queued| queued != custody_id);
+            self.forwarded.remove(custody_id);
+        }
+        self.outgoing_carriers.remove(&request_id);
+        self.pending.remove(&request_id);
+        self.relay_order.retain(|queued| *queued != request_id);
+        self.forwarded.remove(&request_id);
+        self.immune.insert(request_id, self.now_ms);
+        self.tx.remove(&request_id);
+    }
+
+    fn commit_http_response(&mut self, bundle: &Bundle, item: HttpRespItem) -> Result<()> {
+        if !self.app_payload_policy.supports(AppQueueKind::HttpResponse)
+            || self.http_responses.len() + self.service_responses.len() >= MAX_DURABLE_RESPONSES
+        {
+            return Err(Error::Other("durable response inbox limit reached".into()));
+        }
+        let request = self
+            .outstanding_requests
+            .get(&item.for_id)
+            .cloned()
+            .ok_or_else(|| Error::Other("response authorization disappeared".into()))?;
+        let wire_bytes = bundle.to_bytes()?.len();
+        let charge = self
+            .reserve_app_queue(
+                AppQueueKind::HttpResponse,
+                Some(item.from),
+                Self::http_response_bytes(&item).saturating_add(wire_bytes),
+            )
+            .ok_or_else(|| Error::Other("http response admission limit reached".into()))?;
+        let expires_at_ms = self.now_ms.saturating_add(DURABLE_HOST_DELIVERY_TTL_MS);
+        let persisted = PersistedHttpResponse {
+            item: item.clone(),
+            received_at_ms: self.now_ms,
+            expires_at_ms,
+        };
+        let mut candidate = self.outstanding_requests.clone();
+        candidate.remove(&item.for_id);
+        let mut mutations = vec![
+            KvMutation::Put {
+                key: Self::http_response_key(&item.id),
+                value: postcard::to_allocvec(&persisted)?,
+            },
+            Self::outstanding_requests_mutation(&candidate)?,
+            KvMutation::Remove {
+                key: Self::outgoing_carrier_key(&item.for_id),
+            },
+        ];
+        mutations.extend(
+            request
+                .custody_ids
+                .iter()
+                .copied()
+                .map(|id| KvMutation::RemoveBundle { id }),
+        );
+        if let Err(error) = self.store.apply_kv_batch(&mutations) {
+            self.release_app_queue(charge);
+            return Err(Error::Other(format!(
+                "http response persistence failed: {error}"
+            )));
+        }
+        self.finish_outstanding_response(item.for_id, &request);
+        self.http_response_expires.insert(item.id, expires_at_ms);
+        self.http_response_charges.insert(item.id, charge);
+        self.http_responses.push(item);
+        Ok(())
+    }
+
+    fn commit_service_response(&mut self, bundle: &Bundle, item: ServiceRespItem) -> Result<()> {
+        if !self
+            .app_payload_policy
+            .supports(AppQueueKind::ServiceResponse)
+            || self.http_responses.len() + self.service_responses.len() >= MAX_DURABLE_RESPONSES
+        {
+            return Err(Error::Other("durable response inbox limit reached".into()));
+        }
+        let request = self
+            .outstanding_requests
+            .get(&item.for_id)
+            .cloned()
+            .ok_or_else(|| Error::Other("response authorization disappeared".into()))?;
+        let wire_bytes = bundle.to_bytes()?.len();
+        let charge = self
+            .reserve_app_queue(
+                AppQueueKind::ServiceResponse,
+                Some(item.from),
+                Self::service_response_bytes(&item).saturating_add(wire_bytes),
+            )
+            .ok_or_else(|| Error::Other("service response admission limit reached".into()))?;
+        let expires_at_ms = self.now_ms.saturating_add(DURABLE_HOST_DELIVERY_TTL_MS);
+        let persisted = PersistedServiceResponse {
+            item: item.clone(),
+            received_at_ms: self.now_ms,
+            expires_at_ms,
+        };
+        let mut candidate = self.outstanding_requests.clone();
+        candidate.remove(&item.for_id);
+        let mut mutations = vec![
+            KvMutation::Put {
+                key: Self::service_response_key(&item.id),
+                value: postcard::to_allocvec(&persisted)?,
+            },
+            Self::outstanding_requests_mutation(&candidate)?,
+            KvMutation::Remove {
+                key: Self::outgoing_carrier_key(&item.for_id),
+            },
+        ];
+        mutations.extend(
+            request
+                .custody_ids
+                .iter()
+                .copied()
+                .map(|id| KvMutation::RemoveBundle { id }),
+        );
+        if let Err(error) = self.store.apply_kv_batch(&mutations) {
+            self.release_app_queue(charge);
+            return Err(Error::Other(format!(
+                "service response persistence failed: {error}"
+            )));
+        }
+        self.finish_outstanding_response(item.for_id, &request);
+        self.service_response_expires.insert(item.id, expires_at_ms);
+        self.service_response_charges.insert(item.id, charge);
+        self.service_responses.push(item);
+        Ok(())
     }
 
     /// Drain egress HTTP requests we (as a gateway) should fulfill.
     pub fn take_http_requests(&mut self) -> Vec<HttpReqItem> {
+        let pending = self.take_http_requests_deferred();
+        let mut accepted = Vec::with_capacity(pending.len());
+        for item in pending {
+            if self.complete_app_delivery(&item.id) {
+                accepted.push(item);
+            } else {
+                self.http_requests.push(item);
+            }
+        }
+        accepted
+    }
+
+    /// Move HTTP requests into a higher-level admission gate without ACKing or consuming dedup.
+    pub fn take_http_requests_deferred(&mut self) -> Vec<HttpReqItem> {
         std::mem::take(&mut self.http_requests)
     }
 
-    /// Drain HTTP responses sealed back to us (as a requester).
-    pub fn take_http_responses(&mut self) -> Vec<HttpRespItem> {
-        std::mem::take(&mut self.http_responses)
+    /// Poll durable HTTP responses. Repeated calls return the same stable response ids until the host
+    /// explicitly accepts each row.
+    pub fn take_http_responses(&self) -> Vec<HttpRespItem> {
+        self.http_responses
+            .iter()
+            .filter(|item| {
+                self.http_response_expires
+                    .get(&item.id)
+                    .is_some_and(|expiry| *expiry > self.now_ms)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn accept_http_response(&mut self, id: &BundleId) -> Result<bool> {
+        let Some(index) = self.http_responses.iter().position(|item| &item.id == id) else {
+            return Ok(false);
+        };
+        self.store
+            .remove_kv_critical(&Self::http_response_key(id))
+            .map_err(|e| Error::Other(format!("http response acceptance failed: {e}")))?;
+        self.http_responses.remove(index);
+        self.http_response_expires.remove(id);
+        if let Some(charge) = self.http_response_charges.remove(id) {
+            self.release_app_queue(charge);
+        }
+        Ok(true)
     }
 
     // --- service calls (DESIGN.md §29) ----------------------------------------
@@ -3153,6 +5222,191 @@ impl<S: Store> Node<S> {
     /// Set this node's display name (returned by `hop.identify`). `None` clears it.
     pub fn set_name(&mut self, name: Option<String>) {
         self.name = name;
+    }
+
+    /// Configure host-facing queue admission. Lowering limits does not discard already admitted
+    /// durable inbox work; it only rejects new work until usage falls below the new bounds.
+    pub fn set_app_queue_limits(&mut self, limits: AppQueueLimits) {
+        self.app_queue_limits = limits;
+    }
+
+    fn reserve_app_queue(
+        &mut self,
+        kind: AppQueueKind,
+        source: Option<PubKeyBytes>,
+        bytes: usize,
+    ) -> Option<AppQueueCharge> {
+        let index = kind as usize;
+        let limits = self.app_queue_limits;
+        if bytes > limits.max_item_bytes
+            || self.app_queue_usage.items >= limits.max_total_items
+            || self.app_queue_usage.bytes.saturating_add(bytes) > limits.max_total_bytes
+            || self.app_queue_usage.counts[index] >= limits.max_items_per_queue
+            || self.app_queue_usage.queue_bytes[index].saturating_add(bytes)
+                > limits.max_bytes_per_queue
+        {
+            return None;
+        }
+        if let Some(source) = source {
+            let usage = self
+                .app_queue_usage
+                .senders
+                .get(&source)
+                .copied()
+                .unwrap_or_default();
+            if usage.items >= limits.max_sender_items
+                || usage.bytes.saturating_add(bytes) > limits.max_sender_bytes
+            {
+                return None;
+            }
+            self.app_queue_usage.senders.insert(
+                source,
+                AppSenderUsage {
+                    items: usage.items + 1,
+                    bytes: usage.bytes + bytes,
+                },
+            );
+        }
+        self.app_queue_usage.items += 1;
+        self.app_queue_usage.bytes += bytes;
+        self.app_queue_usage.counts[index] += 1;
+        self.app_queue_usage.queue_bytes[index] += bytes;
+        Some(AppQueueCharge {
+            kind,
+            source,
+            bytes,
+        })
+    }
+
+    fn release_app_queue(&mut self, charge: AppQueueCharge) {
+        let index = charge.kind as usize;
+        self.app_queue_usage.items = self.app_queue_usage.items.saturating_sub(1);
+        self.app_queue_usage.bytes = self.app_queue_usage.bytes.saturating_sub(charge.bytes);
+        self.app_queue_usage.counts[index] = self.app_queue_usage.counts[index].saturating_sub(1);
+        self.app_queue_usage.queue_bytes[index] =
+            self.app_queue_usage.queue_bytes[index].saturating_sub(charge.bytes);
+        if let Some(source) = charge.source {
+            if let Some(usage) = self.app_queue_usage.senders.get_mut(&source) {
+                usage.items = usage.items.saturating_sub(1);
+                usage.bytes = usage.bytes.saturating_sub(charge.bytes);
+                if usage.items == 0 {
+                    self.app_queue_usage.senders.remove(&source);
+                }
+            }
+        }
+    }
+
+    fn admit_app_delivery(
+        &mut self,
+        kind: AppQueueKind,
+        bundle: &Bundle,
+        item_bytes: usize,
+    ) -> bool {
+        if !self.app_payload_policy.supports(kind) {
+            return false;
+        }
+        let id = bundle.id();
+        if self.pending_app_deliveries.contains_key(&id) {
+            return false;
+        }
+        let Ok(wire) = bundle.to_bytes() else {
+            return false;
+        };
+        let Some(charge) = self.reserve_app_queue(
+            kind,
+            Some(bundle.inner.src),
+            item_bytes.saturating_add(wire.len()),
+        ) else {
+            return false;
+        };
+        self.pending_app_deliveries.insert(
+            id,
+            PendingAppDelivery {
+                bundle: bundle.clone(),
+                charge,
+            },
+        );
+        true
+    }
+
+    /// Commit one deferred app delivery. The dedup row and ACK are created only after host or held
+    /// queue admission. Returns false if durable dedup admission failed, leaving the item pending.
+    pub fn complete_app_delivery(&mut self, id: &BundleId) -> bool {
+        let Some(pending) = self.pending_app_deliveries.get(id) else {
+            return false;
+        };
+        let bundle = pending.bundle.clone();
+        self.store.put(bundle.clone(), self.now_ms);
+        if !self.store.seen(id) {
+            return false;
+        }
+        self.store.remove(id);
+        let pending = self
+            .pending_app_deliveries
+            .remove(id)
+            .expect("pending app delivery still present");
+        self.release_app_queue(pending.charge);
+        if bundle.inner.flags.request_ack {
+            self.emit_ack(&bundle);
+        }
+        true
+    }
+
+    /// Reject deferred app work without ACK or dedup consumption so a retransmission can retry.
+    pub fn reject_app_delivery(&mut self, id: &BundleId) -> bool {
+        let Some(pending) = self.pending_app_deliveries.remove(id) else {
+            return false;
+        };
+        self.release_app_queue(pending.charge);
+        true
+    }
+
+    fn header_bytes(headers: &[(String, String)]) -> usize {
+        headers.iter().fold(0usize, |total, (name, value)| {
+            total.saturating_add(name.len()).saturating_add(value.len())
+        })
+    }
+
+    fn http_request_bytes(item: &HttpReqItem) -> usize {
+        item.host
+            .len()
+            .saturating_add(item.method.len())
+            .saturating_add(item.url.len())
+            .saturating_add(Self::header_bytes(&item.headers))
+            .saturating_add(item.body.len())
+            .saturating_add(80)
+    }
+
+    fn http_response_bytes(item: &HttpRespItem) -> usize {
+        Self::header_bytes(&item.headers)
+            .saturating_add(item.body.len())
+            .saturating_add(72)
+    }
+
+    fn service_request_bytes(item: &ServiceReqItem) -> usize {
+        item.service
+            .len()
+            .saturating_add(item.method.len())
+            .saturating_add(item.args.len())
+            .saturating_add(72)
+    }
+
+    fn service_response_bytes(item: &ServiceRespItem) -> usize {
+        item.body.len().saturating_add(72)
+    }
+
+    fn hps_message_bytes(item: &HpsMessage) -> usize {
+        item.path
+            .len()
+            .saturating_add(item.body.len())
+            .saturating_add(96)
+    }
+
+    fn inbox_item_bytes(item: &InboxItem) -> usize {
+        item.content_type
+            .len()
+            .saturating_add(item.body.len())
+            .saturating_add(160)
     }
 
     /// This node's display name, if set.
@@ -3163,6 +5417,101 @@ impl<S: Store> Node<S> {
     /// Set what kind of node this is (returned by `hop.identify`).
     pub fn set_kind(&mut self, kind: NodeKind) {
         self.kind = kind;
+        self.app_payload_policy = AppPayloadPolicy::for_kind(kind);
+        self.discard_unsupported_app_queues();
+    }
+
+    fn discard_unsupported_app_queues(&mut self) {
+        let rejected: Vec<BundleId> = self
+            .pending_app_deliveries
+            .iter()
+            .filter(|(_, pending)| !self.app_payload_policy.supports(pending.charge.kind))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in rejected {
+            self.reject_app_delivery(&id);
+        }
+        if !self.app_payload_policy.supports(AppQueueKind::HttpRequest) {
+            self.http_requests.clear();
+        }
+        if !self.app_payload_policy.supports(AppQueueKind::HttpResponse) {
+            self.http_responses.clear();
+            self.http_response_expires.clear();
+            let charges: Vec<_> = self.http_response_charges.drain().map(|(_, c)| c).collect();
+            for charge in charges {
+                self.release_app_queue(charge);
+            }
+        }
+        if !self
+            .app_payload_policy
+            .supports(AppQueueKind::ServiceRequest)
+        {
+            self.service_requests.clear();
+        }
+        if !self
+            .app_payload_policy
+            .supports(AppQueueKind::ServiceResponse)
+        {
+            self.service_responses.clear();
+            self.service_response_expires.clear();
+            let charges: Vec<_> = self
+                .service_response_charges
+                .drain()
+                .map(|(_, charge)| charge)
+                .collect();
+            for charge in charges {
+                self.release_app_queue(charge);
+            }
+        }
+        if !self.app_payload_policy.supports(AppQueueKind::Telemetry) {
+            self.telemetry_in.clear();
+            let charges = std::mem::take(&mut self.telemetry_charges);
+            for charge in charges {
+                self.release_app_queue(charge);
+            }
+        }
+        if !self.app_payload_policy.supports(AppQueueKind::PeerInbox) {
+            let charges: Vec<_> = self
+                .durable_inbox_charges
+                .drain()
+                .map(|(_, charge)| charge)
+                .collect();
+            for charge in charges {
+                self.release_app_queue(charge);
+            }
+            self.durable_inbox.clear();
+            self.inbox_order.clear();
+            self.inbox.clear();
+        }
+        if !self.app_payload_policy.supports(AppQueueKind::HpsMessage) {
+            self.hps_inbox.clear();
+            self.hps_inbox_expires.clear();
+            let charges = std::mem::take(&mut self.hps_inbox_charges);
+            for charge in charges {
+                self.release_app_queue(charge);
+            }
+        }
+        if !self.app_payload_policy.supports(AppQueueKind::HpsInvite) {
+            self.hps_invites_in.clear();
+            let charges = std::mem::take(&mut self.hps_invite_charges);
+            for charge in charges {
+                self.release_app_queue(charge);
+            }
+        }
+        if !self.app_payload_policy.supports(AppQueueKind::HnsLookup) {
+            self.dns_lookups.clear();
+            let charges = std::mem::take(&mut self.dns_lookup_charges);
+            for charge in charges {
+                self.release_app_queue(charge);
+            }
+        }
+        if !self.app_payload_policy.supports(AppQueueKind::HnsResult) {
+            self.hns_results.clear();
+            let charges = std::mem::take(&mut self.hns_result_charges);
+            for charge in charges {
+                self.release_app_queue(charge);
+            }
+        }
     }
 
     /// This node's identity record, as the built-in `hop.identify` service reports it.
@@ -3199,13 +5548,8 @@ impl<S: Store> Node<S> {
                 ..Default::default()
             },
         )?;
-        let id = bundle.id();
-        self.tx.entry(id).or_default();
-        // Remember the send so a returning delivery learns the route (§27).
-        self.forwarded
-            .insert(id, (self.identity.address(), dst, self.now_ms));
-        self.deliver(bundle);
-        Ok(id)
+        self.ensure_delivery_within_limits(&bundle)?;
+        self.deliver_authorized_request(bundle, dst, RequestKind::Service)
     }
 
     /// Seal a service response back to a caller (app side, for a custom service). Reply
@@ -3231,20 +5575,62 @@ impl<S: Store> Node<S> {
                 ..Default::default()
             },
         )?;
+        self.ensure_delivery_within_limits(&bundle)?;
         let id = bundle.id();
-        self.deliver(bundle);
+        self.deliver(bundle)?;
         Ok(id)
     }
 
     /// Drain custom service requests addressed to us (built-in `hop.` services are
     /// answered by the node and never appear here).
     pub fn take_service_requests(&mut self) -> Vec<ServiceReqItem> {
+        let pending = self.take_service_requests_deferred();
+        let mut accepted = Vec::with_capacity(pending.len());
+        for item in pending {
+            if self.complete_app_delivery(&item.id) {
+                accepted.push(item);
+            } else {
+                self.service_requests.push(item);
+            }
+        }
+        accepted
+    }
+
+    /// Move service requests into a higher-level admission gate without ACKing or consuming dedup.
+    pub fn take_service_requests_deferred(&mut self) -> Vec<ServiceReqItem> {
         std::mem::take(&mut self.service_requests)
     }
 
-    /// Drain service responses sealed back to us (as a caller).
-    pub fn take_service_responses(&mut self) -> Vec<ServiceRespItem> {
-        std::mem::take(&mut self.service_responses)
+    /// Poll durable service responses without consuming them.
+    pub fn take_service_responses(&self) -> Vec<ServiceRespItem> {
+        self.service_responses
+            .iter()
+            .filter(|item| {
+                self.service_response_expires
+                    .get(&item.id)
+                    .is_some_and(|expiry| *expiry > self.now_ms)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn accept_service_response(&mut self, id: &BundleId) -> Result<bool> {
+        let Some(index) = self
+            .service_responses
+            .iter()
+            .position(|item| &item.id == id)
+        else {
+            return Ok(false);
+        };
+        self.store
+            .remove_kv_critical(&Self::service_response_key(id))
+            .map_err(|e| Error::Other(format!("service response acceptance failed: {e}")))?;
+        self.service_responses.remove(index);
+        self.service_response_expires.remove(id);
+        if let Some(charge) = self.service_response_charges.remove(id) {
+            self.release_app_queue(charge);
+        }
+        Ok(true)
     }
 
     /// Export a [`TelemetryBatch`](crate::telemetry::TelemetryBatch) to a collector's address over
@@ -3257,18 +5643,35 @@ impl<S: Store> Node<S> {
         collector: PubKeyBytes,
         batch: &TelemetryBatch,
     ) -> Result<BundleId> {
-        self.send_service_request(
-            collector,
-            SERVICE_TELEMETRY.into(),
-            "export".into(),
-            batch.to_bytes(),
-        )
+        let bundle = Bundle::create(
+            &self.identity,
+            Destination::Device(collector),
+            &collector,
+            &Payload::ServiceRequest {
+                service: SERVICE_TELEMETRY.into(),
+                method: "export".into(),
+                args: batch.to_bytes(),
+            },
+            BundleOpts {
+                created_at: self.now_ms,
+                ..Default::default()
+            },
+        )?;
+        self.ensure_delivery_within_limits(&bundle)?;
+        let id = bundle.id();
+        self.deliver(bundle)?;
+        Ok(id)
     }
 
     /// Drain telemetry batches received from devices (as a collector). Each was decoded and
     /// bounds-checked on receipt; malformed or oversized batches were dropped.
     pub fn take_telemetry(&mut self) -> Vec<TelemetryIn> {
-        std::mem::take(&mut self.telemetry_in)
+        let batches = std::mem::take(&mut self.telemetry_in);
+        let charges = std::mem::take(&mut self.telemetry_charges);
+        for charge in charges {
+            self.release_app_queue(charge);
+        }
+        batches
     }
 
     // --- transparent carrier streaming (DESIGN.md §20) ------------------------
@@ -3282,35 +5685,51 @@ impl<S: Store> Node<S> {
         id
     }
 
-    /// Submit a locally-originated bundle, **auto-streaming if it's too large**. Small
-    /// bundles go as one (the common case). A large one (e.g. an image message, or a big
-    /// service request/response) is split into ordered `StreamData` chunks carrying its
-    /// raw bytes, each sealed to the destination and ACK-tracked for reliable transport;
-    /// the receiver reassembles and processes the original bundle as if it arrived whole —
-    /// so id, request_ack, delivery status and dedup are all preserved. Transparent: every
-    /// `send_*` path funnels through here, so any payload type streams when needed.
-    fn deliver(&mut self, mut bundle: Bundle) {
-        // §35: stamp BEFORE any fragmentation. `to_bytes()` below snapshots the bundle for the
-        // carrier path, so a stamp applied later (in `submit`) would never reach the REASSEMBLED
-        // original: the receiver would see an unstamped bundle and could not attribute it to a
-        // tenant, so the largest (most billable) streamed bundles would silently bill nothing.
-        // Stamping here covers both paths; `submit`'s own `is_none()` guard skips re-stamping the
-        // small case, and the id is stamp-independent (the stamp rides the unsigned envelope).
-        if let Some(stamper) = &self.stamper {
-            let is_vaccine = matches!(bundle.inner.dst, Destination::Vaccine(_));
-            if bundle.env.access.is_none() && !is_vaccine {
-                bundle.env.access = Some(Box::new(stamper.stamp(&bundle.id(), self.now_ms)));
-            }
+    fn ensure_delivery_within_limits(&self, bundle: &Bundle) -> Result<()> {
+        let encoded_len = bundle.to_bytes()?.len();
+        let chunk_bytes = self.carrier_limits.chunk_bytes.max(1);
+        let addressed = matches!(
+            bundle.inner.dst,
+            Destination::Device(_) | Destination::AckTo(_, _)
+        );
+        if addressed
+            && encoded_len > chunk_bytes
+            && (encoded_len > self.carrier_limits.stream_bytes
+                || encoded_len.div_ceil(chunk_bytes) > self.carrier_limits.stream_chunks)
+        {
+            return Err(Error::Other("bundle exceeds carrier stream limit".into()));
         }
-        let encoded = match bundle.to_bytes() {
-            Ok(b) if b.len() > STREAM_CHUNK => b,
-            _ => return self.submit(bundle), // small, or un-encodable: send as one
+        Ok(())
+    }
+
+    /// Build the exact custody set for one outgoing bundle without exposing it to any bearer. Large
+    /// addressed bundles become a bounded set of carrier chunks plus a durable original transaction.
+    fn prepare_delivery_custody(
+        &mut self,
+        mut bundle: Bundle,
+    ) -> Result<(BundleId, Vec<Bundle>, Option<OutgoingCarrier>)> {
+        if bundle.is_private() {
+            bundle.env.trace.clear();
+        }
+        self.stamp_originated_bundle(&mut bundle);
+        self.ensure_delivery_within_limits(&bundle)?;
+        let chunk_bytes = self.carrier_limits.chunk_bytes.max(1);
+        let encoded = bundle.to_bytes()?;
+        let original_id = bundle.id();
+        let addressed = matches!(
+            bundle.inner.dst,
+            Destination::Device(_) | Destination::AckTo(_, _)
+        );
+        if encoded.len() <= chunk_bytes || !addressed {
+            return Ok((original_id, vec![bundle], None));
+        }
+        let destination = match bundle.inner.dst {
+            Destination::Device(destination) | Destination::AckTo(destination, _) => destination,
+            Destination::Broadcast | Destination::Vaccine(..) => unreachable!("addressed above"),
         };
-        let dst = match bundle.inner.dst {
-            Destination::Device(d) | Destination::AckTo(d, _) => d,
-            Destination::Broadcast | Destination::Vaccine(..) => return self.submit(bundle), // no single dst — floods
-        };
-        let sid = self.next_stream_id();
+        let stream_id = self.next_stream_id();
+        let chunks: Vec<&[u8]> = encoded.chunks(chunk_bytes).collect();
+        let count = chunks.len();
         let opts = BundleOpts {
             created_at: self.now_ms,
             flags: BundleFlags {
@@ -3319,30 +5738,349 @@ impl<S: Store> Node<S> {
             },
             ..Default::default()
         };
-        let orig = bundle.id(); // the message id the UI tracks; carriers map back to it
-        let chunks: Vec<&[u8]> = encoded.chunks(STREAM_CHUNK).collect();
-        let n = chunks.len();
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            if let Ok(carrier) = Bundle::create(
+        let mut custody = Vec::with_capacity(count);
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let mut carrier_chunk = Bundle::create(
                 &self.identity,
-                Destination::Device(dst),
-                &dst,
+                Destination::Device(destination),
+                &destination,
                 &Payload::Carrier {
-                    stream_id: sid,
-                    seq: i as u64,
+                    stream_id,
+                    seq: index as u64,
                     bytes: chunk.to_vec(),
-                    fin: i + 1 == n,
+                    fin: index + 1 == count,
                 },
                 opts,
-            ) {
-                self.carrier_owner.insert(carrier.id(), orig); // attribute relay/ownership
-                self.submit(carrier); // request_ack → tracked in `pending` for retransmit
+            )?;
+            self.stamp_originated_bundle(&mut carrier_chunk);
+            custody.push(carrier_chunk);
+        }
+        let carrier = OutgoingCarrier {
+            original: bundle,
+            chunks: custody.iter().map(Bundle::id).collect(),
+        };
+        Ok((original_id, custody, Some(carrier)))
+    }
+
+    fn activate_delivery_custody(
+        &mut self,
+        original_id: BundleId,
+        custody: &[Bundle],
+        carrier: Option<OutgoingCarrier>,
+    ) -> Vec<BundleId> {
+        if let Some(carrier) = carrier {
+            for chunk in &carrier.chunks {
+                self.carrier_owner.insert(*chunk, original_id);
+            }
+            self.outgoing_carriers.insert(original_id, carrier);
+        }
+        let mut ids = Vec::with_capacity(custody.len());
+        for stored in custody {
+            let id = stored.id();
+            if stored.inner.flags.request_ack && !stored.inner.flags.is_ack {
+                self.pending.insert(
+                    id,
+                    PendingTx {
+                        copies: stored.env.copies,
+                        created_at: stored.inner.created_at,
+                        lifetime_ms: stored.inner.lifetime_ms,
+                        next_retx_at: self.now_ms.saturating_add(self.retx_interval_ms),
+                        retx_interval: self.retx_interval_ms,
+                    },
+                );
+            }
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Commit a prepared send ratchet together with the exact custody records it produced. For a
+    /// large addressed bundle those records are every carrier chunk; for all other sends it is the
+    /// bundle itself. Nothing is offered and the live ratchet is untouched until the whole Store
+    /// batch succeeds.
+    fn store_session_delivery(
+        &mut self,
+        peer: PubKeyBytes,
+        session: PeerSession,
+        bundle: Bundle,
+    ) -> Result<Vec<BundleId>> {
+        let (original, custody, carrier) = self.prepare_delivery_custody(bundle)?;
+
+        let mut mutations = Vec::with_capacity(custody.len() + 2);
+        mutations.push(KvMutation::Put {
+            key: Self::session_kv_key(&peer),
+            value: postcard::to_allocvec(&session)?,
+        });
+        if let Some(carrier) = &carrier {
+            mutations.push(KvMutation::Put {
+                key: Self::outgoing_carrier_key(&original),
+                value: postcard::to_allocvec(carrier)?,
+            });
+        }
+        mutations.extend(custody.iter().cloned().map(|bundle| KvMutation::PutBundle {
+            bundle: Box::new(bundle),
+            now_ms: self.now_ms,
+        }));
+        self.store
+            .apply_kv_batch(&mutations)
+            .map_err(|e| Error::Other(format!("outbound persistence failed: {e}")))?;
+
+        self.sessions.insert(peer, session);
+        self.touch_session(peer);
+        Ok(self.activate_delivery_custody(original, &custody, carrier))
+    }
+
+    /// Submit a locally-originated bundle, **auto-streaming if it's too large**. Small
+    /// bundles go as one (the common case). A large one (e.g. an image message, or a big
+    /// service request/response) is split into ordered `StreamData` chunks carrying its
+    /// raw bytes, each sealed to the destination and ACK-tracked for reliable transport;
+    /// the receiver reassembles and processes the original bundle as if it arrived whole —
+    /// so id, request_ack, delivery status and dedup are all preserved. Transparent: every
+    /// `send_*` path funnels through here, so any payload type streams when needed.
+    fn deliver(&mut self, bundle: Bundle) -> Result<()> {
+        let (original, custody, carrier) = self.prepare_delivery_custody(bundle)?;
+        if carrier.is_none() {
+            self.submit_checked(
+                custody
+                    .into_iter()
+                    .next()
+                    .expect("non-carrier custody contains its original bundle"),
+            )?;
+            return Ok(());
+        }
+        let carrier_ref = carrier.as_ref().expect("checked above");
+        let mut mutations = Vec::with_capacity(custody.len() + 1);
+        mutations.push(KvMutation::Put {
+            key: Self::outgoing_carrier_key(&original),
+            value: postcard::to_allocvec(carrier_ref)?,
+        });
+        mutations.extend(custody.iter().cloned().map(|bundle| KvMutation::PutBundle {
+            bundle: Box::new(bundle),
+            now_ms: self.now_ms,
+        }));
+        self.store
+            .apply_kv_batch(&mutations)
+            .map_err(|e| Error::Other(format!("carrier custody persistence failed: {e}")))?;
+        let stored = self.activate_delivery_custody(original, &custody, carrier);
+        for id in stored {
+            self.offer_bundle_to_all_except(id, LOCAL_LINK);
+        }
+        Ok(())
+    }
+
+    fn continue_carrier_rehydrate(&mut self) -> Result<bool> {
+        let Some(mut state) = self.carrier_rehydrate.take() else {
+            return Ok(true);
+        };
+        let result = self.run_carrier_rehydrate_round(&mut state);
+        match result {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.carrier_rehydrate = Some(state);
+                Ok(false)
+            }
+            Err(error) => {
+                self.carrier_rehydrate = Some(state);
+                Err(error)
             }
         }
     }
 
-    /// Feed one inbound carrier chunk into reassembly; returns the reconstructed original
-    /// bundle bytes once the stream is complete (else `None`).
+    fn run_carrier_rehydrate_round(&mut self, state: &mut CarrierRehydrateState) -> Result<bool> {
+        let mut round = CarrierRehydrateUsage::default();
+        self.drain_carrier_rehydrate_cleanup(state, &mut round)?;
+        if !state.cleanup.is_empty() {
+            return Ok(false);
+        }
+
+        while round.rows < CARRIER_REHYDRATE_MAX_ROWS
+            && round.bytes < CARRIER_REHYDRATE_MAX_BYTES
+            && round.pages < CARRIER_REHYDRATE_MAX_PAGES
+        {
+            let row_limit = CARRIER_PERSISTED_PAGE_ROWS
+                .min(CARRIER_REHYDRATE_MAX_ROWS.saturating_sub(round.rows));
+            let byte_limit = CARRIER_REHYDRATE_MAX_BYTES.saturating_sub(round.bytes);
+            let page = self
+                .store
+                .list_kv_page_bounded("strm/", state.cursor.as_deref(), row_limit, byte_limit)
+                .map_err(|error| Error::Other(format!("carrier rehydrate page failed: {error}")))?;
+            if page.rows.len() > row_limit
+                || page.scanned_bytes > byte_limit
+                || page.scanned_pages == 0
+                || page.scanned_pages > CARRIER_REHYDRATE_MAX_PAGES.saturating_sub(round.pages)
+            {
+                return Err(Error::Other(
+                    "carrier rehydrate backend exceeded its page budget".into(),
+                ));
+            }
+            round.rows += page.rows.len();
+            round.bytes += page.scanned_bytes;
+            round.pages += page.scanned_pages;
+            self.carrier_rehydrate_usage.rows = self
+                .carrier_rehydrate_usage
+                .rows
+                .saturating_add(page.rows.len());
+            self.carrier_rehydrate_usage.bytes = self
+                .carrier_rehydrate_usage
+                .bytes
+                .saturating_add(page.scanned_bytes);
+            self.carrier_rehydrate_usage.pages = self
+                .carrier_rehydrate_usage
+                .pages
+                .saturating_add(page.scanned_pages);
+            if page.rows.is_empty() {
+                return Ok(true);
+            }
+
+            for row in page.rows {
+                if state
+                    .cursor
+                    .as_deref()
+                    .is_some_and(|cursor| cursor >= row.key.as_str())
+                {
+                    return Err(Error::Other(
+                        "carrier rehydrate cursor did not advance".into(),
+                    ));
+                }
+                state.cursor = Some(row.key.clone());
+                let Some((from, stream_id, seq)) = parse_stream_key(&row.key) else {
+                    Self::queue_carrier_cleanup(state, row);
+                    continue;
+                };
+                if state.rejected_stream != Some((from, stream_id)) {
+                    state.rejected_stream = None;
+                }
+                if state.rejected_stream == Some((from, stream_id)) {
+                    Self::queue_carrier_cleanup(state, row);
+                    continue;
+                }
+                if !row.canonical {
+                    self.reject_rehydrated_stream(state, row, from, stream_id);
+                    continue;
+                }
+                let Some(value) = row.value.as_deref() else {
+                    self.reject_rehydrated_stream(state, row, from, stream_id);
+                    continue;
+                };
+                let Ok(chunk) = postcard::from_bytes::<PersistedCarrierChunk>(value) else {
+                    self.reject_rehydrated_stream(state, row, from, stream_id);
+                    continue;
+                };
+                let invalid_time = chunk.started_at != 0
+                    && (chunk.received_at < chunk.started_at
+                        || chunk.received_at.saturating_sub(chunk.started_at)
+                            >= CARRIER_STREAM_LIFETIME_MS);
+                if invalid_time {
+                    self.reject_rehydrated_stream(state, row, from, stream_id);
+                    continue;
+                }
+                match self.accept_stream_chunk_at(
+                    from,
+                    stream_id,
+                    seq,
+                    CarrierChunkInput {
+                        bytes: chunk.bytes,
+                        fin: chunk.fin,
+                        origin: CarrierChunkOrigin::Persisted {
+                            started_at: chunk.started_at,
+                            received_at: chunk.received_at,
+                        },
+                    },
+                ) {
+                    StreamChunkAcceptance::Retained => {}
+                    StreamChunkAcceptance::Complete(inner_bytes) => {
+                        let _ = self.process_reconstructed_bundle(LOCAL_LINK, from, &inner_bytes);
+                        self.reject_rehydrated_stream(state, row, from, stream_id);
+                    }
+                    StreamChunkAcceptance::Rejected => {
+                        self.reject_rehydrated_stream(state, row, from, stream_id);
+                    }
+                }
+            }
+
+            self.drain_carrier_rehydrate_cleanup(state, &mut round)?;
+            if !state.cleanup.is_empty() {
+                return Ok(false);
+            }
+        }
+        Ok(false)
+    }
+
+    fn drain_carrier_rehydrate_cleanup(
+        &mut self,
+        state: &mut CarrierRehydrateState,
+        round: &mut CarrierRehydrateUsage,
+    ) -> Result<()> {
+        while !state.cleanup.is_empty()
+            && round.cleanup_operations < CARRIER_REHYDRATE_MAX_CLEANUP_OPERATIONS
+        {
+            let count = CARRIER_CLEANUP_BATCH_ROWS.min(state.cleanup.len()).min(
+                CARRIER_REHYDRATE_MAX_CLEANUP_OPERATIONS.saturating_sub(round.cleanup_operations),
+            );
+            let batch: Vec<_> = state.cleanup.iter().take(count).cloned().collect();
+            round.cleanup_operations += count;
+            self.carrier_rehydrate_usage.cleanup_operations = self
+                .carrier_rehydrate_usage
+                .cleanup_operations
+                .saturating_add(count);
+            self.store
+                .remove_kv_rows_critical(&batch)
+                .map_err(|error| {
+                    Error::Other(format!("carrier rehydrate cleanup failed: {error}"))
+                })?;
+            state.cleanup.drain(..count);
+        }
+        Ok(())
+    }
+
+    fn reject_rehydrated_stream(
+        &mut self,
+        state: &mut CarrierRehydrateState,
+        row: KvPageRow,
+        from: PubKeyBytes,
+        stream_id: StreamId,
+    ) {
+        if let Some(stream) = self.remove_incoming_stream(&from, &stream_id) {
+            for seq in stream.chunks.keys() {
+                Self::queue_carrier_cleanup(
+                    state,
+                    KvPageRow::removal(stream_chunk_key(&from, &stream_id, *seq)),
+                );
+            }
+        }
+        Self::queue_carrier_cleanup(state, row);
+        state.rejected_stream = Some((from, stream_id));
+    }
+
+    fn queue_carrier_cleanup(state: &mut CarrierRehydrateState, row: KvPageRow) {
+        if state
+            .cleanup
+            .iter()
+            .any(|existing| existing.key == row.key && existing.storage_id == row.storage_id)
+        {
+            return;
+        }
+        if row.storage_id.is_none()
+            && state
+                .cleanup
+                .iter()
+                .any(|existing| existing.key == row.key && existing.canonical)
+        {
+            return;
+        }
+        if row.canonical {
+            if let Some(existing) = state.cleanup.iter_mut().find(|existing| {
+                existing.key == row.key && existing.canonical && existing.storage_id.is_none()
+            }) {
+                *existing = row;
+                return;
+            }
+        }
+        state.cleanup.push_back(row);
+    }
+
+    /// Feed one inbound carrier chunk into reassembly. Rejected chunks were not retained and must
+    /// not be deduped or ACKed by the caller.
     fn accept_stream_chunk(
         &mut self,
         from: PubKeyBytes,
@@ -3350,48 +6088,341 @@ impl<S: Store> Node<S> {
         seq: u64,
         bytes: Vec<u8>,
         fin: bool,
-    ) -> Option<Vec<u8>> {
-        let now = self.now_ms;
-        // Persist the raw chunk first, so a partial transfer survives a background
-        // suspend/relaunch (beacon mode): we ACK each carrier (the relay then drops its
-        // copy), so without this a half-assembled image whose in-memory state is lost on
-        // wake could never complete. Re-fed on rehydrate (DESIGN.md §20, §22).
-        let mut val = Vec::with_capacity(bytes.len() + 1);
-        val.push(fin as u8);
-        val.extend_from_slice(&bytes);
-        self.store
-            .put_kv(&stream_chunk_key(&from, &stream_id, seq), val);
+    ) -> StreamChunkAcceptance {
+        if self.carrier_rehydrate.is_some() {
+            return StreamChunkAcceptance::Rejected;
+        }
+        self.accept_stream_chunk_at(
+            from,
+            stream_id,
+            seq,
+            CarrierChunkInput {
+                bytes,
+                fin,
+                origin: CarrierChunkOrigin::Live,
+            },
+        )
+    }
 
+    fn anchor_incoming_stream(
+        &mut self,
+        from: &PubKeyBytes,
+        stream_id: &StreamId,
+        now_ms: u64,
+    ) -> bool {
+        let prefix = stream_prefix(from, stream_id);
+        let Some((key, bytes)) = self.store.list_kv_page(&prefix, None, 1).into_iter().next()
+        else {
+            return false;
+        };
+        let Ok(mut chunk) = postcard::from_bytes::<PersistedCarrierChunk>(&bytes) else {
+            return false;
+        };
+        chunk.started_at = now_ms;
+        if chunk.received_at == 0 {
+            chunk.received_at = now_ms;
+        }
+        let Ok(value) = postcard::to_allocvec(&chunk) else {
+            return false;
+        };
+        self.store.put_kv_critical(&key, value).is_ok()
+    }
+
+    /// Parse and authenticate a completed carrier without consuming its spool. Only the original
+    /// authenticated sender may carry an addressed bundle to this recipient, and nested carriers are
+    /// refused. `on_bundle` reports true only after the normal receive path has durable custody.
+    fn process_reconstructed_bundle(
+        &mut self,
+        from_link: LinkId,
+        carrier_sender: PubKeyBytes,
+        bytes: &[u8],
+    ) -> bool {
+        let Ok(bundle) = Bundle::from_bytes(bytes) else {
+            return false;
+        };
+        if bundle.verify().is_err()
+            || bundle.inner.src != carrier_sender
+            || !is_for(&bundle, &self.address())
+            || matches!(bundle.open(&self.identity), Ok(Payload::Carrier { .. }))
+        {
+            return false;
+        }
+        self.process_bundle(from_link, bundle)
+    }
+
+    fn accept_stream_chunk_at(
+        &mut self,
+        from: PubKeyBytes,
+        stream_id: StreamId,
+        seq: u64,
+        input: CarrierChunkInput,
+    ) -> StreamChunkAcceptance {
+        let CarrierChunkInput { bytes, fin, origin } = input;
+        let (persisted_times, cleanup_on_reject) = match origin {
+            CarrierChunkOrigin::Live => (None, true),
+            CarrierChunkOrigin::Persisted {
+                started_at,
+                received_at,
+            } => (Some((started_at, received_at)), false),
+        };
+        let activity_at = persisted_times.map_or(self.now_ms, |(_, received_at)| received_at);
+        let hinted_start = persisted_times.map_or(self.now_ms, |(started_at, _)| started_at);
+        let key = (from, stream_id);
+        if bytes.is_empty()
+            || bytes.len() > self.carrier_limits.chunk_bytes
+            || self.carrier_limits.stream_chunks == 0
+            || seq >= self.carrier_limits.stream_chunks as u64
+        {
+            if cleanup_on_reject {
+                let _ = self.abort_incoming_stream(&from, &stream_id);
+            }
+            return StreamChunkAcceptance::Rejected;
+        }
+
+        let hash = *blake3::hash(&bytes).as_bytes();
+        if let Some(existing) = self
+            .incoming_streams
+            .get(&key)
+            .and_then(|stream| stream.chunks.get(&seq))
+            .copied()
+        {
+            let stream = &self.incoming_streams[&key];
+            let mismatched_start = persisted_times.is_some()
+                && hinted_start != 0
+                && stream.started_at != 0
+                && hinted_start != stream.started_at;
+            let expired = stream.started_at != 0
+                && activity_at.saturating_sub(stream.started_at) >= CARRIER_STREAM_LIFETIME_MS;
+            if mismatched_start || expired {
+                if cleanup_on_reject {
+                    let _ = self.abort_incoming_stream(&from, &stream_id);
+                }
+                return StreamChunkAcceptance::Rejected;
+            }
+            if existing.hash == hash && existing.fin == fin {
+                if let Some(stream) = self.incoming_streams.get_mut(&key) {
+                    stream.at = stream.at.max(activity_at);
+                }
+                if self
+                    .incoming_streams
+                    .get(&key)
+                    .is_some_and(|stream| stream.reassembler.is_finished())
+                {
+                    return StreamChunkAcceptance::Complete(
+                        self.incoming_streams[&key].data.clone(),
+                    );
+                }
+                return StreamChunkAcceptance::Retained;
+            }
+            if cleanup_on_reject {
+                let _ = self.abort_incoming_stream(&from, &stream_id);
+            }
+            return StreamChunkAcceptance::Rejected;
+        }
+
+        let (is_new, stream_bytes, stream_chunks, terminal_seq, has_later_chunk, mut started_at) =
+            self.incoming_streams
+                .get(&key)
+                .map(|stream| {
+                    (
+                        false,
+                        stream.bytes,
+                        stream.chunks.len(),
+                        stream
+                            .chunks
+                            .iter()
+                            .find_map(|(chunk_seq, chunk)| chunk.fin.then_some(*chunk_seq)),
+                        stream.chunks.keys().any(|chunk_seq| *chunk_seq > seq),
+                        stream.started_at,
+                    )
+                })
+                .unwrap_or((true, 0, 0, None, false, hinted_start));
+        if started_at == 0 && hinted_start != 0 {
+            started_at = hinted_start;
+        }
+        if (started_at != 0 && activity_at.saturating_sub(started_at) >= CARRIER_STREAM_LIFETIME_MS)
+            || (persisted_times.is_some()
+                && !is_new
+                && hinted_start != 0
+                && started_at != 0
+                && hinted_start != started_at)
+        {
+            if cleanup_on_reject {
+                let _ = self.abort_incoming_stream(&from, &stream_id);
+            }
+            return StreamChunkAcceptance::Rejected;
+        }
+        let next_stream_bytes = match stream_bytes.checked_add(bytes.len()) {
+            Some(total) => total,
+            None => {
+                if cleanup_on_reject {
+                    let _ = self.abort_incoming_stream(&from, &stream_id);
+                }
+                return StreamChunkAcceptance::Rejected;
+            }
+        };
+        let impossible_order =
+            terminal_seq.is_some_and(|terminal| seq > terminal || fin) || (fin && has_later_chunk);
+        if impossible_order
+            || stream_chunks.saturating_add(1) > self.carrier_limits.stream_chunks
+            || next_stream_bytes > self.carrier_limits.stream_bytes
+        {
+            if cleanup_on_reject {
+                let _ = self.abort_incoming_stream(&from, &stream_id);
+            }
+            return StreamChunkAcceptance::Rejected;
+        }
+
+        let sender_usage = self
+            .incoming_sender_usage
+            .get(&from)
+            .copied()
+            .unwrap_or_default();
+        let exceeds_stream_pressure = is_new
+            && (self.incoming_streams.len() >= self.carrier_limits.global_streams
+                || sender_usage.streams >= self.carrier_limits.sender_streams);
+        let exceeds_byte_pressure = sender_usage
+            .bytes
+            .checked_add(bytes.len())
+            .is_none_or(|total| total > self.carrier_limits.sender_bytes)
+            || self
+                .incoming_stream_bytes
+                .checked_add(bytes.len())
+                .is_none_or(|total| total > self.carrier_limits.global_bytes);
+        if exceeds_stream_pressure || exceeds_byte_pressure {
+            // Aggregate pressure is temporary. Keep every previously retained chunk and do not
+            // persist, dedup, or ACK this one, so retransmission can succeed after cleanup.
+            return StreamChunkAcceptance::Rejected;
+        }
+
+        let persisted = PersistedCarrierChunk {
+            started_at,
+            received_at: activity_at,
+            fin,
+            bytes: bytes.clone(),
+        };
+        if persisted_times.is_none() {
+            let storage_key = stream_chunk_key(&from, &stream_id, seq);
+            let Ok(value) = postcard::to_allocvec(&persisted) else {
+                return StreamChunkAcceptance::Rejected;
+            };
+            if self.store.put_kv_critical(&storage_key, value).is_err() {
+                return StreamChunkAcceptance::Rejected;
+            }
+        }
+
+        if is_new {
+            self.incoming_streams.insert(
+                key,
+                IncomingStream {
+                    reassembler: StreamReassembler::new(),
+                    data: Vec::new(),
+                    chunks: HashMap::new(),
+                    bytes: 0,
+                    started_at,
+                    at: activity_at,
+                },
+            );
+            self.incoming_sender_usage.entry(from).or_default().streams += 1;
+        }
         let entry = self
             .incoming_streams
-            .entry((from, stream_id))
-            .or_insert_with(|| IncomingStream {
-                reassembler: StreamReassembler::new(),
-                data: Vec::new(),
-                at: now,
-            });
-        entry.at = now;
+            .get_mut(&key)
+            .expect("admitted carrier stream exists");
+        entry.at = entry.at.max(activity_at);
+        if entry.started_at == 0 && hinted_start != 0 {
+            entry.started_at = hinted_start;
+        }
+        entry.bytes += bytes.len();
+        entry.chunks.insert(seq, IncomingChunk { hash, fin });
         for chunk in entry.reassembler.accept(seq, bytes, fin) {
             entry.data.extend_from_slice(&chunk);
         }
-        if entry.reassembler.is_finished() {
-            let data = self
-                .incoming_streams
-                .remove(&(from, stream_id))
-                .map(|s| s.data);
-            self.clear_persisted_stream(&from, &stream_id); // whole message assembled
-            data
+        self.incoming_stream_bytes += persisted.bytes.len();
+        self.incoming_sender_usage.entry(from).or_default().bytes += persisted.bytes.len();
+
+        if self
+            .incoming_streams
+            .get(&key)
+            .is_some_and(|stream| stream.reassembler.is_finished())
+        {
+            StreamChunkAcceptance::Complete(self.incoming_streams[&key].data.clone())
         } else {
-            None
+            StreamChunkAcceptance::Retained
         }
     }
 
-    /// Remove all persisted chunks of a completed or abandoned carrier stream (DESIGN.md §20).
-    fn clear_persisted_stream(&mut self, from: &PubKeyBytes, stream_id: &StreamId) {
-        let prefix = stream_prefix(from, stream_id);
-        for (k, _) in self.store.list_kv(&prefix) {
-            self.store.remove_kv(&k);
+    fn remove_incoming_stream(
+        &mut self,
+        from: &PubKeyBytes,
+        stream_id: &StreamId,
+    ) -> Option<IncomingStream> {
+        let stream = self.incoming_streams.remove(&(*from, *stream_id))?;
+        self.incoming_stream_bytes = self.incoming_stream_bytes.saturating_sub(stream.bytes);
+        let remove_sender = if let Some(usage) = self.incoming_sender_usage.get_mut(from) {
+            usage.streams = usage.streams.saturating_sub(1);
+            usage.bytes = usage.bytes.saturating_sub(stream.bytes);
+            usage.streams == 0 && usage.bytes == 0
+        } else {
+            false
+        };
+        if remove_sender {
+            self.incoming_sender_usage.remove(from);
         }
+        Some(stream)
+    }
+
+    fn finalize_incoming_stream(&mut self, from: &PubKeyBytes, stream_id: &StreamId) -> bool {
+        if self.clear_persisted_stream(from, stream_id).is_err() {
+            return false;
+        }
+        self.remove_incoming_stream(from, stream_id);
+        true
+    }
+
+    fn abort_incoming_stream(&mut self, from: &PubKeyBytes, stream_id: &StreamId) -> bool {
+        self.finalize_incoming_stream(from, stream_id)
+    }
+
+    /// Remove all persisted chunks of a completed or abandoned carrier stream (DESIGN.md §20).
+    fn clear_persisted_stream(&mut self, from: &PubKeyBytes, stream_id: &StreamId) -> Result<()> {
+        let prefix = stream_prefix(from, stream_id);
+        let mut after: Option<String> = None;
+        loop {
+            let page = self
+                .store
+                .list_kv_page_bounded(
+                    &prefix,
+                    after.as_deref(),
+                    CARRIER_PERSISTED_PAGE_ROWS,
+                    CARRIER_REHYDRATE_MAX_BYTES,
+                )
+                .map_err(|error| Error::Other(format!("carrier cleanup page failed: {error}")))?;
+            if page.rows.is_empty() {
+                break;
+            }
+            if page.rows.len() > CARRIER_PERSISTED_PAGE_ROWS
+                || page.scanned_bytes > CARRIER_REHYDRATE_MAX_BYTES
+                || page.scanned_pages == 0
+            {
+                return Err(Error::Other(
+                    "carrier cleanup backend exceeded its page budget".into(),
+                ));
+            }
+            let next = page.rows.last().map(|row| row.key.clone());
+            if next == after {
+                return Err(Error::Other(
+                    "carrier cleanup cursor did not advance".into(),
+                ));
+            }
+            self.store
+                .remove_kv_rows_critical(&page.rows)
+                .map_err(|error| {
+                    Error::Other(format!("carrier cleanup persistence failed: {error}"))
+                })?;
+            after = next;
+        }
+        Ok(())
     }
 
     /// Publish (and gossip) a signed service advert so others discover it across the
@@ -3661,9 +6692,13 @@ impl<S: Store> Node<S> {
     /// retry timer is due, giving up on any past their lifetime (§7, §8).
     pub fn tick(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+        self.clock_anchored |= now_ms != 0;
         // §35: roll the keyed-access hint tables when the epoch advances (no-op under Open, cheap
         // when the epoch is stable). Keeps admission an O(1) hint lookup instead of a per-bundle scan.
         self.access_policy.refresh(now_ms);
+        // Cold-start carrier recovery is intentionally not an unbounded constructor operation. One
+        // bounded round runs per tick, retaining its cursor and cleanup queue on exhaustion/failure.
+        let _ = self.continue_carrier_rehydrate();
         // §35: drop pending attribution for any bundle no longer HELD. A delivered bundle already
         // removed its own entry (via meter_delivered) synchronously; what remains here for a
         // no-longer-held id is an evicted or TTL-expired bundle that never delivered, and is
@@ -3672,7 +6707,39 @@ impl<S: Store> Node<S> {
             self.metered_attribution
                 .retain(|id, _| self.store.contains(id));
         }
+        // Persisted PeerSession intentionally has no wall-clock field. Rehydrate marks restored
+        // sessions unanchored, so their first real tick establishes an idle-GC baseline instead of
+        // comparing an epoch-scale timestamp against zero and deleting them immediately.
+        if now_ms != 0 {
+            for peer in self.unanchored_sessions.iter().copied().collect::<Vec<_>>() {
+                if self.sessions.contains_key(&peer) {
+                    self.touch_session(peer);
+                } else {
+                    self.unanchored_sessions.remove(&peer);
+                }
+            }
+        }
+        let _ = self.expire_outstanding_requests();
+        let _ = self.expire_hps_subscribe_pending();
+        if now_ms != 0 {
+            self.unanchored_outstanding_requests.retain(|id| {
+                self.outstanding_requests
+                    .get(id)
+                    .is_some_and(|request| request.expires_at_ms <= now_ms)
+            });
+            self.unanchored_hps_subscribe_pending.retain(|path| {
+                self.hps_subscribe_pending
+                    .get(path)
+                    .is_some_and(|pending| pending.expires_at_ms <= now_ms)
+            });
+        }
+        self.expire_hps_inbox();
+        self.expire_durable_responses();
+        self.expire_hps_replays();
+        self.hps_acked.retain(|_, expiry| *expiry > now_ms);
         self.directory.expire(now_ms);
+        self.forget_evicted_adverts();
+        self.prune_peer_sent();
         // §39 P4 (+ sec-priv-04): drop stale next-hops — a recipient that stopped beaconing (moved or
         // went passive) stops attracting bundles down its link within one TTL (no permanent black-hole).
         // Prune expired links per bucket, then drop any bucket left with no live next-hop.
@@ -3702,6 +6769,30 @@ impl<S: Store> Node<S> {
             }
         }
         self.store.prune(now_ms);
+        self.expire_outgoing_carriers();
+        // Accepted receiver dedup expires with the bundle window. Unaccepted inbox rows never expire:
+        // host acceptance, not sender TTL, owns their retention and redelivery lifecycle.
+        let expired_received: Vec<BundleId> = self
+            .receiver_seen
+            .iter()
+            .filter(|(id, seen)| {
+                seen.expires_at_ms <= now_ms && !self.durable_inbox.contains_key(*id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if !expired_received.is_empty() {
+            let removals: Vec<KvMutation> = expired_received
+                .iter()
+                .map(|id| KvMutation::Remove {
+                    key: Self::receiver_seen_kv_key(id),
+                })
+                .collect();
+            if self.store.apply_kv_batch(&removals).is_ok() {
+                for id in expired_received {
+                    self.receiver_seen.remove(&id);
+                }
+            }
+        }
         // Drop relay-queue entries whose bundles have been delivered or expired.
         self.relay_order.retain(|id| self.store.contains(id));
         self.relay_fwd.retain(|id, _| self.store.contains(id));
@@ -3728,17 +6819,40 @@ impl<S: Store> Node<S> {
         // Forget forwarded-route memory for bundles that can no longer ACK back (§27).
         self.forwarded
             .retain(|_, (_, _, t)| now_ms.saturating_sub(*t) < 3_600_000);
-        // Drop abandoned half-received carrier streams (sender vanished mid-transfer), and
-        // clear their persisted chunks so they don't linger in the store.
+        // A stream accepted before the host established a real clock gets one absolute anchor on
+        // the first real tick. Later arrivals may refresh idle activity, never this lifetime anchor.
+        if now_ms != 0 {
+            let unanchored: Vec<(PubKeyBytes, StreamId)> = self
+                .incoming_streams
+                .iter()
+                .filter(|(_, stream)| stream.started_at == 0)
+                .map(|(key, _)| *key)
+                .collect();
+            for (from, stream_id) in unanchored {
+                if self.anchor_incoming_stream(&from, &stream_id, now_ms) {
+                    if let Some(stream) = self.incoming_streams.get_mut(&(from, stream_id)) {
+                        stream.started_at = now_ms;
+                        if stream.at == 0 {
+                            stream.at = now_ms;
+                        }
+                    }
+                }
+            }
+        }
+        // Drop abandoned half-received carrier streams (sender vanished mid-transfer), releasing
+        // sender/global accounting and persisted chunks through the same cleanup path.
         let dropped: Vec<(PubKeyBytes, StreamId)> = self
             .incoming_streams
             .iter()
-            .filter(|(_, s)| now_ms.saturating_sub(s.at) >= 3_600_000)
+            .filter(|(_, stream)| {
+                (stream.at != 0 && now_ms.saturating_sub(stream.at) >= CARRIER_STREAM_IDLE_MS)
+                    || (stream.started_at != 0
+                        && now_ms.saturating_sub(stream.started_at) >= CARRIER_STREAM_LIFETIME_MS)
+            })
             .map(|(k, _)| *k)
             .collect();
         for (from, sid) in dropped {
-            self.incoming_streams.remove(&(from, sid));
-            self.clear_persisted_stream(&from, &sid);
+            let _ = self.abort_incoming_stream(&from, &sid);
         }
         // Forget carrier→original links once the carrier is no longer held (delivered/expired).
         self.carrier_owner.retain(|cid, _| self.store.contains(cid));
@@ -3854,14 +6968,57 @@ impl<S: Store> Node<S> {
 
     /// Publish a locally-originated advert; gossips it to live links.
     pub fn publish(&mut self, advert: Advert) {
-        if self.directory.ingest(advert, self.now_ms).unwrap_or(false) {
+        let accepted = self.directory.ingest(advert, self.now_ms).unwrap_or(false);
+        self.forget_evicted_adverts();
+        if accepted {
             self.offer_adverts_to_all();
         }
     }
 
-    /// Bundles addressed to this node that have arrived since the last call.
+    /// Legacy raw-bundle test seam. Public hosts use [`Self::inbox_items`] so polling is
+    /// non-destructive and cannot consume a ratchet twice after a crash.
     pub fn take_inbox(&mut self) -> Vec<Bundle> {
-        std::mem::take(&mut self.inbox)
+        let queued = std::mem::take(&mut self.inbox);
+        let mut accepted = Vec::with_capacity(queued.len());
+        for bundle in queued {
+            let id = bundle.id();
+            if !self.pending_app_deliveries.contains_key(&id) || self.complete_app_delivery(&id) {
+                accepted.push(bundle);
+            } else {
+                self.inbox.push(bundle);
+            }
+        }
+        accepted
+    }
+
+    /// Decrypted, authenticated messages awaiting synchronous host acceptance. Repeated calls return
+    /// the same stable ids until [`Self::accept_inbox`] durably removes each item.
+    pub fn inbox_items(&self) -> Vec<InboxItem> {
+        self.inbox_order
+            .iter()
+            .filter_map(|id| self.durable_inbox.get(id).cloned())
+            .collect()
+    }
+
+    /// Accept one host-persisted inbox item. The durable row is removed before in-memory state changes
+    /// or an ACK/vaccine is emitted. A failed delete leaves the item available for redelivery.
+    pub fn accept_inbox(&mut self, id: &BundleId) -> Result<bool> {
+        let Some(item) = self.durable_inbox.get(id).cloned() else {
+            return Ok(false);
+        };
+        self.store
+            .apply_kv_batch(&[KvMutation::Remove {
+                key: Self::inbox_kv_key(id),
+            }])
+            .map_err(|e| Error::Other(format!("inbox acceptance persistence failed: {e}")))?;
+        self.durable_inbox.remove(id);
+        if let Some(charge) = self.durable_inbox_charges.remove(id) {
+            self.release_app_queue(charge);
+        }
+        self.inbox_order.retain(|queued| queued != id);
+        self.inbox.retain(|bundle| bundle.id() != *id);
+        self.emit_inbox_ack(&item.acknowledgement);
+        Ok(true)
     }
 
     /// Opaque bytes to ship over the bearer, paired with their connection.
@@ -3981,10 +7138,13 @@ impl<S: Store> Node<S> {
                         PeerSent {
                             adverts: est.sent_adverts,
                             bundles: est.sent_bundles,
+                            last_seen_ms: self.now_ms,
                         },
                     );
+                    self.prune_peer_sent();
                 }
                 self.priv_ingest.remove(&link); // F-07: drop the rate-limit counter for a dead link
+                self.advert_ingest.remove(&link);
             }
             BearerEvent::Data(link, bytes) => self.on_data(link, bytes),
         }
@@ -4036,7 +7196,7 @@ impl<S: Store> Node<S> {
     }
 
     fn on_data(&mut self, link: LinkId, bytes: Vec<u8>) {
-        let Ok(packet) = postcard::from_bytes::<LinkPacket>(&bytes) else {
+        let Some(packet) = decode_link_packet(&bytes) else {
             return;
         };
         match packet {
@@ -4172,8 +7332,13 @@ impl<S: Store> Node<S> {
             return;
         };
         let peer = est.peer;
+        if advert_record_exceeds_limit(&plaintext) {
+            return;
+        }
         match postcard::from_bytes::<Wire>(&plaintext) {
-            Ok(Wire::Bundle(b)) => self.on_bundle(link, b),
+            Ok(Wire::Bundle(b)) => {
+                self.on_bundle(link, b);
+            }
             Ok(Wire::Advert(a)) => self.on_advert(link, peer, a),
             Ok(Wire::Have(hs)) => self.on_have(link, hs),
             Err(_) => {}
@@ -4193,6 +7358,13 @@ impl<S: Store> Node<S> {
             let Ok(piece) = est.session.decrypt(ct) else {
                 return;
             };
+            // A valid advert is at most 8 KiB and therefore never needs record fragmentation. Reject
+            // its discriminant on the first fragment before accumulating a large attacker record.
+            if piece.is_empty() || (idx == 0 && piece.first() == Some(&1)) {
+                est.frag_buf.clear();
+                est.frag_next = 0;
+                return;
+            }
             if usize::from(cnt) > MAX_RECORD_FRAGMENTS
                 || piece.len() > MAX_RECORD_PLAINTEXT
                 || est.frag_buf.len().saturating_add(piece.len()) > MAX_REASSEMBLED_RECORD
@@ -4220,8 +7392,13 @@ impl<S: Store> Node<S> {
             }
         };
         if let Some((plaintext, peer)) = ready {
+            if advert_record_exceeds_limit(&plaintext) {
+                return;
+            }
             match postcard::from_bytes::<Wire>(&plaintext) {
-                Ok(Wire::Bundle(b)) => self.on_bundle(link, b),
+                Ok(Wire::Bundle(b)) => {
+                    self.on_bundle(link, b);
+                }
                 Ok(Wire::Advert(a)) => self.on_advert(link, peer, a),
                 Ok(Wire::Have(hs)) => self.on_have(link, hs),
                 Err(_) => {}
@@ -4249,9 +7426,19 @@ impl<S: Store> Node<S> {
     }
 
     fn on_bundle(&mut self, from_link: LinkId, bundle: Bundle) {
+        let _ = self.process_bundle(from_link, bundle);
+    }
+
+    fn process_bundle(&mut self, from_link: LinkId, mut bundle: Bundle) -> bool {
         if bundle.verify().is_err() {
-            return; // never store/relay unverifiable bundles
+            return false; // never store/relay unverifiable bundles
         }
+        if bundle.is_private() {
+            // Provenance is mutable envelope metadata and is never valid on the untraceable path.
+            // Clear injected values without rejecting an otherwise valid private bundle.
+            bundle.env.trace.clear();
+        }
+        let _ = self.expire_hps_subscribe_pending();
         // F-07: throttle a flood of unsigned private bundles from a single link before it can
         // touch the store, dedup table, or flood path. Signed (attributable) traffic is exempt.
         //
@@ -4264,9 +7451,15 @@ impl<S: Store> Node<S> {
         let rate_limited =
             bundle.is_private() || matches!(bundle.inner.dst, Destination::Vaccine(_));
         if rate_limited && !self.allow_private_ingest(from_link) {
-            return;
+            return false;
         }
         let id = bundle.id();
+        if self.pending_app_deliveries.contains_key(&id) {
+            // Local app work is admitted but not accepted yet. A duplicate neither grows the queue
+            // nor receives an ACK before the host or higher-level holding gate accepts the first copy.
+            return false;
+        }
+        let mut locally_accepted = false;
 
         // A broadcast is processed by everyone and relayed by everyone, then falls through to
         // the store+offer flood below — we never short-circuit, since halting the flood at the
@@ -4277,19 +7470,37 @@ impl<S: Store> Node<S> {
                 // cheap DH+hash) — so a flooded duplicate can re-ACK if our first ACK was
                 // lost. deliver_private delivers/handles the inner payload only once.
                 if self.recognizes(&bundle) {
-                    self.deliver_private(&bundle, &id);
+                    if !self.deliver_private(&bundle, &id) {
+                        return false;
+                    }
+                    locally_accepted = true;
                 }
-            } else if !self.store.seen(&id) {
-                self.process_broadcast(&bundle); // an hps:// publish (§32)
+            } else if !self.store.seen(&id) && !self.process_broadcast(&bundle) {
+                return false;
             }
         }
 
         if is_for(&bundle, &self.address()) {
+            if let Some(seen) = self.receiver_seen.get(&id).cloned() {
+                // A staged item is not accepted yet, so duplicates stay silent. Once the inbox row
+                // is gone, the durable seen metadata permits the existing throttled re-ACK behavior.
+                if !self.durable_inbox.contains_key(&id) {
+                    self.emit_inbox_ack(&seen.acknowledgement);
+                }
+                return true;
+            }
             if self.store.seen(&id) {
                 // A duplicate of something we already delivered. If it wanted an ACK, our
                 // ACK may have been lost — re-emit it (throttled) so the sender can stop
                 // retransmitting. Never re-deliver to the inbox.
-                if !bundle.inner.flags.is_ack && bundle.inner.flags.request_ack {
+                let is_user_content = matches!(
+                    bundle.open(&self.identity),
+                    Ok(Payload::PeerMessage { .. })
+                        | Ok(Payload::SessionInit { .. })
+                        | Ok(Payload::SessionMessage { .. })
+                );
+                if !is_user_content && !bundle.inner.flags.is_ack && bundle.inner.flags.request_ack
+                {
                     let due = match self.last_ack.get(&id) {
                         Some(&t) => self.now_ms.saturating_sub(t) >= REACK_MIN_INTERVAL_MS,
                         None => true,
@@ -4298,7 +7509,7 @@ impl<S: Store> Node<S> {
                         self.emit_ack(&bundle);
                     }
                 }
-                return;
+                return true;
             }
             if bundle.inner.flags.is_ack {
                 // An ACK for one of our sent bundles: stop tracking & carrying it,
@@ -4328,55 +7539,135 @@ impl<S: Store> Node<S> {
                     // and is honored. The only thing this gives up vs blind honoring is a re-ack or an
                     // ack for a store-evicted bundle (store.get None -> no match): delivered is not
                     // (re-)set and retransmit continues until lifetime, which is safe and self-correcting.
+                    let carrier_progress = self.carrier_owner.get(&for_bundle_id).copied();
+                    let completed_unacked_carrier = carrier_progress.filter(|original_id| {
+                        self.outgoing_carriers
+                            .get(original_id)
+                            .is_some_and(|carrier| {
+                                !carrier.original.inner.flags.request_ack
+                                    && carrier.chunks.iter().all(|chunk| {
+                                        *chunk == for_bundle_id || !self.store.contains(chunk)
+                                    })
+                            })
+                    });
+                    let authorized_bundle = self.store.get(&for_bundle_id).or_else(|| {
+                        self.outgoing_carriers
+                            .get(&for_bundle_id)
+                            .map(|carrier| carrier.original.clone())
+                    });
                     let authorized = !bundle.is_private()
                         && matches!(
-                            self.store.get(&for_bundle_id).filter(|b| !b.is_private()).map(|b| b.inner.dst),
+                            authorized_bundle
+                                .filter(|original| !original.is_private())
+                                .map(|original| original.inner.dst),
                             Some(Destination::Device(d)) if d == bundle.inner.src
                         );
                     if authorized {
-                        self.pending.remove(&for_bundle_id);
-                        self.store.remove(&for_bundle_id);
-                        // Mark the UI-facing message delivered (resolve carrier/deferral aliases).
-                        let display = self.display_id(&for_bundle_id);
-                        if let Some(info) = self.tx.get_mut(&display) {
-                            info.delivered = true;
-                            info.delivered_hops = delivery_hops;
-                            info.delivered_ms = delivery_ms;
-                        }
-                        // Our message reached its destination: learn the route (§27).
-                        if let Some((s, d, _)) = self.forwarded.remove(&for_bundle_id) {
-                            self.routes.learn(&s, &d, self.now_ms);
+                        if carrier_progress.is_some() {
+                            let mut removals = vec![KvMutation::RemoveBundle { id: for_bundle_id }];
+                            if let Some(original_id) = completed_unacked_carrier {
+                                removals.push(KvMutation::Remove {
+                                    key: Self::outgoing_carrier_key(&original_id),
+                                });
+                            }
+                            if self.store.apply_kv_batch(&removals).is_err() {
+                                return false;
+                            }
+                            self.pending.remove(&for_bundle_id);
+                            self.carrier_owner.remove(&for_bundle_id);
+                            self.forwarded.remove(&for_bundle_id);
+                            if let Some(original_id) = completed_unacked_carrier {
+                                self.outgoing_carriers.remove(&original_id);
+                            }
+                        } else {
+                            if let Some(carrier) =
+                                self.outgoing_carriers.get(&for_bundle_id).cloned()
+                            {
+                                let mut removals = vec![KvMutation::Remove {
+                                    key: Self::outgoing_carrier_key(&for_bundle_id),
+                                }];
+                                removals.extend(
+                                    carrier
+                                        .chunks
+                                        .iter()
+                                        .copied()
+                                        .map(|id| KvMutation::RemoveBundle { id }),
+                                );
+                                if self.store.apply_kv_batch(&removals).is_err() {
+                                    return false;
+                                }
+                                for chunk in &carrier.chunks {
+                                    self.pending.remove(chunk);
+                                    self.carrier_owner.remove(chunk);
+                                    self.forwarded.remove(chunk);
+                                }
+                                self.outgoing_carriers.remove(&for_bundle_id);
+                            } else {
+                                self.store.remove(&for_bundle_id);
+                            }
+                            self.pending.remove(&for_bundle_id);
+                            // Carrier ACKs are transfer progress only. Only this original-bundle ACK
+                            // reaches the transaction row and marks the user message Delivered.
+                            let display = self.display_id(&for_bundle_id);
+                            if let Some(info) = self.tx.get_mut(&display) {
+                                info.delivered = true;
+                                info.delivered_hops = delivery_hops;
+                                info.delivered_ms = delivery_ms;
+                            }
+                            // Our message reached its destination: learn the route (§27).
+                            if let Some((s, d, _)) = self.forwarded.remove(&for_bundle_id) {
+                                self.routes.learn(&s, &d, self.now_ms);
+                            }
                         }
                     }
                 }
             } else {
-                // Route by payload: HTTP req/resp go to their own queues; peer/session
-                // messages stay raw for read_message (sessions need stateful decrypt).
+                let mut ack_after_processing = true;
+                // Route by payload. User content decrypts and commits its durable inbox state here;
+                // every other addressed protocol payload keeps its existing immediate processing.
                 match bundle.open(&self.identity) {
+                    Ok(payload @ Payload::PeerMessage { .. })
+                    | Ok(payload @ Payload::SessionInit { .. })
+                    | Ok(payload @ Payload::SessionMessage { .. }) => {
+                        if !self.app_payload_policy.supports(AppQueueKind::PeerInbox) {
+                            return false;
+                        }
+                        if self
+                            .stage_inbound_message(&bundle, bundle.inner.src, payload, true, false)
+                            .is_err()
+                        {
+                            return false;
+                        }
+                        ack_after_processing = false;
+                    }
                     Ok(Payload::HttpResponse {
                         status,
                         headers,
                         body,
                         for_bundle_id,
                     }) => {
-                        // r11-01: only a response to a request WE sent may purge/surface. A forged
-                        // response naming an id we never sent (e.g. a real private message's cleartext
-                        // id) is ignored, so it cannot purge + immune-poison that message at a relay.
-                        if self.is_our_outstanding_send(&for_bundle_id) {
-                            // The response answers our request → drop the request bundle so it
-                            // stops being held/re-offered, and vaccinate any in-flight copies.
-                            self.pending.remove(&for_bundle_id);
-                            self.store.remove(&for_bundle_id);
-                            self.relay_order.retain(|x| *x != for_bundle_id);
-                            self.immune.insert(for_bundle_id, self.now_ms);
-                            self.tx.remove(&for_bundle_id);
-                            self.http_responses.push(HttpRespItem {
+                        if self
+                            .unanchored_outstanding_requests
+                            .contains(&for_bundle_id)
+                        {
+                            return false;
+                        }
+                        // The request id, authenticated signer, and response kind must all match before
+                        // any request, store, immunity, UI, or response-queue state is changed.
+                        if self.response_authorized(
+                            &for_bundle_id,
+                            &bundle.inner.src,
+                            RequestKind::Http,
+                        ) {
+                            let item = HttpRespItem {
                                 from: bundle.inner.src,
+                                id,
                                 for_id: for_bundle_id,
                                 status,
                                 headers,
                                 body,
-                            });
+                            };
+                            return self.commit_http_response(&bundle, item).is_ok();
                         }
                     }
                     // A hops:// request sealed to us (we're a hop-endpoint, §30): surface
@@ -4389,7 +7680,7 @@ impl<S: Store> Node<S> {
                         body,
                         max_resp_bytes,
                     }) => {
-                        self.http_requests.push(HttpReqItem {
+                        let item = HttpReqItem {
                             from: bundle.inner.src,
                             id,
                             host,
@@ -4398,31 +7689,45 @@ impl<S: Store> Node<S> {
                             headers,
                             body,
                             max_resp: max_resp_bytes,
-                        });
+                        };
+                        if !self.admit_app_delivery(
+                            AppQueueKind::HttpRequest,
+                            &bundle,
+                            Self::http_request_bytes(&item),
+                        ) {
+                            return false;
+                        }
+                        self.http_requests.push(item);
+                        return false;
                     }
                     Ok(Payload::ServiceResponse {
                         for_bundle_id,
                         status,
                         body,
                     }) => {
+                        if self
+                            .unanchored_outstanding_requests
+                            .contains(&for_bundle_id)
+                        {
+                            return false;
+                        }
                         // A response is the return-path "delete" for our request: service
                         // calls carry no ACK-vaccine of their own, so without this the
                         // request bundle would sit pinned in our store forever. Drop it
                         // everywhere and vaccinate so any in-flight copy is dropped too.
-                        // r11-01: only for a request WE sent, so a forged response cannot purge +
-                        // immune-poison an arbitrary (e.g. private) bundle at a relay.
-                        if self.is_our_outstanding_send(&for_bundle_id) {
-                            self.pending.remove(&for_bundle_id);
-                            self.store.remove(&for_bundle_id);
-                            self.relay_order.retain(|x| *x != for_bundle_id);
-                            self.immune.insert(for_bundle_id, self.now_ms);
-                            self.tx.remove(&for_bundle_id);
-                            self.service_responses.push(ServiceRespItem {
+                        if self.response_authorized(
+                            &for_bundle_id,
+                            &bundle.inner.src,
+                            RequestKind::Service,
+                        ) {
+                            let item = ServiceRespItem {
                                 from: bundle.inner.src,
+                                id,
                                 for_id: for_bundle_id,
                                 status,
                                 body,
-                            });
+                            };
+                            return self.commit_service_response(&bundle, item).is_ok();
                         }
                     }
                     Ok(Payload::ServiceRequest {
@@ -4443,26 +7748,46 @@ impl<S: Store> Node<S> {
                             // legitimately-old spooled stamp), then surface it. Fire-and-forget (no
                             // response); a malformed or oversized batch is dropped rather than trusted.
                             if let Some(batch) = TelemetryBatch::from_bytes(&args) {
+                                if !self.app_payload_policy.supports(AppQueueKind::Telemetry) {
+                                    return false;
+                                }
                                 let tenant = bundle
                                     .env
                                     .access
                                     .as_deref()
-                                    .and_then(|s| self.access_policy.attribute(s, &id));
+                                    .and_then(|stamp| self.access_policy.attribute(stamp, &id));
+                                let Some(charge) = self.reserve_app_queue(
+                                    AppQueueKind::Telemetry,
+                                    Some(from),
+                                    args.len().saturating_add(40),
+                                ) else {
+                                    return false;
+                                };
                                 self.telemetry_in.push(TelemetryIn {
                                     from,
                                     batch,
                                     tenant,
                                 });
+                                self.telemetry_charges.push(charge);
                             }
                         } else {
                             // Custom service: hand to the embedding app to fulfill.
-                            self.service_requests.push(ServiceReqItem {
+                            let item = ServiceReqItem {
                                 from,
                                 id,
                                 service,
                                 method,
                                 args,
-                            });
+                            };
+                            if !self.admit_app_delivery(
+                                AppQueueKind::ServiceRequest,
+                                &bundle,
+                                Self::service_request_bytes(&item),
+                            ) {
+                                return false;
+                            }
+                            self.service_requests.push(item);
+                            return false;
                         }
                     }
                     // A join request for a topic we host (§32). Verify app+proof, then branch on
@@ -4497,7 +7822,18 @@ impl<S: Store> Node<S> {
                                 .iter()
                                 .any(|i| i.path == path && i.host == host)
                             {
+                                if !self.app_payload_policy.supports(AppQueueKind::HpsInvite) {
+                                    return false;
+                                }
+                                let Some(charge) = self.reserve_app_queue(
+                                    AppQueueKind::HpsInvite,
+                                    Some(host),
+                                    path.len().saturating_add(64),
+                                ) else {
+                                    return false;
+                                };
                                 self.hps_invites_in.push(HpsInviteItem { path, host, kind });
+                                self.hps_invite_charges.push(charge);
                                 self.persist_invites();
                             }
                         }
@@ -4517,29 +7853,47 @@ impl<S: Store> Node<S> {
                     Ok(Payload::HpsLeave { path, proof }) => {
                         if self.hps_authorized(&bundle, &path, &proof) {
                             let who = bundle.inner.src;
-                            if let Some(m) = self.hps_members.get_mut(&path) {
-                                m.remove(&who);
-                            }
-                            if let Some(r) = self.hps_reach.get_mut(&path) {
-                                r.remove(&who);
+                            if self
+                                .hps_members
+                                .get(&path)
+                                .is_some_and(|members| members.contains(&who))
+                                && self.hps_rekey(&path, None, &[who]).is_ok()
+                            {
+                                if let Some(r) = self.hps_reach.get_mut(&path) {
+                                    r.remove(&who);
+                                }
                             }
                         }
                     }
                     // Member → host: reach ack — tally unique acking addresses (§32).
                     Ok(Payload::HpsReachAck {
                         topic_tag,
-                        epoch: _,
+                        epoch,
+                        mac,
                     }) => {
-                        // Map the opaque tag back to a path we host.
                         let who = bundle.inner.src;
-                        let path = self
+                        // Map the opaque tag back to a path we host, then require this exact
+                        // generation and a MAC under its current content key before mutating reach.
+                        let topic = self
                             .services
-                            .keys()
-                            .find(|p| self.app.topic_tag(p) == topic_tag)
-                            .cloned();
-                        if let Some(path) = path {
-                            self.hps_reach.entry(path.clone()).or_default().insert(who);
-                            self.record_member(&path, who);
+                            .iter()
+                            .find(|(path, _)| self.app.topic_tag(path) == topic_tag)
+                            .map(|(path, cfg)| (path.clone(), cfg.epoch, cfg.content_key));
+                        if let Some((path, current_epoch, content_key)) = topic {
+                            let authorized = bundle.inner.app == self.app.id
+                                && epoch == current_epoch
+                                && hps::verify_reach_ack_mac(
+                                    &content_key,
+                                    &self.app.id,
+                                    &who,
+                                    &topic_tag,
+                                    epoch,
+                                    &mac,
+                                );
+                            if authorized {
+                                self.hps_reach.entry(path.clone()).or_default().insert(who);
+                                self.record_member(&path, who);
+                            }
                         }
                     }
                     // Host → us: rotate to a new key generation (revocation, §32).
@@ -4551,36 +7905,43 @@ impl<S: Store> Node<S> {
                         service_pubkey,
                         proof,
                     }) => {
-                        if self.hps_authorized(&bundle, &old_path, &proof) {
-                            if let Some(old) = self.subscriptions.get(&old_path) {
-                                if epoch > old.epoch {
-                                    let host = old.host;
-                                    // F-18d: fail-safe ordering. Install the NEW subscription
-                                    // BEFORE tearing down the OLD one's bookkeeping (subscriptions
-                                    // map, directory, persisted kv), not after. `guard_core`
-                                    // (services) catches a panic per call, but only around the
-                                    // WHOLE `on_bundle`, not between these two steps. Removing
-                                    // old-then-installing-new meant a panic landing between them
-                                    // (e.g. a future change to `install_subscription`'s
-                                    // dependencies) would silently DESTROY a working subscription
-                                    // with nothing installed to replace it: a network-triggerable
-                                    // denial of a hosted topic that never self-heals. Installing
-                                    // first means the same hypothetical panic leaves us holding
-                                    // BOTH the old and new subscription, a harmless stale
-                                    // duplicate, never a lost one. See
-                                    // `hps_rekey_install_before_remove_survives_a_mid_arm_panic`.
-                                    self.install_subscription(
-                                        &new_path,
-                                        host,
-                                        content_key,
-                                        service_pubkey,
-                                        epoch,
-                                    );
+                        if let Some(old) = self.subscriptions.get(&old_path).cloned() {
+                            let collision = old_path != new_path
+                                && (self.subscriptions.contains_key(&new_path)
+                                    || self.services.contains_key(&new_path)
+                                    || self.hps_subscribe_pending.contains_key(&new_path));
+                            if self.hps_authorized(&bundle, &old_path, &proof)
+                                && bundle.inner.src == old.host
+                                && epoch > old.epoch
+                                && !collision
+                            {
+                                let host = old.host;
+                                let replacement = HpsSubscription {
+                                    content_key,
+                                    service_pubkey,
+                                    host,
+                                    epoch,
+                                    topic_tag: self.app.topic_tag(&new_path),
+                                };
+                                let mut mutations = vec![KvMutation::Put {
+                                    key: Self::hps_sub_key(&new_path),
+                                    value: match postcard::to_allocvec(&replacement) {
+                                        Ok(value) => value,
+                                        Err(_) => return false,
+                                    },
+                                }];
+                                if old_path != new_path {
+                                    mutations.push(KvMutation::Remove {
+                                        key: Self::hps_sub_key(&old_path),
+                                    });
+                                }
+                                if self.store.apply_kv_batch(&mutations).is_ok() {
                                     if old_path != new_path {
                                         self.subscriptions.remove(&old_path);
                                         self.directory.unsubscribe(&old_path);
-                                        self.store.remove_kv(&Self::hps_sub_key(&old_path));
                                     }
+                                    self.directory.subscribe(new_path.clone());
+                                    self.subscriptions.insert(new_path, replacement);
                                 }
                             }
                         }
@@ -4594,7 +7955,46 @@ impl<S: Store> Node<S> {
                         epoch,
                     }) => {
                         let host = bundle.inner.src;
-                        self.install_subscription(&path, host, content_key, service_pubkey, epoch);
+                        let expected = self.hps_subscribe_pending.get(&path).copied();
+                        if expected.is_some()
+                            && self.unanchored_hps_subscribe_pending.contains(&path)
+                        {
+                            return false;
+                        }
+                        if bundle.inner.app == self.app.id
+                            && !self.subscriptions.contains_key(&path)
+                            && expected.is_some_and(|pending| {
+                                !self.unanchored_hps_subscribe_pending.contains(&path)
+                                    && pending.host == host
+                                    && pending.expires_at_ms > self.now_ms
+                            })
+                        {
+                            let subscription = HpsSubscription {
+                                content_key,
+                                service_pubkey,
+                                host,
+                                epoch,
+                                topic_tag: self.app.topic_tag(&path),
+                            };
+                            let Ok(value) = postcard::to_allocvec(&subscription) else {
+                                return false;
+                            };
+                            let mutations = [
+                                KvMutation::Put {
+                                    key: Self::hps_sub_key(&path),
+                                    value,
+                                },
+                                KvMutation::Remove {
+                                    key: Self::hps_subscribe_pending_key(&path),
+                                },
+                            ];
+                            if self.store.apply_kv_batch(&mutations).is_ok() {
+                                self.directory.subscribe(path.clone());
+                                self.subscriptions.insert(path.clone(), subscription);
+                                self.hps_subscribe_pending.remove(&path);
+                                self.unanchored_hps_subscribe_pending.remove(&path);
+                            }
+                        }
                     }
                     // A transport carrier chunk: reassemble (§20); once complete, reconstruct
                     // the original bundle and process it as if it had arrived whole.
@@ -4606,27 +8006,46 @@ impl<S: Store> Node<S> {
                         fin,
                     }) => {
                         let from = bundle.inner.src;
-                        if let Some(inner_bytes) =
-                            self.accept_stream_chunk(from, stream_id, seq, bytes, fin)
-                        {
-                            if let Ok(inner) = Bundle::from_bytes(&inner_bytes) {
-                                self.on_bundle(from_link, inner);
+                        match self.accept_stream_chunk(from, stream_id, seq, bytes, fin) {
+                            StreamChunkAcceptance::Retained => {}
+                            StreamChunkAcceptance::Complete(inner_bytes) => {
+                                if !self.process_reconstructed_bundle(from_link, from, &inner_bytes)
+                                    || !self.finalize_incoming_stream(&from, &stream_id)
+                                {
+                                    return false;
+                                }
+                            }
+                            StreamChunkAcceptance::Rejected => {
+                                // The chunk was not durably retained. Do not mark it seen or ACK it;
+                                // sender retransmission is the recovery path after pressure clears.
+                                return false;
                             }
                         }
                     }
                     // A peer says our ratchet desynced: drop our session and re-establish so
                     // a fresh handshake re-syncs it (DESIGN.md §25). Not surfaced to the app.
                     Ok(Payload::SessionReset) => self.handle_session_reset(bundle.inner.src),
-                    _ => self.inbox.push(bundle.clone()),
+                    _ => {
+                        let item_bytes = bundle
+                            .to_bytes()
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX);
+                        if !self.admit_app_delivery(AppQueueKind::GenericInbox, &bundle, item_bytes)
+                        {
+                            return false;
+                        }
+                        self.inbox.push(bundle.clone());
+                        return false;
+                    }
                 }
-                if bundle.inner.flags.request_ack {
+                if ack_after_processing && bundle.inner.flags.request_ack {
                     self.emit_ack(&bundle);
                 }
             }
             // Mark seen (dedup) but don't hold — we never relay what's addressed to us.
-            self.store.put(bundle, self.now_ms);
+            let stored = self.store.put(bundle, self.now_ms);
             self.store.remove(&id);
-            return;
+            return stored || self.store.seen(&id);
         }
 
         // A passing ACK vaccinates us: the bundle it acknowledges is delivered, so
@@ -4722,7 +8141,7 @@ impl<S: Store> Node<S> {
                 _ => {}
             }
         } else if self.immune.contains_key(&id) {
-            return; // already delivered elsewhere — don't re-store or re-flood it
+            return true; // already delivered elsewhere — don't re-store or re-flood it
         }
 
         // core-protocol-r3-02: a delivery vaccine may have raced ahead of this private bundle and
@@ -4734,7 +8153,10 @@ impl<S: Store> Node<S> {
         // once per unique bundle id at first store, not a hot path.
         if bundle.is_private() && self.already_vaccinated_by_token(&bundle) {
             self.immune.insert(id, self.now_ms);
-            return;
+            return true;
+        }
+        if self.max_relayed == 0 {
+            return locally_accepted;
         }
         // Not ours: store for onward relay, then offer to every other live link.
         //
@@ -4771,7 +8193,7 @@ impl<S: Store> Node<S> {
                 Admit::Granted(tenant) => tenant,
                 Admit::Refused => {
                     self.access_refused = self.access_refused.saturating_add(1);
-                    return;
+                    return false;
                 }
             }
         };
@@ -4825,6 +8247,7 @@ impl<S: Store> Node<S> {
             // F-09: offer just the bundle we accepted to the other links, not the whole store.
             self.offer_bundle_to_all_except(id, from_link);
         }
+        stored
     }
 
     /// Keep relayed (not-ours) bundles within `max_relayed`. Custody policy (DESIGN.md §6):
@@ -4846,6 +8269,15 @@ impl<S: Store> Node<S> {
             self.relay_order.remove(idx);
             self.store.remove(&id);
             self.relay_fwd.remove(&id);
+            self.forwarded.remove(&id);
+            for state in self.links.values_mut() {
+                if let LinkState::Up(established) = state {
+                    established.sent_bundles.remove(&id);
+                }
+            }
+            for sent in self.peer_sent.values_mut() {
+                sent.bundles.remove(&id);
+            }
         }
     }
 
@@ -4888,50 +8320,71 @@ impl<S: Store> Node<S> {
 
     /// Emit an ACK bundle back to the origin of `orig`, sealed to its address.
     fn emit_ack(&mut self, orig: &Bundle) {
-        // The ACK should survive as long as the message it confirms (so the sender keeps
-        // hearing it while it's still retransmitting over a long hop), capped, and ride a
-        // notch above bulk traffic so confirmations aren't stuck behind big transfers.
-        let lifetime = orig.inner.lifetime_ms.min(MAX_ACK_LIFETIME_MS);
-        let ack = Bundle::create(
-            &self.identity,
-            Destination::AckTo(orig.inner.src, orig.id()),
-            &orig.inner.src,
-            &Payload::Ack {
-                for_bundle_id: orig.id(),
-                status: 0,
-                delivery_hops: orig.env.hops,
-                delivery_ms: forward_ms(self.now_ms, orig.inner.created_at),
-                // Traced ACK: identity-signed, so the Ed25519 signature authenticates WHO acked. It
-                // does not by itself prove they are the destination, so the receiver additionally
-                // AUTHORIZES the acker against the acked bundle's plaintext Device(dst) before honoring
-                // it (core-protocol-r7-01); no CDH proof rides here (that hardens the unsigned
-                // private-ACK path, core-protocol-r2-04).
-                proof: None,
-            },
-            BundleOpts {
-                created_at: self.now_ms,
-                lifetime_ms: lifetime,
-                priority: orig.inner.priority.saturating_add(1),
-                flags: BundleFlags {
-                    is_ack: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        if let Ok(ack) = ack {
-            // Track this ACK for replication (ride to N peers, then stop) and remember we
-            // just acked this message (re-ACK throttle on duplicates).
-            self.ack_replicate.entry(ack.id()).or_default();
-            self.last_ack.insert(orig.id(), self.now_ms);
-            self.submit(ack);
+        let acknowledgement = self.inbox_acknowledgement(orig, orig.inner.src, false);
+        self.emit_inbox_ack(&acknowledgement);
+    }
+
+    fn allow_advert_ingest(&mut self, link: LinkId) -> bool {
+        let now = self.now_ms;
+        if now.saturating_sub(self.advert_ingest_global.0) >= ADVERT_VERIFY_WINDOW_MS {
+            self.advert_ingest_global = (now, 0);
+        }
+        let per_link = self.advert_ingest.entry(link).or_insert((now, 0));
+        if now.saturating_sub(per_link.0) >= ADVERT_VERIFY_WINDOW_MS {
+            *per_link = (now, 0);
+        }
+        if per_link.1 >= MAX_ADVERTS_PER_LINK_WINDOW
+            || self.advert_ingest_global.1 >= MAX_ADVERTS_GLOBAL_WINDOW
+        {
+            return false;
+        }
+        per_link.1 += 1;
+        self.advert_ingest_global.1 += 1;
+        true
+    }
+
+    fn forget_evicted_adverts(&mut self) {
+        let evicted = self.directory.take_evicted();
+        if evicted.is_empty() {
+            return;
+        }
+        for id in evicted {
+            for state in self.links.values_mut() {
+                if let LinkState::Up(established) = state {
+                    established.sent_adverts.remove(&id);
+                }
+            }
+            for sent in self.peer_sent.values_mut() {
+                sent.adverts.remove(&id);
+            }
+        }
+    }
+
+    fn prune_peer_sent(&mut self) {
+        let now = self.now_ms;
+        self.peer_sent.retain(|_, sent| {
+            sent.adverts.retain(|id| self.directory.contains(id));
+            sent.bundles.retain(|id| self.store.contains(id));
+            now.saturating_sub(sent.last_seen_ms) < PEER_SENT_TTL_MS
+        });
+        while self.peer_sent.len() > MAX_PEER_SENT {
+            let victim = self
+                .peer_sent
+                .iter()
+                .min_by_key(|(_, sent)| sent.last_seen_ms)
+                .map(|(peer, _)| *peer);
+            let Some(victim) = victim else { break };
+            self.peer_sent.remove(&victim);
         }
     }
 
     fn on_advert(&mut self, from_link: LinkId, peer: PubKeyBytes, advert: Advert) {
         let _ = peer; // reserved for finer-grained relay scoring (DESIGN.md §18)
-                      // Service adverts flood the directory (subscribed → full retention, else the
-                      // bounded relay cache). Re-gossip only when newly accepted.
+        if !self.allow_advert_ingest(from_link) {
+            return;
+        }
+        // Service adverts flood the directory (subscribed → full retention, else the
+        // bounded relay cache). Re-gossip only when newly accepted.
         let is_prekey = matches!(advert.body.kind, AdvertKind::PreKey { .. });
         // §39 P4: a signed receiver-beacon lays/refreshes a gradient toward its mailbox via the
         // link we heard it on. Read its fields (and the publisher) before `ingest` consumes it.
@@ -4946,7 +8399,9 @@ impl<S: Store> Node<S> {
             )),
             _ => None,
         };
-        if self.directory.ingest(advert, self.now_ms).unwrap_or(false) {
+        let accepted = self.directory.ingest(advert, self.now_ms).unwrap_or(false);
+        self.forget_evicted_adverts();
+        if accepted {
             self.offer_adverts_to_all();
             // A newly-learned prekey may unblock content we were holding to ratchet (§25).
             if is_prekey {
@@ -5403,6 +8858,40 @@ impl<S: Store> Node<S> {
     }
 }
 
+fn decode_link_packet(bytes: &[u8]) -> Option<LinkPacket> {
+    if bytes.len() > MAX_LINK_PACKET_BYTES {
+        return None;
+    }
+    let packet = postcard::from_bytes::<LinkPacket>(bytes).ok()?;
+    let valid = match &packet {
+        LinkPacket::Handshake(message) => message.len() <= MAX_HANDSHAKE_MESSAGE_BYTES,
+        LinkPacket::Data(ciphertext) => ciphertext.len() <= MAX_RECORD_PLAINTEXT + 16,
+        LinkPacket::DataFrag { idx, cnt, ct } => {
+            *cnt > 0
+                && usize::from(*cnt) <= MAX_RECORD_FRAGMENTS
+                && *idx < *cnt
+                && ct.len() <= MAX_RECORD_PLAINTEXT + 16
+        }
+    };
+    valid.then_some(packet)
+}
+
+/// Feature-scoped parser entry point for cargo-fuzz. Production receives the same checks through
+/// [`Node::on_data`], while the private packet enum remains outside the public protocol API.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_link_packet(bytes: &[u8]) {
+    if let Some(packet) = decode_link_packet(bytes) {
+        match packet {
+            LinkPacket::Handshake(message) | LinkPacket::Data(message) => {
+                std::hint::black_box(message.len());
+            }
+            LinkPacket::DataFrag { idx, cnt, ct } => {
+                std::hint::black_box((idx, cnt, ct.len()));
+            }
+        }
+    }
+}
+
 impl<S: Store> Node<S> {
     /// Is the bundle's destination one of our currently-connected, authenticated
     /// peers? If so we can deliver directly and need not spray copies to relays.
@@ -5445,6 +8934,9 @@ fn parse_stream_key(key: &str) -> Option<(PubKeyBytes, StreamId, u64)> {
     let from = parts.next()?;
     let sid = parts.next()?;
     let seq = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
     let from = <PubKeyBytes>::try_from(bs58::decode(from).into_vec().ok()?.as_slice()).ok()?;
     let sid = <StreamId>::try_from(bs58::decode(sid).into_vec().ok()?.as_slice()).ok()?;
     Some((from, sid, seq.parse().ok()?))
@@ -5479,6 +8971,23 @@ mod tests {
     use super::*;
     use crate::bundle::{BundleOpts, Destination, Payload};
     use crate::discover::AdvertKind;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn malformed_link_packet_bytes_never_panic(
+            bytes in prop::collection::vec(any::<u8>(), 0..(MAX_LINK_PACKET_BYTES + 64))
+        ) {
+            let parsed = std::panic::catch_unwind(|| decode_link_packet(&bytes));
+            prop_assert!(parsed.is_ok(), "link packet parser panicked");
+            if let Some(packet) = parsed.unwrap() {
+                let canonical = postcard::to_allocvec(&packet).expect("decoded packet re-encodes");
+                prop_assert_eq!(decode_link_packet(&canonical), Some(packet));
+            }
+        }
+    }
 
     // --- F-03: rehydrate counts (does not silently drop) undecodable persisted state --------
     #[test]
@@ -5553,6 +9062,21 @@ mod tests {
         }
     }
 
+    fn accept_all<S: Store>(node: &mut Node<S>) {
+        let ids: Vec<BundleId> = node.inbox_items().into_iter().map(|item| item.id).collect();
+        for id in ids {
+            assert!(node.accept_inbox(&id).unwrap());
+        }
+    }
+
+    fn take_hps_and_accept<S: Store>(node: &mut Node<S>) -> Vec<HpsMessage> {
+        let messages = node.take_hps_messages();
+        for message in &messages {
+            assert!(node.accept_hps_message(&message.id).unwrap());
+        }
+        messages
+    }
+
     fn msg(from: &Node, to: &Node, body: &[u8]) -> Bundle {
         Bundle::create(
             &from.identity,
@@ -5563,6 +9087,61 @@ mod tests {
                 body: body.to_vec(),
             },
             BundleOpts::default(),
+        )
+        .unwrap()
+    }
+
+    fn custom_service_request<S: Store>(
+        from: &Identity,
+        to: &Node<S>,
+        sequence: u8,
+        request_ack: bool,
+    ) -> Bundle {
+        Bundle::create(
+            from,
+            Destination::Device(to.address()),
+            &to.address(),
+            &Payload::ServiceRequest {
+                service: "app.queue".into(),
+                method: "run".into(),
+                args: vec![sequence],
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    request_ack,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn carrier<S: Store>(
+        from: &Identity,
+        to: &Node<S>,
+        stream_id: StreamId,
+        seq: u64,
+        bytes: Vec<u8>,
+        fin: bool,
+    ) -> Bundle {
+        Bundle::create(
+            from,
+            Destination::Device(to.address()),
+            &to.address(),
+            &Payload::Carrier {
+                stream_id,
+                seq,
+                bytes,
+                fin,
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         )
         .unwrap()
     }
@@ -5579,7 +9158,7 @@ mod tests {
     /// Inject `who`'s (epoch-0) prekey straight into `node`'s directory via a genuine signed PreKey
     /// advert — the same thing gossip would deliver, but without wiring a live link. Lets a test send a
     /// §39 private message to an OFFLINE recipient (the sender only needs the recipient's published SPK).
-    fn inject_prekey(node: &mut Node, who: &Identity) {
+    fn inject_prekey<S: Store>(node: &mut Node<S>, who: &Identity) {
         let spk = who.derive_prekey();
         let advert = Advert::publish(
             who,
@@ -5593,6 +9172,638 @@ mod tests {
         )
         .unwrap();
         node.directory.ingest(advert, node.now_ms).unwrap();
+    }
+
+    /// Pair pump for tests whose nodes use different Store implementations.
+    fn pump_pair<A: Store, B: Store>(
+        a: &mut Node<A>,
+        a_link: LinkId,
+        b: &mut Node<B>,
+        b_link: LinkId,
+    ) {
+        for _ in 0..1000 {
+            let mut any = false;
+            for (link, bytes) in a.drain_outgoing() {
+                any = true;
+                if link == a_link {
+                    b.handle(BearerEvent::Data(b_link, bytes));
+                }
+            }
+            for (link, bytes) in b.drain_outgoing() {
+                any = true;
+                if link == b_link {
+                    a.handle(BearerEvent::Data(a_link, bytes));
+                }
+            }
+            if !any {
+                break;
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FaultStore {
+        inner: MemoryStore,
+        fail_bundle_puts: usize,
+        fail_bundle_removes: usize,
+        evict_bundle_puts: usize,
+        bundle_put_calls: usize,
+        bundle_remove_calls: usize,
+        fail_critical_put_prefix: Option<String>,
+        fail_critical_remove_prefix: Option<String>,
+        fail_batch_after: Option<usize>,
+        enforce_firestore_carrier_limits: bool,
+        fail_carrier_cleanup_at: Option<usize>,
+        carrier_cleanup_batches: Vec<(usize, usize)>,
+        carrier_page_calls: std::cell::RefCell<Vec<(Option<String>, usize, usize)>>,
+    }
+
+    impl Store for FaultStore {
+        fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+            self.bundle_put_calls += 1;
+            if self.fail_bundle_puts > 0 {
+                self.fail_bundle_puts -= 1;
+                return false;
+            }
+            if self.evict_bundle_puts > 0 {
+                self.evict_bundle_puts -= 1;
+                return true;
+            }
+            self.inner.put(bundle, now_ms)
+        }
+        fn rehydrate(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+            self.inner.rehydrate(bundle, now_ms)
+        }
+        fn get(&self, id: &BundleId) -> Option<Bundle> {
+            self.inner.get(id)
+        }
+        fn remove(&mut self, id: &BundleId) -> Option<Bundle> {
+            self.bundle_remove_calls += 1;
+            if self.fail_bundle_removes > 0 {
+                self.fail_bundle_removes -= 1;
+                return None;
+            }
+            self.inner.remove(id)
+        }
+        fn seen(&self, id: &BundleId) -> bool {
+            self.inner.seen(id)
+        }
+        fn contains(&self, id: &BundleId) -> bool {
+            self.inner.contains(id)
+        }
+        fn have(&self) -> crate::store::HaveSet {
+            self.inner.have()
+        }
+        fn prune(&mut self, now_ms: u64) {
+            self.inner.prune(now_ms)
+        }
+        fn split_copies(&mut self, id: &BundleId) -> u16 {
+            self.inner.split_copies(id)
+        }
+        fn set_copies(&mut self, id: &BundleId, copies: u16) {
+            self.inner.set_copies(id, copies)
+        }
+        fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
+            self.inner.seen_expiry(id)
+        }
+        fn put_kv(&mut self, key: &str, value: Vec<u8>) {
+            self.inner.put_kv(key, value)
+        }
+        fn apply_kv_batch(&mut self, mutations: &[KvMutation]) -> std::result::Result<(), String> {
+            let carrier_cleanup = !mutations.is_empty()
+                && mutations.iter().all(
+                    |mutation| matches!(mutation, KvMutation::Remove { key } if key.starts_with("strm/")),
+                );
+            if carrier_cleanup && self.enforce_firestore_carrier_limits {
+                let encoded_bytes =
+                    mutations
+                        .iter()
+                        .fold(0usize, |total, mutation| match mutation {
+                            KvMutation::Remove { key } => total.saturating_add(key.len() + 8),
+                            _ => total,
+                        });
+                if mutations.len() >= 400 || encoded_bytes >= 512 * 1024 {
+                    return Err("modeled Firestore critical-batch limit exceeded".into());
+                }
+                let attempt = self.carrier_cleanup_batches.len();
+                self.carrier_cleanup_batches
+                    .push((mutations.len(), encoded_bytes));
+                if self.fail_carrier_cleanup_at == Some(attempt) {
+                    self.fail_carrier_cleanup_at = None;
+                    return Err("injected Firestore carrier cleanup failure".into());
+                }
+            }
+            for (index, mutation) in mutations.iter().enumerate() {
+                if self
+                    .fail_batch_after
+                    .is_some_and(|boundary| index >= boundary)
+                {
+                    return Err(format!("injected batch failure at mutation {index}"));
+                }
+                match mutation {
+                    KvMutation::Put { key, .. }
+                        if self
+                            .fail_critical_put_prefix
+                            .as_ref()
+                            .is_some_and(|prefix| key.starts_with(prefix)) =>
+                    {
+                        return Err(format!("injected critical put failure for {key}"));
+                    }
+                    KvMutation::Remove { key }
+                        if self
+                            .fail_critical_remove_prefix
+                            .as_ref()
+                            .is_some_and(|prefix| key.starts_with(prefix)) =>
+                    {
+                        return Err(format!("injected critical remove failure for {key}"));
+                    }
+                    KvMutation::PutBundle { .. } if self.fail_bundle_puts > 0 => {
+                        self.fail_bundle_puts -= 1;
+                        return Err("injected critical bundle put failure".into());
+                    }
+                    KvMutation::RemoveBundle { .. } if self.fail_bundle_removes > 0 => {
+                        self.fail_bundle_removes -= 1;
+                        return Err("injected critical bundle remove failure".into());
+                    }
+                    _ => {}
+                }
+            }
+            self.inner.apply_kv_batch(mutations)
+        }
+        fn put_kv_critical(
+            &mut self,
+            key: &str,
+            value: Vec<u8>,
+        ) -> std::result::Result<(), String> {
+            if self
+                .fail_critical_put_prefix
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(format!("injected critical put failure for {key}"));
+            }
+            self.inner.put_kv_critical(key, value)
+        }
+        fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
+            self.inner.get_kv(key)
+        }
+        fn remove_kv(&mut self, key: &str) {
+            self.inner.remove_kv(key)
+        }
+        fn remove_kv_critical(&mut self, key: &str) -> std::result::Result<(), String> {
+            if self
+                .fail_critical_remove_prefix
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(format!("injected critical remove failure for {key}"));
+            }
+            self.inner.remove_kv_critical(key)
+        }
+        fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+            self.inner.list_kv(prefix)
+        }
+        fn list_kv_page(
+            &self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Vec<(String, Vec<u8>)> {
+            self.inner.list_kv_page(prefix, after, limit)
+        }
+        fn list_kv_page_bounded(
+            &self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+            max_bytes: usize,
+        ) -> std::result::Result<crate::store::KvPage, String> {
+            if prefix.starts_with("strm/") {
+                self.carrier_page_calls.borrow_mut().push((
+                    after.map(str::to_string),
+                    limit,
+                    max_bytes,
+                ));
+            }
+            self.inner
+                .list_kv_page_bounded(prefix, after, limit, max_bytes)
+        }
+    }
+
+    fn established_fault_pair() -> (Node<FaultStore>, Node, LinkId, LinkId) {
+        let mut alice = Node::with_store(Identity::generate(), FaultStore::default());
+        let mut bob = Node::new(Identity::generate());
+        let (alice_link, bob_link) = (91, 92);
+        alice.handle(BearerEvent::Connected(alice_link, Role::Initiator));
+        bob.handle(BearerEvent::Connected(bob_link, Role::Responder));
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+        alice.publish_prekey().unwrap();
+        bob.publish_prekey().unwrap();
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+
+        alice
+            .send_message_traced(bob.address(), "t".into(), b"establish".to_vec(), false)
+            .unwrap();
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+        for bundle in bob.take_inbox() {
+            let id = bundle.id();
+            bob.read_message(&bundle).unwrap();
+            bob.accept_inbox(&id).unwrap();
+        }
+        bob.send_message_traced(alice.address(), "t".into(), b"confirm".to_vec(), false)
+            .unwrap();
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+        for bundle in alice.take_inbox() {
+            let id = bundle.id();
+            alice.read_message(&bundle).unwrap();
+            alice.accept_inbox(&id).unwrap();
+        }
+        alice.clear_queue();
+        bob.clear_queue();
+        assert!(alice.drain_outgoing().is_empty());
+        assert!(bob.drain_outgoing().is_empty());
+        assert!(alice.has_session(&bob.address()));
+        assert!(bob.has_session(&alice.address()));
+        (alice, bob, alice_link, bob_link)
+    }
+
+    fn ratchet_message(bundle: &Bundle, recipient: &Identity) -> crate::session::RatchetMessage {
+        match bundle.open(recipient).unwrap() {
+            Payload::SessionInit { msg, .. } | Payload::SessionMessage { msg } => msg,
+            _ => panic!("expected ratcheted payload"),
+        }
+    }
+
+    #[test]
+    fn undecryptable_session_message_is_neither_receiver_seen_nor_acked() {
+        let (mut alice, mut bob, alice_link, bob_link) = established_fault_pair();
+        let alice_addr = alice.address();
+        let before = postcard::to_allocvec(&alice.sessions[&bob.address()]).unwrap();
+        let genuine_id = bob
+            .send_message_traced(alice_addr, "t".into(), b"tamper".to_vec(), true)
+            .unwrap();
+        let genuine = bob.store.get(&genuine_id).unwrap();
+        let mut payload = genuine.open(&alice.identity).unwrap();
+        match &mut payload {
+            Payload::SessionInit { msg, .. } | Payload::SessionMessage { msg } => {
+                msg.ciphertext[0] ^= 0x80;
+            }
+            _ => panic!("expected ratcheted payload"),
+        }
+        let bad = Bundle::create(
+            &bob.identity,
+            Destination::Device(alice_addr),
+            &alice_addr,
+            &payload,
+            BundleOpts {
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let bad_id = bad.id();
+        alice.ingest(bad);
+
+        assert!(alice.inbox_items().is_empty());
+        assert!(!alice.receiver_seen.contains_key(&bad_id));
+        assert!(!alice.store.seen(&bad_id));
+        assert_eq!(
+            postcard::to_allocvec(&alice.sessions[&bob.address()]).unwrap(),
+            before,
+            "failed authentication leaves the previous receive ratchet usable"
+        );
+        assert!(!alice.last_ack.contains_key(&bad_id));
+        assert!(alice.store.have().ids.into_iter().all(|id| {
+            alice.store.get(&id).is_none_or(|held| {
+                !held.inner.flags.is_ack && !matches!(held.inner.dst, Destination::Vaccine(_))
+            })
+        }));
+
+        // The genuine next message still decrypts with the untouched session.
+        bob.send_message_traced(alice_addr, "t".into(), b"still usable".to_vec(), false)
+            .unwrap();
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+        assert!(alice
+            .inbox_items()
+            .iter()
+            .any(|item| item.body == b"still usable"));
+    }
+
+    #[test]
+    fn inbox_batch_failure_advances_neither_session_seen_nor_ack() {
+        let (mut alice, mut bob, alice_link, bob_link) = established_fault_pair();
+        let peer = bob.address();
+        let before_live = postcard::to_allocvec(&alice.sessions[&peer]).unwrap();
+        let session_key = Node::<FaultStore>::session_kv_key(&peer);
+        let before_durable = alice.store.get_kv(&session_key).unwrap();
+        alice.store.fail_critical_put_prefix = Some("inbox/".into());
+
+        let id = bob
+            .send_message_traced(alice.address(), "t".into(), b"retry me".to_vec(), true)
+            .unwrap();
+        let bundle = bob.store.get(&id).unwrap();
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+
+        assert!(alice.inbox_items().is_empty());
+        assert!(!alice.receiver_seen.contains_key(&id));
+        assert!(!alice.store.seen(&id));
+        assert_eq!(
+            postcard::to_allocvec(&alice.sessions[&peer]).unwrap(),
+            before_live
+        );
+        assert_eq!(alice.store.get_kv(&session_key), Some(before_durable));
+        assert!(alice.drain_outgoing().is_empty());
+
+        alice.store.fail_critical_put_prefix = None;
+        alice.ingest(bundle);
+        let staged = alice.inbox_items();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].id, id);
+        assert_eq!(staged[0].body, b"retry me");
+    }
+
+    #[test]
+    fn private_inbox_persistence_failure_emits_neither_ack_nor_vaccine() {
+        let (mut alice, mut bob, alice_link, bob_link) = established_fault_pair();
+        alice.store.fail_critical_put_prefix = Some("inbox/".into());
+        let id = bob
+            .send_message(alice.address(), "t".into(), b"private".to_vec(), true)
+            .unwrap();
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+
+        assert!(alice.inbox_items().is_empty());
+        assert!(!alice.receiver_seen.contains_key(&id));
+        assert!(!alice.store.seen(&id));
+        assert!(
+            alice.drain_outgoing().is_empty(),
+            "failed private staging emits neither private ACK nor vaccine"
+        );
+    }
+
+    #[test]
+    fn staged_inbox_survives_restart_and_next_message_uses_persisted_ratchet() {
+        let (mut alice, mut bob, alice_link, bob_link) = established_fault_pair();
+        let secret = alice.identity_secret();
+        let first_id = bob
+            .send_message_traced(
+                alice.address(),
+                "t".into(),
+                b"before restart".to_vec(),
+                true,
+            )
+            .unwrap();
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+        assert_eq!(alice.inbox_items()[0].id, first_id);
+
+        let mut restarted = Node::with_store(
+            Identity::from_secret_bytes(&secret),
+            FaultStore {
+                inner: alice.store.inner.clone(),
+                ..Default::default()
+            },
+        );
+        let restored = restarted.inbox_items();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, first_id);
+        assert_eq!(restored[0].body, b"before restart");
+
+        let second_id = bob
+            .send_message_traced(
+                restarted.address(),
+                "t".into(),
+                b"after restart".to_vec(),
+                false,
+            )
+            .unwrap();
+        let second = bob.store.get(&second_id).unwrap();
+        restarted.ingest(second);
+        assert!(restarted
+            .inbox_items()
+            .iter()
+            .any(|item| item.id == second_id && item.body == b"after restart"));
+    }
+
+    #[test]
+    fn inbox_repeats_until_durable_acceptance_then_stops() {
+        let (mut alice, mut bob, alice_link, bob_link) = established_fault_pair();
+        let id = bob
+            .send_message_traced(alice.address(), "t".into(), b"persist first".to_vec(), true)
+            .unwrap();
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+
+        assert_eq!(alice.inbox_items()[0].id, id);
+        assert_eq!(alice.inbox_items()[0].id, id, "polling is non-destructive");
+        alice.store.fail_critical_remove_prefix = Some("inbox/".into());
+        assert!(alice.accept_inbox(&id).is_err());
+        assert_eq!(alice.inbox_items()[0].id, id);
+        assert!(alice.drain_outgoing().is_empty());
+
+        alice.store.fail_critical_remove_prefix = None;
+        assert!(alice.accept_inbox(&id).unwrap());
+        assert!(alice.inbox_items().is_empty());
+        assert!(!alice.drain_outgoing().is_empty());
+
+        let restarted = Node::with_store(
+            Identity::from_secret_bytes(&alice.identity_secret()),
+            FaultStore {
+                inner: alice.store.inner.clone(),
+                ..Default::default()
+            },
+        );
+        assert!(restarted.inbox_items().is_empty());
+    }
+
+    #[test]
+    fn failed_session_write_preserves_live_state_and_emits_nothing() {
+        let (mut alice, bob, _, _) = established_fault_pair();
+        let peer = bob.address();
+        let key = Node::<FaultStore>::session_kv_key(&peer);
+        let old_live = postcard::to_allocvec(&alice.sessions[&peer]).unwrap();
+        let old_durable = alice.store.get_kv(&key).unwrap();
+        let old_have = alice.store.have().ids.len();
+        let old_tx = alice.tx.len();
+        alice.store.fail_critical_put_prefix = Some("session/".into());
+
+        let result = alice.send_message_traced(peer, "t".into(), b"must fail".to_vec(), false);
+
+        assert!(result.is_err());
+        assert_eq!(
+            postcard::to_allocvec(&alice.sessions[&peer]).unwrap(),
+            old_live,
+            "the live ratchet must not advance when its durable write fails"
+        );
+        assert_eq!(alice.store.get_kv(&key).unwrap(), old_durable);
+        assert_eq!(alice.store.have().ids.len(), old_have);
+        assert_eq!(alice.tx.len(), old_tx, "no delivery state was created");
+        assert!(
+            alice.drain_outgoing().is_empty(),
+            "no ciphertext was offered"
+        );
+    }
+
+    #[test]
+    fn failed_initial_session_write_does_not_establish_or_emit() {
+        let mut alice = Node::with_store(Identity::generate(), FaultStore::default());
+        let bob = Identity::generate();
+        inject_prekey(&mut alice, &bob);
+        alice.store.fail_critical_put_prefix = Some("session/".into());
+
+        let result =
+            alice.send_message_traced(bob.address(), "t".into(), b"first message".to_vec(), false);
+
+        assert!(result.is_err());
+        assert!(!alice.has_session(&bob.address()));
+        assert!(alice.store.list_kv("session/").is_empty());
+        assert!(alice.store.have().ids.is_empty());
+        assert!(alice.tx.is_empty());
+        assert!(alice.drain_outgoing().is_empty());
+    }
+
+    #[test]
+    fn failed_deferred_queue_write_is_not_reported_as_a_send() {
+        let mut alice = Node::with_store(Identity::generate(), FaultStore::default());
+        alice.store.fail_critical_put_prefix = Some("pending_content".into());
+
+        let result = alice.send_message_traced(
+            Identity::generate().address(),
+            "t".into(),
+            b"must remain unaccepted".to_vec(),
+            false,
+        );
+
+        assert!(result.is_err());
+        assert!(alice.pending_content.is_empty());
+        assert!(alice.store.get_kv("pending_content").is_none());
+        assert!(alice.tx.is_empty());
+    }
+
+    #[test]
+    fn restart_after_successful_send_never_reuses_a_message_key() {
+        let (mut alice, mut bob, _, _) = established_fault_pair();
+        let bob_addr = bob.address();
+        let alice_secret = alice.identity_secret();
+
+        let first_id = alice
+            .send_message_traced(bob_addr, "t".into(), b"before restart".to_vec(), false)
+            .unwrap();
+        let first_bundle = alice.store.get(&first_id).unwrap();
+        let first_ratchet = ratchet_message(&first_bundle, &bob.identity);
+        let first = bob
+            .read_message(&first_bundle)
+            .unwrap()
+            .expect("first message decrypts");
+        assert_eq!(first.body, b"before restart");
+
+        let persisted = alice.store.inner.clone();
+        let mut restarted = Node::with_store(
+            Identity::from_secret_bytes(&alice_secret),
+            FaultStore {
+                inner: persisted,
+                ..Default::default()
+            },
+        );
+        let second_id = restarted
+            .send_message_traced(bob_addr, "t".into(), b"after restart".to_vec(), false)
+            .unwrap();
+        let second_bundle = restarted.store.get(&second_id).unwrap();
+        let second_ratchet = ratchet_message(&second_bundle, &bob.identity);
+
+        assert_ne!(
+            (first_ratchet.header.dh, first_ratchet.header.n),
+            (second_ratchet.header.dh, second_ratchet.header.n),
+            "a restart must resume after the durably committed send key"
+        );
+        assert_ne!(first_ratchet.ciphertext, second_ratchet.ciphertext);
+        let second = bob
+            .read_message(&second_bundle)
+            .unwrap()
+            .expect("post-restart message decrypts");
+        assert_eq!(second.body, b"after restart");
+    }
+
+    #[test]
+    fn deferred_flush_session_write_failure_retains_the_queue() {
+        let mut alice = Node::with_store(Identity::generate(), FaultStore::default());
+        let bob = Identity::generate();
+        let handle = alice
+            .send_message_traced(bob.address(), "t".into(), b"queued".to_vec(), false)
+            .unwrap();
+        assert_eq!(alice.pending_content.len(), 1);
+        inject_prekey(&mut alice, &bob);
+        alice.store.fail_critical_put_prefix = Some("session/".into());
+
+        alice.flush_pending_content();
+
+        assert_eq!(alice.pending_content.len(), 1);
+        assert_eq!(alice.pending_content[0].display_id, handle);
+        let durable: Vec<PendingContent> =
+            postcard::from_bytes(&alice.store.get_kv("pending_content").unwrap()).unwrap();
+        assert_eq!(durable.len(), 1, "the durable deferred queue is unchanged");
+        assert!(alice.store.have().ids.is_empty());
+        assert!(alice.drain_outgoing().is_empty());
+    }
+
+    #[test]
+    fn failed_session_delete_preserves_reset_and_idle_gc_state() {
+        let (mut alice, bob, _, _) = established_fault_pair();
+        let peer = bob.address();
+        let key = Node::<FaultStore>::session_kv_key(&peer);
+        let durable = alice.store.get_kv(&key).unwrap();
+        alice.store.fail_critical_remove_prefix = Some("session/".into());
+
+        alice.handle_session_reset(peer);
+        assert!(alice.has_session(&peer));
+        assert_eq!(alice.store.get_kv(&key), Some(durable.clone()));
+        assert!(alice.drain_outgoing().is_empty());
+
+        alice.tick(1);
+        alice.tick(SESSION_MAX_IDLE_MS + 2);
+        assert!(
+            alice.has_session(&peer),
+            "idle GC keeps live state on delete failure"
+        );
+        assert_eq!(alice.store.get_kv(&key), Some(durable));
+    }
+
+    #[test]
+    fn bundle_store_failure_rolls_back_ratchet_and_emits_nothing() {
+        let (mut alice, mut bob, alice_link, bob_link) = established_fault_pair();
+        let peer = bob.address();
+        let key = Node::<FaultStore>::session_kv_key(&peer);
+        let old_session = alice.store.get_kv(&key).unwrap();
+        let old_live = postcard::to_allocvec(&alice.sessions[&peer]).unwrap();
+        let old_have = alice.store.have().ids.len();
+        let old_tx = alice.tx.len();
+        alice.store.fail_bundle_puts = 1;
+
+        let failed = alice.send_message(peer, "t".into(), b"not emitted".to_vec(), false);
+        assert!(failed.is_err());
+        assert_eq!(
+            alice.store.get_kv(&key).unwrap(),
+            old_session,
+            "the durable ratchet and custody record are one failed transaction"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&alice.sessions[&peer]).unwrap(),
+            old_live
+        );
+        assert_eq!(alice.store.have().ids.len(), old_have);
+        assert_eq!(alice.tx.len(), old_tx);
+        assert!(alice.drain_outgoing().is_empty());
+
+        alice
+            .send_message(peer, "t".into(), b"after failure".to_vec(), false)
+            .unwrap();
+        pump_pair(&mut alice, alice_link, &mut bob, bob_link);
+        let delivered = bob
+            .take_inbox()
+            .iter()
+            .find_map(|bundle| bob.read_message(bundle).ok().flatten())
+            .expect("the next send decrypts from the unchanged ratchet state");
+        assert_eq!(delivered.body, b"after failure");
     }
 
     /// Build a §39 private delivery-ACK sealed to `to` for `for_bundle_id`, carrying `proof`
@@ -5758,6 +9969,7 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         nodes[1].set_name(Some("Bob's Phone".into()));
+        nodes[0].set_time(1);
 
         nodes[0]
             .send_service_request(
@@ -5792,6 +10004,7 @@ mod tests {
         ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].set_time(1);
 
         nodes[0]
             .send_service_request(
@@ -5958,6 +10171,7 @@ mod tests {
         ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].set_time(1);
 
         let req_id = nodes[0]
             .send_service_request(
@@ -5994,6 +10208,635 @@ mod tests {
     }
 
     #[test]
+    fn app_queue_limits_cover_every_queue_and_release_exact_accounting() {
+        let mut node = Node::new(Identity::generate());
+        let source = [7u8; 32];
+        let kinds = [
+            AppQueueKind::PeerInbox,
+            AppQueueKind::GenericInbox,
+            AppQueueKind::HttpRequest,
+            AppQueueKind::HttpResponse,
+            AppQueueKind::ServiceRequest,
+            AppQueueKind::ServiceResponse,
+            AppQueueKind::HnsLookup,
+            AppQueueKind::HnsResult,
+            AppQueueKind::HpsMessage,
+            AppQueueKind::HpsInvite,
+            AppQueueKind::Telemetry,
+        ];
+        node.set_app_queue_limits(AppQueueLimits {
+            max_items_per_queue: 1,
+            max_bytes_per_queue: 8,
+            max_total_items: APP_QUEUE_KINDS,
+            max_total_bytes: APP_QUEUE_KINDS * 8,
+            max_item_bytes: 8,
+            max_sender_items: APP_QUEUE_KINDS,
+            max_sender_bytes: APP_QUEUE_KINDS * 8,
+        });
+        for kind in kinds {
+            let charge = node
+                .reserve_app_queue(kind, Some(source), 8)
+                .expect("first item in every queue is admitted");
+            assert!(
+                node.reserve_app_queue(kind, Some([8u8; 32]), 1).is_none(),
+                "each queue enforces its own count cap"
+            );
+            node.release_app_queue(charge);
+        }
+        assert_eq!(node.app_queue_usage.items, 0);
+        assert_eq!(node.app_queue_usage.bytes, 0);
+        assert!(node.app_queue_usage.senders.is_empty());
+
+        node.set_app_queue_limits(AppQueueLimits {
+            max_items_per_queue: 2,
+            max_bytes_per_queue: 8,
+            max_total_items: 3,
+            max_total_bytes: 10,
+            max_item_bytes: 8,
+            max_sender_items: 1,
+            max_sender_bytes: 8,
+        });
+        assert!(
+            node.reserve_app_queue(AppQueueKind::HttpRequest, Some(source), 9)
+                .is_none(),
+            "one oversized item is rejected before accounting"
+        );
+        let first = node
+            .reserve_app_queue(AppQueueKind::HttpRequest, Some(source), 5)
+            .unwrap();
+        assert!(
+            node.reserve_app_queue(AppQueueKind::HttpRequest, Some([8u8; 32]), 4)
+                .is_none(),
+            "per-queue bytes are bounded"
+        );
+        assert!(
+            node.reserve_app_queue(AppQueueKind::ServiceRequest, Some(source), 1)
+                .is_none(),
+            "one source cannot consume another queue's share"
+        );
+        let second = node
+            .reserve_app_queue(AppQueueKind::ServiceRequest, Some([8u8; 32]), 5)
+            .unwrap();
+        assert!(
+            node.reserve_app_queue(AppQueueKind::HpsMessage, Some([9u8; 32]), 1)
+                .is_none(),
+            "the total byte cap applies across queue classes"
+        );
+        node.release_app_queue(first);
+        let third = node
+            .reserve_app_queue(AppQueueKind::HpsMessage, Some([9u8; 32]), 1)
+            .expect("released capacity is reusable by another source");
+        node.release_app_queue(second);
+        node.release_app_queue(third);
+        assert_eq!(node.app_queue_usage.items, 0);
+        assert_eq!(node.app_queue_usage.bytes, 0);
+        assert!(node.app_queue_usage.senders.is_empty());
+    }
+
+    #[test]
+    fn app_queue_rejection_does_not_ack_or_consume_dedup() {
+        let mut node = Node::new(Identity::generate());
+        node.set_app_queue_limits(AppQueueLimits {
+            max_items_per_queue: 3,
+            max_bytes_per_queue: 1 << 20,
+            max_total_items: 3,
+            max_total_bytes: 1 << 20,
+            max_item_bytes: 1 << 20,
+            max_sender_items: 1,
+            max_sender_bytes: 1 << 20,
+        });
+        let noisy = Identity::generate();
+        let other = Identity::generate();
+        let first = custom_service_request(&noisy, &node, 1, true);
+        let rejected = custom_service_request(&noisy, &node, 2, true);
+        let fair = custom_service_request(&other, &node, 3, true);
+        let first_id = first.id();
+        let rejected_id = rejected.id();
+        let fair_id = fair.id();
+
+        node.on_bundle(1, first.clone());
+        node.on_bundle(1, rejected.clone());
+        node.on_bundle(2, fair.clone());
+        node.on_bundle(1, first.clone());
+        assert_eq!(
+            node.service_requests.len(),
+            2,
+            "duplicates do not grow the queue"
+        );
+        assert_eq!(node.pending_app_deliveries.len(), 2);
+        for id in [first_id, rejected_id, fair_id] {
+            assert!(!node.store.seen(&id));
+            assert!(!node.last_ack.contains_key(&id));
+        }
+
+        let queued = node.take_service_requests_deferred();
+        assert_eq!(queued.len(), 2);
+        assert!(node.complete_app_delivery(&first_id));
+        assert!(node.store.seen(&first_id));
+        assert!(node.last_ack.contains_key(&first_id));
+        assert!(node.reject_app_delivery(&fair_id));
+        assert!(!node.store.seen(&fair_id));
+        assert!(!node.last_ack.contains_key(&fair_id));
+
+        node.on_bundle(2, fair);
+        node.on_bundle(1, rejected);
+        assert_eq!(
+            node.service_requests.len(),
+            2,
+            "rejected work retries after capacity is released"
+        );
+        assert!(node.pending_app_deliveries.contains_key(&fair_id));
+        assert!(node.pending_app_deliveries.contains_key(&rejected_id));
+        assert!(!node.store.seen(&fair_id));
+        assert!(!node.store.seen(&rejected_id));
+        assert!(!node.last_ack.contains_key(&fair_id));
+        assert!(!node.last_ack.contains_key(&rejected_id));
+    }
+
+    #[test]
+    fn app_delivery_completion_requires_retained_dedup_before_ack() {
+        let mut node = Node::with_store(Identity::generate(), FaultStore::default());
+        let sender = Identity::generate();
+        let request = custom_service_request(&sender, &node, 1, true);
+        let id = request.id();
+
+        node.on_bundle(1, request.clone());
+        assert!(node.pending_app_deliveries.contains_key(&id));
+        node.store.evict_bundle_puts = 1;
+        assert!(!node.complete_app_delivery(&id));
+        assert!(node.pending_app_deliveries.contains_key(&id));
+        assert!(!node.store.seen(&id));
+        assert!(!node.last_ack.contains_key(&id));
+
+        assert!(node.reject_app_delivery(&id));
+        node.on_bundle(1, request);
+        assert!(node.complete_app_delivery(&id));
+        assert!(node.store.seen(&id));
+        assert!(node.last_ack.contains_key(&id));
+    }
+
+    #[test]
+    fn infrastructure_roles_retain_only_their_host_payload_classes() {
+        let kinds = [
+            AppQueueKind::PeerInbox,
+            AppQueueKind::GenericInbox,
+            AppQueueKind::HttpRequest,
+            AppQueueKind::HttpResponse,
+            AppQueueKind::ServiceRequest,
+            AppQueueKind::ServiceResponse,
+            AppQueueKind::HnsLookup,
+            AppQueueKind::HnsResult,
+            AppQueueKind::HpsMessage,
+            AppQueueKind::HpsInvite,
+            AppQueueKind::Telemetry,
+        ];
+        for kind in kinds {
+            assert!(AppPayloadPolicy::for_kind(NodeKind::Device).supports(kind));
+            assert!(!AppPayloadPolicy::for_kind(NodeKind::Relay).supports(kind));
+            assert_eq!(
+                AppPayloadPolicy::for_kind(NodeKind::Gateway).supports(kind),
+                kind == AppQueueKind::HttpRequest
+            );
+            assert_eq!(
+                AppPayloadPolicy::for_kind(NodeKind::Endpoint).supports(kind),
+                matches!(kind, AppQueueKind::HttpRequest | AppQueueKind::HpsMessage)
+            );
+        }
+
+        let sender = Identity::generate();
+        let mut relay = Node::new(Identity::generate());
+        let queued_before_role = custom_service_request(&sender, &relay, 1, true);
+        relay.on_bundle(1, queued_before_role);
+        assert_eq!(relay.pending_app_deliveries.len(), 1);
+        relay.set_kind(NodeKind::Relay);
+        assert!(relay.pending_app_deliveries.is_empty());
+        assert!(relay.service_requests.is_empty());
+        assert_eq!(relay.app_queue_usage.items, 0);
+
+        let dropped = custom_service_request(&sender, &relay, 2, true);
+        let dropped_id = dropped.id();
+        relay.on_bundle(1, dropped);
+        assert!(relay.pending_app_deliveries.is_empty());
+        assert!(!relay.store.seen(&dropped_id));
+        assert!(!relay.last_ack.contains_key(&dropped_id));
+    }
+
+    #[test]
+    fn response_authorization_rejects_racing_wrong_signer_and_wrong_kind() {
+        let mut caller = Node::new(Identity::generate());
+        caller.set_time(1);
+        let expected = Identity::generate();
+        let attacker = Identity::generate();
+        let request_id = caller
+            .send_service_request(
+                expected.address(),
+                "app.echo".into(),
+                "say".into(),
+                b"hello".to_vec(),
+            )
+            .unwrap();
+
+        // A validly signed response from the wrong identity races first.
+        let wrong_signer = Bundle::create(
+            &attacker,
+            Destination::Device(caller.address()),
+            &caller.address(),
+            &Payload::ServiceResponse {
+                for_bundle_id: request_id,
+                status: 0,
+                body: b"attacker".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        caller.on_bundle(1, wrong_signer);
+
+        // The expected signer then races a response of the wrong protocol kind.
+        let wrong_kind = Bundle::create(
+            &expected,
+            Destination::Device(caller.address()),
+            &caller.address(),
+            &Payload::HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: b"not service".to_vec(),
+                for_bundle_id: request_id,
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        caller.on_bundle(2, wrong_kind);
+
+        assert!(caller.store.contains(&request_id));
+        assert!(caller.outstanding_requests.contains_key(&request_id));
+        assert!(!caller.immune.contains_key(&request_id));
+        assert!(caller.take_service_responses().is_empty());
+        assert!(caller.take_http_responses().is_empty());
+
+        // The genuine response still wins after both adversarial racers were rejected.
+        let genuine = Bundle::create(
+            &expected,
+            Destination::Device(caller.address()),
+            &caller.address(),
+            &Payload::ServiceResponse {
+                for_bundle_id: request_id,
+                status: 0,
+                body: b"genuine".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        caller.on_bundle(3, genuine);
+
+        let responses = caller.take_service_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].body, b"genuine");
+        assert!(!caller.store.contains(&request_id));
+        assert!(!caller.outstanding_requests.contains_key(&request_id));
+    }
+
+    #[test]
+    fn response_authorization_rehydrates_and_expires_with_the_request() {
+        let caller_secret = Identity::generate().to_secret_bytes();
+        let endpoint = Identity::generate();
+        let mut caller = Node::from_identity_secret(&caller_secret);
+        caller.set_time(10_000);
+        let request_id = caller
+            .send_hops_request(
+                endpoint.address(),
+                "example.com".into(),
+                "GET".into(),
+                "/".into(),
+                vec![],
+                vec![],
+                1024,
+            )
+            .unwrap();
+        let expiry = caller.outstanding_requests[&request_id].expires_at_ms;
+
+        let store = caller.clone_store();
+        let mut caller = Node::with_store(Identity::from_secret_bytes(&caller_secret), store);
+        assert_eq!(
+            caller.outstanding_requests[&request_id].responder,
+            endpoint.address(),
+            "the expected responder survives restart"
+        );
+        assert_eq!(
+            caller.outstanding_requests[&request_id].expires_at_ms, expiry,
+            "the original request expiry survives restart"
+        );
+        caller.tick(10_000);
+
+        let genuine = Bundle::create(
+            &endpoint,
+            Destination::Device(caller.address()),
+            &caller.address(),
+            &Payload::HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: b"after restart".to_vec(),
+                for_bundle_id: request_id,
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        caller.on_bundle(1, genuine);
+        let responses = caller.take_http_responses();
+        assert_eq!(responses.len(), 1);
+        assert!(caller.accept_http_response(&responses[0].id).unwrap());
+        assert!(!caller.outstanding_requests.contains_key(&request_id));
+
+        let expiring_id = caller
+            .send_hops_request(
+                endpoint.address(),
+                "example.com".into(),
+                "GET".into(),
+                "/late".into(),
+                vec![],
+                vec![],
+                1024,
+            )
+            .unwrap();
+        let expiring_at = caller.outstanding_requests[&expiring_id].expires_at_ms;
+        caller.tick(expiring_at);
+        assert!(!caller.outstanding_requests.contains_key(&expiring_id));
+        assert!(caller.store.get_kv("outstanding_requests").is_none());
+
+        let late = Bundle::create(
+            &endpoint,
+            Destination::Device(caller.address()),
+            &caller.address(),
+            &Payload::HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: b"too late".to_vec(),
+                for_bundle_id: expiring_id,
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        caller.on_bundle(2, late);
+        assert!(caller.take_http_responses().is_empty());
+    }
+
+    #[test]
+    fn response_bearing_requests_require_a_nonzero_clock_anchor() {
+        let endpoint = Identity::generate();
+        let mut caller = Node::new(Identity::generate());
+
+        assert!(caller
+            .send_service_request(
+                endpoint.address(),
+                "app.echo".into(),
+                "run".into(),
+                Vec::new(),
+            )
+            .is_err());
+        assert!(caller
+            .send_hops_request(
+                endpoint.address(),
+                "example.com".into(),
+                "GET".into(),
+                "/".into(),
+                Vec::new(),
+                Vec::new(),
+                1024,
+            )
+            .is_err());
+        assert!(caller.outstanding_requests.is_empty());
+        assert!(caller.store.have().ids.is_empty());
+        assert!(caller.drain_outgoing().is_empty());
+
+        caller.set_time(0);
+        assert!(caller
+            .send_service_request(
+                endpoint.address(),
+                "app.echo".into(),
+                "run".into(),
+                Vec::new(),
+            )
+            .is_err());
+        caller.set_time(1);
+        assert!(caller
+            .send_service_request(
+                endpoint.address(),
+                "app.echo".into(),
+                "run".into(),
+                Vec::new(),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn request_authorization_and_exact_custody_commit_atomically_before_send() {
+        let endpoint = Identity::generate();
+        let mut caller = Node::with_store(Identity::generate(), FaultStore::default());
+        caller.set_time(1);
+        caller.store.fail_critical_put_prefix = Some("outstanding_requests".into());
+        assert!(caller
+            .send_service_request(
+                endpoint.address(),
+                "app.echo".into(),
+                "run".into(),
+                b"one".to_vec(),
+            )
+            .is_err());
+        assert!(caller.outstanding_requests.is_empty());
+        assert!(caller.store.have().ids.is_empty());
+        assert!(caller.tx.is_empty());
+        assert!(caller.drain_outgoing().is_empty());
+
+        caller.store.fail_critical_put_prefix = None;
+        caller.store.fail_bundle_puts = 1;
+        assert!(caller
+            .send_hops_request(
+                endpoint.address(),
+                "example.com".into(),
+                "POST".into(),
+                "/".into(),
+                vec![],
+                b"two".to_vec(),
+                1024,
+            )
+            .is_err());
+        assert!(caller.outstanding_requests.is_empty());
+        assert!(caller.store.have().ids.is_empty());
+        assert!(caller.tx.is_empty());
+        assert!(caller.drain_outgoing().is_empty());
+    }
+
+    #[test]
+    fn response_commit_failure_keeps_authorization_then_restart_redelivers_until_accept() {
+        let caller_secret = Identity::generate().to_secret_bytes();
+        let endpoint = Identity::generate();
+        let mut caller = Node::with_store(
+            Identity::from_secret_bytes(&caller_secret),
+            FaultStore::default(),
+        );
+        caller.set_time(1);
+        let request_id = caller
+            .send_service_request(
+                endpoint.address(),
+                "app.echo".into(),
+                "run".into(),
+                Vec::new(),
+            )
+            .unwrap();
+        let response = Bundle::create(
+            &endpoint,
+            Destination::Device(caller.address()),
+            &caller.address(),
+            &Payload::ServiceResponse {
+                for_bundle_id: request_id,
+                status: 0,
+                body: b"durable".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+
+        caller.store.fail_critical_remove_prefix = Some("outstanding_requests".into());
+        caller.on_bundle(1, response.clone());
+        assert!(caller.outstanding_requests.contains_key(&request_id));
+        assert!(caller.store.contains(&request_id));
+        assert!(caller.take_service_responses().is_empty());
+        assert!(!caller.store.seen(&response.id()));
+
+        caller.store.fail_critical_remove_prefix = None;
+        caller.on_bundle(1, response);
+        let polled = caller.take_service_responses();
+        assert_eq!(polled.len(), 1);
+        assert_eq!(caller.take_service_responses()[0].id, polled[0].id);
+        assert!(!caller.outstanding_requests.contains_key(&request_id));
+
+        let mut restarted = Node::with_store(
+            Identity::from_secret_bytes(&caller_secret),
+            FaultStore {
+                inner: caller.store.inner.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(restarted.take_service_responses()[0].id, polled[0].id);
+        restarted.store.fail_critical_remove_prefix = Some("response/service/".into());
+        assert!(restarted.accept_service_response(&polled[0].id).is_err());
+        assert_eq!(restarted.take_service_responses().len(), 1);
+
+        let mut redelivered = Node::with_store(
+            Identity::from_secret_bytes(&caller_secret),
+            FaultStore {
+                inner: restarted.store.inner.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(redelivered.take_service_responses()[0].id, polled[0].id);
+        assert!(redelivered.accept_service_response(&polled[0].id).unwrap());
+        assert!(redelivered.take_service_responses().is_empty());
+    }
+
+    #[test]
+    fn restored_request_rejects_responses_before_clock_anchor_and_expires_stale_rows() {
+        let caller_secret = Identity::generate().to_secret_bytes();
+        let endpoint = Identity::generate();
+        let mut caller = Node::from_identity_secret(&caller_secret);
+        caller.set_time(1_000);
+        let request_id = caller
+            .send_service_request(
+                endpoint.address(),
+                "app.echo".into(),
+                "run".into(),
+                Vec::new(),
+            )
+            .unwrap();
+        let expiry = caller.outstanding_requests[&request_id].expires_at_ms;
+        let response = Bundle::create(
+            &endpoint,
+            Destination::Device(caller.address()),
+            &caller.address(),
+            &Payload::ServiceResponse {
+                for_bundle_id: request_id,
+                status: 0,
+                body: b"late".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let response_id = response.id();
+        let store = caller.clone_store();
+        let mut caller = Node::with_store(Identity::from_secret_bytes(&caller_secret), store);
+        caller.set_time(expiry + 1);
+        caller.on_bundle(1, response.clone());
+        assert!(caller.take_service_responses().is_empty());
+        assert!(!caller.store.seen(&response_id));
+        assert!(caller.outstanding_requests.contains_key(&request_id));
+
+        caller.tick(expiry + 1);
+        assert!(!caller.outstanding_requests.contains_key(&request_id));
+        caller.on_bundle(1, response);
+        assert!(caller.take_service_responses().is_empty());
+    }
+
+    #[test]
+    fn outstanding_requests_and_durable_responses_are_bounded_and_expire() {
+        let endpoint = Identity::generate();
+        let mut caller = Node::new(Identity::generate());
+        caller.set_time(1);
+        for index in 0..MAX_OUTSTANDING_REQUESTS {
+            caller
+                .send_service_request(
+                    endpoint.address(),
+                    "app.echo".into(),
+                    "run".into(),
+                    vec![index as u8],
+                )
+                .unwrap();
+        }
+        assert_eq!(caller.outstanding_requests.len(), MAX_OUTSTANDING_REQUESTS);
+        assert!(caller
+            .send_service_request(
+                endpoint.address(),
+                "app.echo".into(),
+                "overflow".into(),
+                Vec::new(),
+            )
+            .is_err());
+        caller.tick(1 + BundleOpts::default().lifetime_ms as u64);
+        assert!(caller.outstanding_requests.is_empty());
+        assert!(caller.store.have().ids.is_empty());
+
+        let request_id = caller
+            .send_service_request(
+                endpoint.address(),
+                "app.echo".into(),
+                "response".into(),
+                Vec::new(),
+            )
+            .unwrap();
+        let response = Bundle::create(
+            &endpoint,
+            Destination::Device(caller.address()),
+            &caller.address(),
+            &Payload::ServiceResponse {
+                for_bundle_id: request_id,
+                status: 0,
+                body: Vec::new(),
+            },
+            BundleOpts {
+                created_at: caller.now_ms,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        caller.on_bundle(1, response);
+        let response_id = caller.take_service_responses()[0].id;
+        caller.tick(caller.now_ms.saturating_add(DURABLE_HOST_DELIVERY_TTL_MS));
+        assert!(caller.take_service_responses().is_empty());
+        assert!(caller
+            .store
+            .get_kv(&Node::<MemoryStore>::service_response_key(&response_id))
+            .is_none());
+    }
+
+    #[test]
     fn hps_register_keyed_lets_a_preshared_group_talk_without_a_handshake() {
         // The general pre-shared-key primitive the endpoint cluster is built on: two nodes that
         // already agree on a content key can read + write a topic with no host and no join.
@@ -6011,7 +10854,7 @@ mod tests {
         nodes[0].hps_publish(path, b"hello group").unwrap();
         net.pump(&mut nodes);
 
-        let msgs = nodes[1].take_hps_messages();
+        let msgs = take_hps_and_accept(&mut nodes[1]);
         assert_eq!(msgs.len(), 1, "the peer received the keyed publish");
         assert_eq!(msgs[0].path, path);
         assert_eq!(msgs[0].body, b"hello group");
@@ -6042,8 +10885,10 @@ mod tests {
         let key = format!("session/{}", bs58::encode(a).into_string());
         assert!(nodes[1].store.get_kv(&key).is_some(), "session persisted");
 
-        // Idle past the GC horizon → the next tick prunes it (memory + store).
-        nodes[1].tick(SESSION_MAX_IDLE_MS + 1);
+        // A zero-time session anchors on the first real tick, then a later idle-horizon tick prunes
+        // it from memory and storage.
+        nodes[1].tick(1);
+        nodes[1].tick(SESSION_MAX_IDLE_MS + 2);
         assert!(!nodes[1].has_session(&a), "idle session GC'd from memory");
         assert!(
             nodes[1].store.get_kv(&key).is_none(),
@@ -6072,14 +10917,18 @@ mod tests {
             .unwrap();
         net.pump(&mut nodes);
         for b in nodes[1].take_inbox() {
+            let id = b.id();
             nodes[1].read_message(&b).unwrap();
+            nodes[1].accept_inbox(&id).unwrap();
         }
         nodes[1]
             .send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true)
             .unwrap();
         net.pump(&mut nodes);
         for b in nodes[0].take_inbox() {
+            let id = b.id();
             nodes[0].read_message(&b).unwrap();
+            nodes[0].accept_inbox(&id).unwrap();
         }
         assert!(
             nodes[0].has_session(&nodes[1].address()),
@@ -6204,14 +11053,18 @@ mod tests {
             .unwrap();
         net.pump(&mut nodes);
         for b in nodes[1].take_inbox() {
+            let id = b.id();
             nodes[1].read_message(&b).unwrap();
+            nodes[1].accept_inbox(&id).unwrap();
         }
         nodes[1]
             .send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true)
             .unwrap();
         net.pump(&mut nodes);
         for b in nodes[0].take_inbox() {
+            let id = b.id();
             nodes[0].read_message(&b).unwrap();
+            nodes[0].accept_inbox(&id).unwrap();
         }
 
         // Two messages from 0; deliver, then process them in reverse order.
@@ -6257,32 +11110,724 @@ mod tests {
         let mut r = Node::from_identity_secret(&secret);
         // First three chunks arrive in one wake (not the final one).
         for (i, c) in chunks.iter().take(3).enumerate() {
-            assert!(r
-                .accept_stream_chunk(from, sid, i as u64, c.clone(), false)
-                .is_none());
+            assert!(matches!(
+                r.accept_stream_chunk(from, sid, i as u64, c.clone(), false),
+                StreamChunkAcceptance::Retained
+            ));
         }
 
         // Beacon-mode kill + relaunch: rebuild from the persisted store. In-memory reassembly
         // is gone, but rehydrate re-feeds the persisted chunks.
         let store = r.clone_store();
         let mut r = Node::with_store(Identity::from_secret_bytes(&secret), store);
+        assert_eq!(r.incoming_stream_bytes, 300);
+        assert_eq!(r.incoming_sender_usage[&from].bytes, 300);
+        assert_eq!(r.incoming_streams[&(from, sid)].started_at, 0);
 
-        // Remaining chunks arrive on a later wake; the final one completes the message.
-        assert!(r
-            .accept_stream_chunk(from, sid, 3, chunks[3].clone(), false)
-            .is_none());
-        let done = r.accept_stream_chunk(from, sid, 4, chunks[4].clone(), true);
+        // A real epoch clock on the first post-restart tick anchors activity instead of
+        // immediately treating the restored stream as decades idle.
+        r.tick(1_700_000_000_000);
+        assert!(r.incoming_streams.contains_key(&(from, sid)));
         assert_eq!(
-            done.as_deref(),
-            Some(full.as_slice()),
-            "resumed and completed across restart"
+            r.incoming_streams[&(from, sid)].started_at,
+            1_700_000_000_000
         );
 
-        // Completion clears the persisted chunks.
+        // Remaining chunks arrive on a later wake; the final one completes the message.
+        assert!(matches!(
+            r.accept_stream_chunk(from, sid, 3, chunks[3].clone(), false),
+            StreamChunkAcceptance::Retained
+        ));
+        let done = r.accept_stream_chunk(from, sid, 4, chunks[4].clone(), true);
+        let StreamChunkAcceptance::Complete(done) = done else {
+            panic!("resumed stream did not complete");
+        };
+        assert_eq!(done, full, "resumed and completed across restart");
+
+        // Reconstruction alone retains custody. The downstream durable receive path finalizes it.
+        assert!(!r.clone_store().list_kv("strm/").is_empty());
+        assert!(r.finalize_incoming_stream(&from, &sid));
         assert!(
             r.clone_store().list_kv("strm/").is_empty(),
             "persisted chunks cleared"
         );
+        assert_eq!(r.incoming_stream_bytes, 0);
+        assert!(!r.incoming_sender_usage.contains_key(&from));
+    }
+
+    #[test]
+    fn hostile_carrier_shape_and_sequence_abort_the_stream() {
+        let mut node = Node::new(Identity::generate());
+        node.carrier_limits = CarrierLimits {
+            chunk_bytes: 4,
+            stream_bytes: 16,
+            stream_chunks: 4,
+            sender_streams: 2,
+            sender_bytes: 32,
+            global_streams: 4,
+            global_bytes: 64,
+        };
+        let from = Identity::generate().address();
+        let sid = [1u8; 16];
+
+        assert!(matches!(
+            node.accept_stream_chunk(from, sid, 0, vec![1; 4], false),
+            StreamChunkAcceptance::Retained
+        ));
+        assert!(matches!(
+            node.accept_stream_chunk(from, sid, u64::MAX, vec![2], false),
+            StreamChunkAcceptance::Rejected
+        ));
+        assert!(!node.incoming_streams.contains_key(&(from, sid)));
+        assert_eq!(node.incoming_stream_bytes, 0);
+        assert!(node.store.list_kv(&stream_prefix(&from, &sid)).is_empty());
+
+        assert!(matches!(
+            node.accept_stream_chunk(from, sid, 0, vec![1; 4], false),
+            StreamChunkAcceptance::Retained
+        ));
+        assert!(matches!(
+            node.accept_stream_chunk(from, sid, 1, vec![2; 5], false),
+            StreamChunkAcceptance::Rejected
+        ));
+        assert!(!node.incoming_streams.contains_key(&(from, sid)));
+
+        // A terminal chunk may arrive out of order, but no sequence may appear beyond it.
+        assert!(matches!(
+            node.accept_stream_chunk(from, sid, 2, vec![3], true),
+            StreamChunkAcceptance::Retained
+        ));
+        assert!(matches!(
+            node.accept_stream_chunk(from, sid, 3, vec![4], false),
+            StreamChunkAcceptance::Rejected
+        ));
+        assert!(!node.incoming_streams.contains_key(&(from, sid)));
+        assert!(!node.incoming_sender_usage.contains_key(&from));
+    }
+
+    #[test]
+    fn carrier_stream_count_pressure_preserves_state_and_does_not_ack() {
+        let mut node = Node::new(Identity::generate());
+        node.carrier_limits = CarrierLimits {
+            chunk_bytes: 4,
+            stream_bytes: 16,
+            stream_chunks: 4,
+            sender_streams: 1,
+            sender_bytes: 16,
+            global_streams: 2,
+            global_bytes: 32,
+        };
+        let sender = Identity::generate();
+        let other = Identity::generate();
+        let third = Identity::generate();
+        let sid_a = [1u8; 16];
+        let sid_b = [2u8; 16];
+        let sid_c = [3u8; 16];
+        let sid_d = [4u8; 16];
+
+        assert!(matches!(
+            node.accept_stream_chunk(sender.address(), sid_a, 0, vec![1; 4], false),
+            StreamChunkAcceptance::Retained
+        ));
+        let pressured = carrier(&sender, &node, sid_b, 0, vec![2; 4], false);
+        let pressured_id = pressured.id();
+        node.on_bundle(9, pressured.clone());
+        assert!(node
+            .incoming_streams
+            .contains_key(&(sender.address(), sid_a)));
+        assert!(!node
+            .incoming_streams
+            .contains_key(&(sender.address(), sid_b)));
+        assert!(!node.store.seen(&pressured_id));
+        assert!(!node.last_ack.contains_key(&pressured_id));
+        assert!(node
+            .store
+            .list_kv(&stream_prefix(&sender.address(), &sid_b))
+            .is_empty());
+
+        assert!(matches!(
+            node.accept_stream_chunk(other.address(), sid_c, 0, vec![3; 4], false),
+            StreamChunkAcceptance::Retained
+        ));
+        assert!(matches!(
+            node.accept_stream_chunk(third.address(), sid_d, 0, vec![4; 4], false),
+            StreamChunkAcceptance::Rejected
+        ));
+        assert_eq!(node.incoming_streams.len(), 2, "global stream cap holds");
+
+        node.abort_incoming_stream(&sender.address(), &sid_a);
+        node.on_bundle(9, pressured);
+        assert!(node
+            .incoming_streams
+            .contains_key(&(sender.address(), sid_b)));
+        assert!(node.store.seen(&pressured_id));
+        assert!(node.last_ack.contains_key(&pressured_id));
+    }
+
+    #[test]
+    fn carrier_byte_pressure_is_temporary_and_timeout_releases_all_accounting() {
+        let mut node = Node::new(Identity::generate());
+        node.carrier_limits = CarrierLimits {
+            chunk_bytes: 4,
+            stream_bytes: 12,
+            stream_chunks: 4,
+            sender_streams: 3,
+            sender_bytes: 6,
+            global_streams: 4,
+            global_bytes: 8,
+        };
+        let first = Identity::generate().address();
+        let second = Identity::generate().address();
+        let third = Identity::generate().address();
+        let sid_a = [5u8; 16];
+        let sid_b = [6u8; 16];
+        let sid_c = [7u8; 16];
+
+        assert!(matches!(
+            node.accept_stream_chunk(first, sid_a, 0, vec![1; 4], false),
+            StreamChunkAcceptance::Retained
+        ));
+        assert!(matches!(
+            node.accept_stream_chunk(first, sid_a, 1, vec![2; 4], false),
+            StreamChunkAcceptance::Rejected
+        ));
+        assert_eq!(node.incoming_streams[&(first, sid_a)].bytes, 4);
+        assert_eq!(node.incoming_sender_usage[&first].bytes, 4);
+        assert!(node
+            .store
+            .get_kv(&stream_chunk_key(&first, &sid_a, 1))
+            .is_none());
+
+        assert!(matches!(
+            node.accept_stream_chunk(second, sid_b, 0, vec![3; 4], false),
+            StreamChunkAcceptance::Retained
+        ));
+        assert!(matches!(
+            node.accept_stream_chunk(third, sid_c, 0, vec![4], false),
+            StreamChunkAcceptance::Rejected
+        ));
+        assert_eq!(node.incoming_stream_bytes, 8);
+        assert_eq!(node.incoming_streams.len(), 2);
+
+        node.tick(1);
+        node.tick(1 + CARRIER_STREAM_IDLE_MS);
+        assert!(node.incoming_streams.is_empty());
+        assert!(node.incoming_sender_usage.is_empty());
+        assert_eq!(node.incoming_stream_bytes, 0);
+        assert!(node.store.list_kv("strm/").is_empty());
+        assert!(matches!(
+            node.accept_stream_chunk(third, sid_c, 0, vec![4], false),
+            StreamChunkAcceptance::Retained
+        ));
+    }
+
+    #[test]
+    fn invalid_reconstructed_bundle_retains_stream_state_without_ack() {
+        let sender = Identity::generate();
+        let mut node = Node::new(Identity::generate());
+        let sid = [8u8; 16];
+        let invalid = carrier(&sender, &node, sid, 0, vec![0xff; 8], true);
+        let carrier_id = invalid.id();
+
+        node.on_bundle(7, invalid);
+
+        assert!(node.incoming_streams.contains_key(&(sender.address(), sid)));
+        assert_eq!(node.incoming_sender_usage[&sender.address()].bytes, 8);
+        assert_eq!(node.incoming_stream_bytes, 8);
+        assert!(!node.store.list_kv("strm/").is_empty());
+        assert!(!node.store.seen(&carrier_id));
+        assert!(!node.last_ack.contains_key(&carrier_id));
+        assert!(node.take_inbox().is_empty());
+    }
+
+    #[test]
+    fn final_carrier_cleanup_failure_retains_spool_and_restart_finishes_after_durable_receive() {
+        let recipient_secret = Identity::generate().to_secret_bytes();
+        let sender = Identity::generate();
+        let mut recipient = Node::with_store(
+            Identity::from_secret_bytes(&recipient_secret),
+            FaultStore::default(),
+        );
+        let original = Bundle::create(
+            &sender,
+            Destination::Device(recipient.address()),
+            &recipient.address(),
+            &Payload::PeerMessage {
+                content_type: "application/test".into(),
+                body: vec![7u8; 512],
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let original_id = original.id();
+        let bytes = original.to_bytes().unwrap();
+        let split = bytes.len() / 2;
+        let stream_id = [0x31; 16];
+        let first = carrier(
+            &sender,
+            &recipient,
+            stream_id,
+            0,
+            bytes[..split].to_vec(),
+            false,
+        );
+        let final_chunk = carrier(
+            &sender,
+            &recipient,
+            stream_id,
+            1,
+            bytes[split..].to_vec(),
+            true,
+        );
+        let final_id = final_chunk.id();
+        recipient.on_bundle(1, first);
+        recipient.drain_outgoing();
+        recipient.store.fail_critical_remove_prefix = Some("strm/".into());
+        recipient.on_bundle(1, final_chunk);
+
+        assert_eq!(recipient.inbox_items()[0].id, original_id);
+        assert!(recipient
+            .incoming_streams
+            .contains_key(&(sender.address(), stream_id)));
+        assert!(!recipient.store.list_kv("strm/").is_empty());
+        assert!(!recipient.store.seen(&final_id));
+        assert!(!recipient.last_ack.contains_key(&final_id));
+
+        let restarted = Node::with_store(
+            Identity::from_secret_bytes(&recipient_secret),
+            FaultStore {
+                inner: recipient.store.inner.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(restarted.inbox_items()[0].id, original_id);
+        assert!(restarted.incoming_streams.is_empty());
+        assert!(restarted.store.list_kv("strm/").is_empty());
+    }
+
+    #[test]
+    fn final_carrier_waits_for_queue_capacity_then_retries_without_losing_spool() {
+        let sender = Identity::generate();
+        let mut recipient = Node::new(Identity::generate());
+        let original = Bundle::create(
+            &sender,
+            Destination::Device(recipient.address()),
+            &recipient.address(),
+            &Payload::PeerMessage {
+                content_type: "text/plain".into(),
+                body: b"retry after pressure".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let stream_id = [0x32; 16];
+        let final_chunk = carrier(
+            &sender,
+            &recipient,
+            stream_id,
+            0,
+            original.to_bytes().unwrap(),
+            true,
+        );
+        let final_id = final_chunk.id();
+        recipient.set_app_queue_limits(AppQueueLimits {
+            max_items_per_queue: 0,
+            ..AppQueueLimits::default()
+        });
+        recipient.on_bundle(1, final_chunk.clone());
+        assert!(recipient.inbox_items().is_empty());
+        assert!(recipient
+            .incoming_streams
+            .contains_key(&(sender.address(), stream_id)));
+        assert!(!recipient.store.seen(&final_id));
+        assert!(!recipient.store.list_kv("strm/").is_empty());
+
+        recipient.set_app_queue_limits(AppQueueLimits::default());
+        recipient.on_bundle(1, final_chunk);
+        assert_eq!(recipient.inbox_items().len(), 1);
+        assert!(recipient.incoming_streams.is_empty());
+        assert!(recipient.store.list_kv("strm/").is_empty());
+        assert!(recipient.store.seen(&final_id));
+        assert!(recipient.last_ack.contains_key(&final_id));
+    }
+
+    #[test]
+    fn carrier_stream_size_boundary_matches_bundle_parser_limit() {
+        assert_eq!(MAX_CARRIER_STREAM_BYTES, MAX_BUNDLE_WIRE_BYTES);
+        let sender = Identity::generate().address();
+        let mut node = Node::new(Identity::generate());
+        let exact_stream = [0x33; 16];
+        let mut remaining = MAX_BUNDLE_WIRE_BYTES;
+        let mut sequence = 0u64;
+        while remaining > 0 {
+            let count = remaining.min(STREAM_CHUNK);
+            remaining -= count;
+            let accepted = node.accept_stream_chunk(
+                sender,
+                exact_stream,
+                sequence,
+                vec![1; count],
+                remaining == 0,
+            );
+            if remaining == 0 {
+                assert!(
+                    matches!(accepted, StreamChunkAcceptance::Complete(bytes) if bytes.len() == MAX_BUNDLE_WIRE_BYTES)
+                );
+            } else {
+                assert!(matches!(accepted, StreamChunkAcceptance::Retained));
+            }
+            sequence += 1;
+        }
+        assert!(node.finalize_incoming_stream(&sender, &exact_stream));
+
+        let oversized_stream = [0x34; 16];
+        let mut remaining = MAX_BUNDLE_WIRE_BYTES;
+        let mut sequence = 0u64;
+        while remaining > 0 {
+            let count = remaining.min(STREAM_CHUNK);
+            remaining -= count;
+            assert!(matches!(
+                node.accept_stream_chunk(
+                    sender,
+                    oversized_stream,
+                    sequence,
+                    vec![2; count],
+                    false,
+                ),
+                StreamChunkAcceptance::Retained
+            ));
+            sequence += 1;
+        }
+        assert!(matches!(
+            node.accept_stream_chunk(sender, oversized_stream, sequence, vec![3], true),
+            StreamChunkAcceptance::Rejected
+        ));
+        assert!(!node
+            .incoming_streams
+            .contains_key(&(sender, oversized_stream)));
+        assert!(node
+            .store
+            .list_kv(&stream_prefix(&sender, &oversized_stream))
+            .is_empty());
+    }
+
+    #[test]
+    fn rehydrate_removes_hostile_carrier_rows_outside_the_limits() {
+        let from = Identity::generate().address();
+        let sid_sequence = [9u8; 16];
+        let sid_chunk = [10u8; 16];
+        let mut store = MemoryStore::new();
+        let persisted = |bytes: Vec<u8>| {
+            postcard::to_allocvec(&PersistedCarrierChunk {
+                bytes,
+                fin: false,
+                started_at: 1,
+                received_at: 1,
+            })
+            .unwrap()
+        };
+        store.put_kv(
+            &stream_chunk_key(&from, &sid_sequence, 0),
+            persisted(vec![1, 2, 3]),
+        );
+        store.put_kv(
+            &stream_chunk_key(&from, &sid_sequence, MAX_CARRIER_STREAM_CHUNKS as u64),
+            persisted(vec![4]),
+        );
+        store.put_kv(
+            &stream_chunk_key(&from, &sid_chunk, 0),
+            persisted(vec![5; STREAM_CHUNK + 1]),
+        );
+        store.put_kv("strm/not/a/valid/key", vec![0, 1]);
+
+        let node = Node::with_store(Identity::generate(), store);
+
+        assert!(node.incoming_streams.is_empty());
+        assert!(node.incoming_sender_usage.is_empty());
+        assert_eq!(node.incoming_stream_bytes, 0);
+        assert!(node.store.list_kv("strm/").is_empty());
+    }
+
+    #[test]
+    fn rehydrate_bounds_a_large_persisted_carrier_flood_while_paging() {
+        let mut store = MemoryStore::new();
+        for index in 0..1_024u64 {
+            let mut from = [0u8; 32];
+            from[..8].copy_from_slice(&index.to_be_bytes());
+            let mut stream_id = [0u8; 16];
+            stream_id[..8].copy_from_slice(&index.to_be_bytes());
+            let chunk = PersistedCarrierChunk {
+                started_at: 1,
+                received_at: 1,
+                fin: false,
+                bytes: vec![index as u8],
+            };
+            store.put_kv(
+                &stream_chunk_key(&from, &stream_id, 0),
+                postcard::to_allocvec(&chunk).unwrap(),
+            );
+        }
+
+        let mut node = Node::with_store(Identity::generate(), store);
+
+        assert!(!node.carrier_startup_ready());
+        for _ in 0..32 {
+            if node.carrier_startup_ready() {
+                break;
+            }
+            node.tick(1);
+        }
+
+        assert!(node.carrier_startup_ready());
+        assert_eq!(node.incoming_streams.len(), MAX_CARRIER_STREAMS_GLOBAL);
+        assert_eq!(node.incoming_sender_usage.len(), MAX_CARRIER_STREAMS_GLOBAL);
+        assert_eq!(node.incoming_stream_bytes, MAX_CARRIER_STREAMS_GLOBAL);
+        assert_eq!(
+            node.store.list_kv("strm/").len(),
+            MAX_CARRIER_STREAMS_GLOBAL,
+            "rows rejected by admission are removed instead of surviving restart"
+        );
+    }
+
+    #[test]
+    fn carrier_rehydrate_respects_firestore_budgets_and_resumes_after_cleanup_failure() {
+        const ROWS: u64 = 450;
+        assert!(ROWS as usize > 400);
+        assert!(ROWS as usize > CARRIER_REHYDRATE_MAX_ROWS);
+
+        let from = Identity::generate().address();
+        let stream_id = [0x45; 16];
+        let value = postcard::to_allocvec(&PersistedCarrierChunk {
+            started_at: 1,
+            received_at: 1,
+            fin: false,
+            bytes: vec![7],
+        })
+        .unwrap();
+        let mut inner = MemoryStore::new();
+        for seq in 0..ROWS {
+            inner.put_kv(&stream_chunk_key(&from, &stream_id, seq), value.clone());
+        }
+        let store = FaultStore {
+            inner,
+            enforce_firestore_carrier_limits: true,
+            fail_carrier_cleanup_at: Some(0),
+            ..Default::default()
+        };
+        let mut node = Node::with_store(Identity::generate(), store);
+
+        assert!(!node.carrier_startup_ready());
+        assert_eq!(node.carrier_rehydrate_usage.rows, 32);
+        assert_eq!(node.carrier_rehydrate_usage.pages, 2);
+        assert_eq!(node.store.list_kv("strm/").len(), ROWS as usize);
+        let retained_cursor = stream_chunk_key(&from, &stream_id, 31);
+        assert_eq!(
+            node.carrier_rehydrate
+                .as_ref()
+                .and_then(|state| state.cursor.as_deref()),
+            Some(retained_cursor.as_str())
+        );
+
+        let blocked_stream = [0x46; 16];
+        assert!(matches!(
+            node.accept_stream_chunk(from, blocked_stream, 0, vec![1], false),
+            StreamChunkAcceptance::Rejected
+        ));
+        assert!(node
+            .store
+            .get_kv(&stream_chunk_key(&from, &blocked_stream, 0))
+            .is_none());
+
+        node.tick(1);
+        let calls = node.store.carrier_page_calls.borrow();
+        let first_page_cursor = stream_chunk_key(&from, &stream_id, 15);
+        assert_eq!(calls[0].0, None);
+        assert_eq!(calls[1].0.as_deref(), Some(first_page_cursor.as_str()));
+        assert_eq!(calls[2].0.as_deref(), Some(retained_cursor.as_str()));
+        assert!(calls
+            .iter()
+            .all(|(_, rows, bytes)| *rows <= CARRIER_PERSISTED_PAGE_ROWS
+                && *bytes <= CARRIER_REHYDRATE_MAX_BYTES));
+        drop(calls);
+
+        for now in 2..32 {
+            if node.carrier_startup_ready() {
+                break;
+            }
+            node.tick(now);
+        }
+
+        assert!(node.carrier_startup_ready());
+        assert!(node.store.list_kv("strm/").is_empty());
+        assert!(node.incoming_streams.is_empty());
+        assert!(node.carrier_rehydrate_usage.rows >= ROWS as usize);
+        assert!(node.carrier_rehydrate_usage.cleanup_operations >= ROWS as usize);
+        assert!(node
+            .store
+            .carrier_cleanup_batches
+            .iter()
+            .all(
+                |(mutations, bytes)| *mutations <= CARRIER_CLEANUP_BATCH_ROWS
+                    && *bytes < 512 * 1024
+            ));
+        assert_eq!(
+            node.store
+                .carrier_page_calls
+                .borrow()
+                .iter()
+                .filter(|(cursor, _, _)| cursor.is_none())
+                .count(),
+            1,
+            "continuation never restarts the carrier scan at strm/"
+        );
+    }
+
+    #[test]
+    fn clear_persisted_stream_pages_over_firestore_limit_and_retries_from_progress() {
+        const ROWS: u64 = 450;
+        let from = Identity::generate().address();
+        let stream_id = [0x47; 16];
+        let mut node = Node::with_store(
+            Identity::generate(),
+            FaultStore {
+                enforce_firestore_carrier_limits: true,
+                ..Default::default()
+            },
+        );
+        node.store.carrier_page_calls.borrow_mut().clear();
+        for seq in 0..ROWS {
+            node.store
+                .inner
+                .put_kv(&stream_chunk_key(&from, &stream_id, seq), vec![seq as u8]);
+        }
+        node.store.fail_carrier_cleanup_at = Some(1);
+
+        assert!(node.clear_persisted_stream(&from, &stream_id).is_err());
+        assert_eq!(
+            node.store.list_kv(&stream_prefix(&from, &stream_id)).len(),
+            ROWS as usize - CARRIER_PERSISTED_PAGE_ROWS,
+            "the first successful page remains deleted when the next page fails"
+        );
+        node.clear_persisted_stream(&from, &stream_id).unwrap();
+
+        assert!(node
+            .store
+            .list_kv(&stream_prefix(&from, &stream_id))
+            .is_empty());
+        assert!(node.store.carrier_cleanup_batches.len() > 400 / CARRIER_PERSISTED_PAGE_ROWS);
+        assert!(node
+            .store
+            .carrier_cleanup_batches
+            .iter()
+            .all(
+                |(mutations, bytes)| *mutations <= CARRIER_PERSISTED_PAGE_ROWS
+                    && *bytes < 512 * 1024
+            ));
+    }
+
+    #[test]
+    fn carrier_stream_absolute_lifetime_survives_arrivals_and_restart() {
+        let secret = Identity::generate().to_secret_bytes();
+        let from = Identity::generate().address();
+        let stream_id = [11u8; 16];
+        let started_at = 1_000;
+        let mut node = Node::from_identity_secret(&secret);
+        node.set_time(started_at);
+        assert!(matches!(
+            node.accept_stream_chunk(from, stream_id, 0, vec![1], false),
+            StreamChunkAcceptance::Retained
+        ));
+
+        node.set_time(started_at + CARRIER_STREAM_LIFETIME_MS - 1);
+        assert!(matches!(
+            node.accept_stream_chunk(from, stream_id, 1, vec![2], false),
+            StreamChunkAcceptance::Retained
+        ));
+        assert_eq!(
+            node.incoming_streams[&(from, stream_id)].started_at,
+            started_at
+        );
+
+        let store = node.clone_store();
+        let mut restarted = Node::with_store(Identity::from_secret_bytes(&secret), store);
+        assert_eq!(
+            restarted.incoming_streams[&(from, stream_id)].started_at,
+            started_at
+        );
+        restarted.tick(started_at + CARRIER_STREAM_LIFETIME_MS);
+        assert!(!restarted.incoming_streams.contains_key(&(from, stream_id)));
+        assert!(restarted.store.list_kv("strm/").is_empty());
+    }
+
+    #[test]
+    fn carrier_stream_first_clock_anchor_survives_restart() {
+        let secret = Identity::generate().to_secret_bytes();
+        let from = Identity::generate().address();
+        let stream_id = [12u8; 16];
+        let mut node = Node::from_identity_secret(&secret);
+        assert!(matches!(
+            node.accept_stream_chunk(from, stream_id, 0, vec![1], false),
+            StreamChunkAcceptance::Retained
+        ));
+        assert_eq!(node.incoming_streams[&(from, stream_id)].started_at, 0);
+
+        let anchored_at = 5_000;
+        node.tick(anchored_at);
+        let persisted = node
+            .store
+            .list_kv(&stream_prefix(&from, &stream_id))
+            .into_iter()
+            .next()
+            .map(|(_, value)| postcard::from_bytes::<PersistedCarrierChunk>(&value).unwrap())
+            .unwrap();
+        assert_eq!(persisted.started_at, anchored_at);
+        assert_eq!(persisted.received_at, anchored_at);
+
+        let store = node.clone_store();
+        let mut restarted = Node::with_store(Identity::from_secret_bytes(&secret), store);
+        assert_eq!(
+            restarted.incoming_streams[&(from, stream_id)].started_at,
+            anchored_at
+        );
+        restarted.tick(anchored_at + CARRIER_STREAM_LIFETIME_MS);
+        assert!(!restarted.incoming_streams.contains_key(&(from, stream_id)));
+        assert!(restarted.store.list_kv("strm/").is_empty());
+    }
+
+    #[test]
+    fn outbound_carrier_limit_rejects_before_submitting_a_prefix() {
+        assert_eq!(MAX_CARRIER_STREAM_BYTES, MAX_BUNDLE_WIRE_BYTES);
+        let mut node = Node::new(Identity::generate());
+        node.carrier_limits = CarrierLimits {
+            chunk_bytes: 32,
+            stream_bytes: 64,
+            stream_chunks: 2,
+            sender_streams: 1,
+            sender_bytes: 64,
+            global_streams: 1,
+            global_bytes: 64,
+        };
+        let recipient = Identity::generate();
+        assert!(node
+            .send_service_request(
+                recipient.address(),
+                "test".into(),
+                "large".into(),
+                vec![0; 256],
+            )
+            .is_err());
+        assert!(node.store.have().ids.is_empty());
+        assert!(node.pending.is_empty());
+        assert!(node.carrier_owner.is_empty());
+        assert!(node.outstanding_requests.is_empty());
+        assert!(node.tx.is_empty());
+        assert!(node.forwarded.is_empty());
     }
 
     #[test]
@@ -6307,14 +11852,18 @@ mod tests {
             .unwrap();
         net.pump(&mut nodes);
         for b in nodes[1].take_inbox() {
+            let id = b.id();
             nodes[1].read_message(&b).unwrap();
+            nodes[1].accept_inbox(&id).unwrap();
         }
         nodes[1]
             .send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true)
             .unwrap();
         net.pump(&mut nodes);
         for b in nodes[0].take_inbox() {
+            let id = b.id();
             nodes[0].read_message(&b).unwrap();
+            nodes[0].accept_inbox(&id).unwrap();
         }
         assert!(
             nodes[1].has_session(&nodes[0].address()),
@@ -6350,6 +11899,160 @@ mod tests {
             .unwrap()
             .expect("decrypts with the restored ratchet");
         assert_eq!(m.body, b"after restart");
+    }
+
+    #[test]
+    fn restored_session_anchors_to_first_real_tick_before_idle_gc() {
+        let real_now = 1_700_000_000_000u64;
+        let bob_secret = Identity::generate().to_secret_bytes();
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::from_identity_secret(&bob_secret),
+        ];
+        nodes[0].set_time(real_now);
+        nodes[1].set_time(real_now);
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut nodes);
+        let bob = nodes[1].address();
+        let alice = nodes[0].address();
+        nodes[0]
+            .send_message_traced(bob, "t".into(), b"before restart".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+        let first = nodes[1].take_inbox();
+        nodes[1].read_message(&first[0]).unwrap();
+        nodes[1].accept_inbox(&first[0].id()).unwrap();
+        assert!(nodes[1].has_session(&alice));
+
+        let store = nodes[1].clone_store();
+        nodes[1] = Node::with_store(Identity::from_secret_bytes(&bob_secret), store);
+        assert!(nodes[1].unanchored_sessions.contains(&alice));
+
+        // The first post-restart tick uses a real epoch timestamp far beyond the idle horizon. It
+        // must establish the baseline, not interpret the restored session as decades idle.
+        nodes[1].tick(0);
+        assert!(nodes[1].unanchored_sessions.contains(&alice));
+        nodes[1].tick(real_now + 1_000);
+        assert!(nodes[1].has_session(&alice));
+        assert!(nodes[1].unanchored_sessions.is_empty());
+
+        nodes[0].handle(BearerEvent::Disconnected(1));
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 2, 1, 2);
+        nodes[0]
+            .send_message_traced(bob, "t".into(), b"after first tick".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+        let inbox = nodes[1].take_inbox();
+        let message = inbox
+            .iter()
+            .find_map(|bundle| nodes[1].read_message(bundle).ok().flatten())
+            .expect("restored ratchet decrypts after its first real tick");
+        assert_eq!(message.body, b"after first tick");
+    }
+
+    #[test]
+    fn restored_session_send_before_first_real_tick_keeps_durable_ratchet() {
+        let (alice, mut bob, _, _) = established_fault_pair();
+        let peer = bob.address();
+        let alice_secret = alice.identity_secret();
+        let mut restarted = Node::with_store(
+            Identity::from_secret_bytes(&alice_secret),
+            FaultStore {
+                inner: alice.store.inner.clone(),
+                ..Default::default()
+            },
+        );
+        let session_key = Node::<FaultStore>::session_kv_key(&peer);
+        assert!(restarted.unanchored_sessions.contains(&peer));
+
+        let sent = restarted
+            .send_message_traced(peer, "t".into(), b"before clock".to_vec(), false)
+            .unwrap();
+        let sent_bundle = restarted.store.get(&sent).unwrap();
+        let message = bob
+            .read_message(&sent_bundle)
+            .unwrap()
+            .expect("zero-time post-restart send decrypts");
+        assert_eq!(message.body, b"before clock");
+        assert!(restarted.unanchored_sessions.contains(&peer));
+        assert!(!restarted.session_touch.contains_key(&peer));
+        assert!(restarted.store.get_kv(&session_key).is_some());
+
+        let epoch = 1_700_000_000_000;
+        restarted.tick(epoch);
+        assert!(restarted.has_session(&peer));
+        assert_eq!(restarted.session_touch.get(&peer), Some(&epoch));
+        assert!(!restarted.unanchored_sessions.contains(&peer));
+        assert!(restarted.store.get_kv(&session_key).is_some());
+
+        let reply = bob
+            .send_message_traced(
+                restarted.address(),
+                "t".into(),
+                b"after clock".to_vec(),
+                false,
+            )
+            .unwrap();
+        let reply_bundle = bob.store.get(&reply).unwrap();
+        let reply_message = restarted
+            .read_message(&reply_bundle)
+            .unwrap()
+            .expect("ratchet remains synchronized after the epoch tick");
+        assert_eq!(reply_message.body, b"after clock");
+        assert!(restarted.store.get_kv(&session_key).is_some());
+    }
+
+    #[test]
+    fn restored_session_decrypt_before_first_real_tick_keeps_durable_ratchet() {
+        let (alice, mut bob, _, _) = established_fault_pair();
+        let peer = bob.address();
+        let alice_secret = alice.identity_secret();
+        let mut restarted = Node::with_store(
+            Identity::from_secret_bytes(&alice_secret),
+            FaultStore {
+                inner: alice.store.inner.clone(),
+                ..Default::default()
+            },
+        );
+        let session_key = Node::<FaultStore>::session_kv_key(&peer);
+        let inbound = bob
+            .send_message_traced(
+                restarted.address(),
+                "t".into(),
+                b"before clock".to_vec(),
+                false,
+            )
+            .unwrap();
+        let inbound_bundle = bob.store.get(&inbound).unwrap();
+
+        restarted.ingest(inbound_bundle);
+        assert!(restarted
+            .inbox_items()
+            .iter()
+            .any(|item| item.body == b"before clock"));
+        assert!(restarted.unanchored_sessions.contains(&peer));
+        assert!(!restarted.session_touch.contains_key(&peer));
+        assert!(restarted.store.get_kv(&session_key).is_some());
+
+        let epoch = 1_700_000_000_000;
+        restarted.tick(epoch);
+        assert!(restarted.has_session(&peer));
+        assert_eq!(restarted.session_touch.get(&peer), Some(&epoch));
+        assert!(!restarted.unanchored_sessions.contains(&peer));
+        assert!(restarted.store.get_kv(&session_key).is_some());
+
+        let sent = restarted
+            .send_message_traced(peer, "t".into(), b"after clock".to_vec(), false)
+            .unwrap();
+        let sent_bundle = restarted.store.get(&sent).unwrap();
+        let message = bob
+            .read_message(&sent_bundle)
+            .unwrap()
+            .expect("post-tick ratchet send decrypts");
+        assert_eq!(message.body, b"after clock");
+        assert!(restarted.store.get_kv(&session_key).is_some());
     }
 
     #[test]
@@ -6455,6 +12158,7 @@ mod tests {
             }
             if !bob.take_inbox().is_empty() {
                 got = true;
+                accept_all(&mut bob);
                 break; // bob has the message; its pending outgoing is the ACK — withhold it
             }
             for (l, bytes) in bob.drain_outgoing() {
@@ -6508,8 +12212,8 @@ mod tests {
             "shows Sent N (carriers relayed to the relay), not 0"
         );
         assert!(
-            delivered,
-            "delivery ACK for the reassembled original marks it Delivered"
+            !delivered,
+            "carrier progress never marks the original Delivered before host acceptance"
         );
 
         let inbox = nodes[2].take_inbox();
@@ -6524,6 +12228,67 @@ mod tests {
             .expect("a user message");
         assert_eq!(m.content_type, "image/jpeg");
         assert_eq!(m.body, body, "bytes reassembled exactly, in order");
+        nodes[2].accept_inbox(&inbox[0].id()).unwrap();
+        net.pump(&mut nodes);
+        assert!(
+            nodes[0].message_status(&orig).unwrap().1,
+            "the reconstructed original ACK marks it Delivered after acceptance"
+        );
+        assert!(!nodes[0].outgoing_carriers.contains_key(&orig));
+        assert!(nodes[0]
+            .store
+            .get_kv(&Node::<MemoryStore>::outgoing_carrier_key(&orig))
+            .is_none());
+    }
+
+    #[test]
+    fn final_carrier_ack_removes_metadata_when_original_needs_no_ack() {
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        let original = nodes[0]
+            .send_service_response(nodes[1].address(), [0x44; 32], 200, vec![0x55; 300_000])
+            .unwrap();
+        assert!(nodes[0].outgoing_carriers.contains_key(&original));
+        assert!(nodes[0]
+            .store
+            .get_kv(&Node::<MemoryStore>::outgoing_carrier_key(&original))
+            .is_some());
+
+        net.pump(&mut nodes);
+
+        assert!(!nodes[0].outgoing_carriers.contains_key(&original));
+        assert!(nodes[0]
+            .store
+            .get_kv(&Node::<MemoryStore>::outgoing_carrier_key(&original))
+            .is_none());
+    }
+
+    #[test]
+    fn carrier_metadata_expires_when_delivery_never_completes() {
+        let mut node = Node::new(Identity::generate());
+        node.set_time(100);
+        let original = node
+            .send_service_response(
+                Identity::generate().address(),
+                [0x66; 32],
+                200,
+                vec![0x77; 300_000],
+            )
+            .unwrap();
+        assert!(node.outgoing_carriers.contains_key(&original));
+
+        node.tick(100 + BundleOpts::default().lifetime_ms as u64);
+
+        assert!(!node.outgoing_carriers.contains_key(&original));
+        assert!(node
+            .store
+            .get_kv(&Node::<MemoryStore>::outgoing_carrier_key(&original))
+            .is_none());
     }
 
     // --- §39 untraceable (private) messaging ----------------------------------
@@ -6564,6 +12329,11 @@ mod tests {
             "only the intended recipient recognizes the private bundle"
         );
         assert!(inbox[0].is_private());
+        assert!(
+            inbox[0].trace().is_empty(),
+            "private multi-hop trace stays empty"
+        );
+        assert_eq!(inbox[0].env.hops, 2, "hop count remains available");
         assert_eq!(
             inbox[0].inner.src, [0u8; 32],
             "no cleartext sender on the wire"
@@ -6584,6 +12354,57 @@ mod tests {
         );
         assert_eq!(m.content_type, "text/plain");
         assert_eq!(m.body, b"meet at dawn");
+    }
+
+    #[test]
+    fn injected_private_trace_is_cleared_without_rejecting_or_resetting_hops() {
+        let sender = Identity::generate();
+        let recipient = Identity::generate();
+        let recipient_prekey = recipient.derive_prekey();
+        let mut private = Bundle::create_private(
+            &recipient.address(),
+            &recipient_prekey.public,
+            &Payload::Private {
+                sender: sender.address(),
+                inner: Box::new(Payload::SessionReset),
+            },
+            None,
+            BundleOpts::default(),
+        )
+        .unwrap();
+        private.env.hops = 5;
+        private.env.trace.push(crate::bundle::TraceHop {
+            node: [7u8; 8],
+            app: [8u8; 8],
+        });
+        assert!(private.verify().is_ok(), "trace is mutable envelope data");
+        assert!(
+            private.trace().is_empty(),
+            "private trace is never surfaced"
+        );
+
+        let id = private.id();
+        let mut relay = Node::new(Identity::generate());
+        relay.ingest(private);
+        let held = relay
+            .store
+            .get(&id)
+            .expect("valid private bundle is retained");
+        assert!(
+            held.env.trace.is_empty(),
+            "ingest strips injected provenance"
+        );
+        assert_eq!(held.env.hops, 5, "ingest preserves the hop count");
+
+        let mut forwarded = held;
+        assert!(forwarded.forwarded());
+        forwarded.env.trace.push(crate::bundle::TraceHop {
+            node: [9u8; 8],
+            app: [10u8; 8],
+        });
+        forwarded.add_hop([11u8; 8], [12u8; 8]);
+        assert!(forwarded.env.trace.is_empty(), "forward strips trace again");
+        assert_eq!(forwarded.env.hops, 6, "forward still increments hops");
     }
 
     #[test]
@@ -6664,6 +12485,83 @@ mod tests {
     }
 
     #[test]
+    fn forged_private_session_init_preserves_session_and_does_not_reflect_reset() {
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut nodes);
+        let alice = nodes[0].address();
+        let bob = nodes[1].address();
+
+        nodes[0]
+            .send_message(bob, "t".into(), b"establish".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+        let first = nodes[1].take_inbox();
+        nodes[1].read_message(&first[0]).unwrap();
+        nodes[1]
+            .send_message(alice, "t".into(), b"confirm".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+        let confirm = nodes[0].take_inbox();
+        nodes[0].read_message(&confirm[0]).unwrap();
+        let before = postcard::to_allocvec(&nodes[1].sessions[&alice]).unwrap();
+        let _ = nodes[1].drain_outgoing();
+
+        // Anyone can seal a private envelope to Bob and claim Alice as its sender. The bogus X3DH
+        // candidate must authenticate its first ratchet ciphertext before replacing Alice's session.
+        let attacker = Identity::generate();
+        let forged_inner = Payload::Private {
+            sender: alice,
+            inner: Box::new(Payload::SessionInit {
+                ek_pub: attacker.derive_prekey().public,
+                spk_pub: nodes[1].prekey.public,
+                msg: crate::session::RatchetMessage {
+                    header: crate::session::Header {
+                        dh: attacker.derive_prekey().public,
+                        pn: 0,
+                        n: 0,
+                    },
+                    ciphertext: vec![0u8; 16],
+                },
+            }),
+        };
+        let forged = Bundle::create_private(
+            &bob,
+            &nodes[1].prekey.public,
+            &forged_inner,
+            Some(crypto::mailbox_route(&crypto::mailbox_tag(&bob, 0))),
+            BundleOpts::default(),
+        )
+        .unwrap();
+        assert!(nodes[1].read_message(&forged).is_err());
+        assert_eq!(
+            postcard::to_allocvec(&nodes[1].sessions[&alice]).unwrap(),
+            before,
+            "failed candidate decryption must leave the established session byte-for-byte intact"
+        );
+        assert!(
+            !nodes[1].last_reset_req.contains_key(&alice),
+            "an unauthenticated private sender claim must not receive a reflected SessionReset"
+        );
+        assert!(nodes[1].drain_outgoing().is_empty());
+
+        nodes[0]
+            .send_message(bob, "t".into(), b"still synced".to_vec(), false)
+            .unwrap();
+        net.pump(&mut nodes);
+        let inbox = nodes[1].take_inbox();
+        let message = nodes[1]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("the genuine established session still decrypts");
+        assert_eq!(message.body, b"still synced");
+    }
+
+    #[test]
     fn private_send_defers_until_prekey_then_floods() {
         // require-ratchet (§25) holds for private sends too: with no prekey for Bob yet, the
         // message is queued ("Sending…"), never static-sealed — then flushes the moment Bob's
@@ -6727,6 +12625,8 @@ mod tests {
             1,
             "Bob received the private message"
         );
+        accept_all(&mut nodes[2]);
+        net.pump(&mut nodes);
         let (_, delivered, _, _) = nodes[0].message_status(&id).expect("tracked");
         assert!(
             delivered,
@@ -6760,6 +12660,8 @@ mod tests {
         let id = nodes[0]
             .send_message(bob, "t".into(), b"time me".to_vec(), true)
             .unwrap();
+        net.pump(&mut nodes);
+        accept_all(&mut nodes[1]);
         net.pump(&mut nodes);
 
         let (_, delivered, _, fwd_ms) = nodes[0].message_status(&id).expect("tracked");
@@ -6988,6 +12890,8 @@ mod tests {
             .unwrap();
         net.pump(&mut nodes);
         assert_eq!(nodes[3].take_inbox().len(), 1, "m1 delivered");
+        accept_all(&mut nodes[3]);
+        net.pump(&mut nodes);
 
         // the pass ends: you drops off. friend replies while you is away.
         nodes[0].handle(BearerEvent::Disconnected(11));
@@ -7007,6 +12911,7 @@ mod tests {
             1,
             "m2 delivered to you on the second pass"
         );
+        accept_all(&mut nodes[0]);
         settle(&mut nodes, &mut net, &mut now, 120);
 
         // the ACK rides the still-connected carrier→relay→friend chain: friend must see Delivered.
@@ -8662,6 +14567,7 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
         let endpoint = nodes[1].address();
+        nodes[0].set_time(1);
 
         let req = nodes[0]
             .send_hops_request(
@@ -8849,6 +14755,7 @@ mod tests {
             .expect("our message is in the store");
         net.pump(&mut nodes);
         assert!(nodes[1].take_inbox().len() == 1, "delivered once");
+        accept_all(&mut nodes[1]);
 
         // A duplicate arrives after the throttle window → re-ACK (something to send).
         nodes[1].set_time(REACK_MIN_INTERVAL_MS + 1);
@@ -8869,6 +14776,157 @@ mod tests {
             nodes[1].drain_outgoing().is_empty(),
             "throttled: no ACK storm"
         );
+    }
+
+    #[test]
+    fn zero_relay_capacity_dedups_without_foreign_custody_and_keeps_local_traffic() {
+        let mut relay = Node::new(Identity::generate());
+        let foreign = Identity::generate();
+        let destination = Identity::generate();
+        let carried = Bundle::create(
+            &foreign,
+            Destination::Device(destination.address()),
+            &destination.address(),
+            &Payload::ServiceRequest {
+                service: "foreign".into(),
+                method: "hold".into(),
+                args: vec![],
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let carried_id = carried.id();
+
+        relay.ingest(carried.clone());
+        assert!(relay.store.contains(&carried_id));
+        assert!(!relay.relay_order.is_empty());
+        assert!(relay.forwarded.contains_key(&carried_id));
+
+        relay.set_max_relayed(0);
+        assert_eq!(relay.max_relayed, 0);
+        assert!(!relay.store.contains(&carried_id));
+        assert!(relay.store.seen(&carried_id));
+        assert!(relay.relay_order.is_empty());
+        assert!(relay.relay_fwd.is_empty());
+        assert!(!relay.forwarded.contains_key(&carried_id));
+
+        // Trusted durable re-ingest can bypass held-copy dedup, but zero capacity immediately
+        // releases it again and never offers a foreign copy onward.
+        relay.ingest(carried);
+        assert!(!relay.store.contains(&carried_id));
+        assert!(relay.relay_order.is_empty());
+        assert!(relay.drain_outgoing().is_empty());
+
+        let local = Bundle::create(
+            &relay.identity,
+            Destination::Device(destination.address()),
+            &destination.address(),
+            &Payload::ServiceRequest {
+                service: "local".into(),
+                method: "send".into(),
+                args: vec![],
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let local_id = local.id();
+        relay.submit(local);
+        assert!(
+            relay.store.contains(&local_id),
+            "local origin is not relay custody"
+        );
+
+        let addressed = Bundle::create(
+            &foreign,
+            Destination::Device(relay.address()),
+            &relay.address(),
+            &Payload::ServiceRequest {
+                service: "app.local".into(),
+                method: "receive".into(),
+                args: b"ok".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        relay.on_bundle(7, addressed);
+        let requests = relay.take_service_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].args, b"ok");
+    }
+
+    #[test]
+    fn zero_relay_capacity_never_calls_store_put_even_when_delete_would_fail() {
+        let foreign = Identity::generate();
+        let destination = Identity::generate();
+        let bundle = Bundle::create(
+            &foreign,
+            Destination::Device(destination.address()),
+            &destination.address(),
+            &Payload::ServiceRequest {
+                service: "foreign".into(),
+                method: "relay".into(),
+                args: Vec::new(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let id = bundle.id();
+        let mut leaf = Node::with_store(
+            Identity::generate(),
+            FaultStore {
+                fail_bundle_removes: usize::MAX,
+                ..Default::default()
+            },
+        );
+        leaf.set_max_relayed(0);
+        leaf.ingest(bundle);
+        assert_eq!(leaf.store.bundle_put_calls, 0);
+        assert_eq!(leaf.store.bundle_remove_calls, 0);
+        assert!(!leaf.store.contains(&id));
+        assert!(!leaf.store.seen(&id));
+        assert!(leaf.relay_order.is_empty());
+        assert!(leaf.drain_outgoing().is_empty());
+    }
+
+    #[test]
+    fn zero_capacity_leaf_cannot_bridge_two_peers_but_still_receives_local_traffic() {
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        nodes[1].set_max_relayed(0);
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        net.connect(&mut nodes, 1, 2, 2, 2);
+        exchange_prekeys(&mut net, &mut nodes);
+
+        let bridged = nodes[0]
+            .send_message_traced(
+                nodes[2].address(),
+                "text/plain".into(),
+                b"must not bridge".to_vec(),
+                true,
+            )
+            .unwrap();
+        net.pump(&mut nodes);
+        assert!(nodes[2].inbox_items().is_empty());
+        assert!(!nodes[1].store.contains(&bridged));
+        assert!(!nodes[1].store.seen(&bridged));
+
+        nodes[0]
+            .send_message_traced(
+                nodes[1].address(),
+                "text/plain".into(),
+                b"for the leaf".to_vec(),
+                true,
+            )
+            .unwrap();
+        net.pump(&mut nodes);
+        let local = nodes[1].inbox_items();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].body, b"for the leaf");
+        assert!(nodes[1].accept_inbox(&local[0].id).unwrap());
     }
 
     #[test]
@@ -9281,6 +15339,156 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_advert_cannot_hide_behind_an_empty_first_fragment() {
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 10);
+        let mut advert_piece = vec![0u8; MAX_RECORD_PLAINTEXT - 1];
+        advert_piece[0] = 1;
+        let (empty, advert) = match nodes[0].links.get_mut(&1) {
+            Some(LinkState::Up(est)) => (
+                est.session.encrypt(&[]).unwrap(),
+                est.session.encrypt(&advert_piece).unwrap(),
+            ),
+            _ => panic!("link established"),
+        };
+
+        nodes[1].on_record_frag(10, 0, 3, &empty);
+        nodes[1].on_record_frag(10, 1, 3, &advert);
+
+        match nodes[1].links.get(&10) {
+            Some(LinkState::Up(est)) => {
+                assert!(est.frag_buf.is_empty());
+                assert_eq!(est.frag_next, 0);
+            }
+            _ => panic!("link remains established"),
+        }
+    }
+
+    #[test]
+    fn advert_wire_size_is_rejected_from_the_discriminant_before_decode() {
+        let mut oversized = vec![0u8; MAX_ADVERT_LINK_BYTES + 1];
+        oversized[0] = 1;
+        assert!(advert_record_exceeds_limit(&oversized));
+        oversized[0] = 0;
+        assert!(!advert_record_exceeds_limit(&oversized));
+        assert!(!advert_record_exceeds_limit(&vec![
+            1;
+            MAX_ADVERT_LINK_BYTES
+        ]));
+    }
+
+    #[test]
+    fn invalid_reserved_advert_flood_is_bounded_per_link_and_globally() {
+        let publisher = Identity::generate();
+        let valid = Advert::publish(
+            &publisher,
+            AdvertKind::HpsTopic {
+                nonce: [0u8; 12],
+                ct: vec![],
+            },
+            0,
+            60_000,
+            1,
+        )
+        .unwrap();
+        let mut invalid = valid.clone();
+        invalid.sig[0] ^= 1;
+        let mut node = Node::new(Identity::generate());
+
+        for link in 1..=8 {
+            for _ in 0..MAX_ADVERTS_PER_LINK_WINDOW {
+                node.on_advert(link, publisher.address(), invalid.clone());
+            }
+        }
+        assert_eq!(node.advert_ingest_global.1, MAX_ADVERTS_GLOBAL_WINDOW);
+        assert!(node
+            .advert_ingest
+            .values()
+            .all(|(_, count)| *count <= MAX_ADVERTS_PER_LINK_WINDOW));
+
+        node.on_advert(9, publisher.address(), valid.clone());
+        assert!(!node.directory.contains(&valid.id));
+        node.set_time(ADVERT_VERIFY_WINDOW_MS);
+        node.on_advert(9, publisher.address(), valid.clone());
+        assert!(node.directory.contains(&valid.id));
+    }
+
+    #[test]
+    fn advert_eviction_clears_live_and_reconnect_dedup_metadata() {
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 10);
+        nodes[0].directory = Directory::with_relay_cap(1);
+        let publisher = Identity::generate();
+        let make = |title: &str, seq| {
+            Advert::publish(
+                &publisher,
+                AdvertKind::Service {
+                    service: "market".into(),
+                    title: title.into(),
+                    summary: String::new(),
+                    tags: vec![],
+                },
+                0,
+                60_000,
+                seq,
+            )
+            .unwrap()
+        };
+        let first = make("first", 1);
+        let second = make("second", 2);
+        nodes[0].on_advert(1, publisher.address(), first.clone());
+        nodes[0].peer_sent.insert(
+            [9u8; 32],
+            PeerSent {
+                adverts: HashSet::from([first.id]),
+                bundles: HashSet::new(),
+                last_seen_ms: 0,
+            },
+        );
+
+        nodes[0].on_advert(1, publisher.address(), second.clone());
+
+        match nodes[0].links.get(&1) {
+            Some(LinkState::Up(est)) => {
+                assert!(!est.sent_adverts.contains(&first.id));
+                assert!(est.sent_adverts.contains(&second.id));
+            }
+            _ => panic!("link remains established"),
+        }
+        assert!(!nodes[0].peer_sent[&[9u8; 32]].adverts.contains(&first.id));
+    }
+
+    #[test]
+    fn reconnect_dedup_table_is_capped_and_ttl_pruned() {
+        let mut node = Node::new(Identity::generate());
+        for index in 0..=MAX_PEER_SENT {
+            let mut peer = [0u8; 32];
+            peer[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            node.peer_sent.insert(
+                peer,
+                PeerSent {
+                    last_seen_ms: index as u64,
+                    ..Default::default()
+                },
+            );
+        }
+        node.prune_peer_sent();
+        assert_eq!(node.peer_sent.len(), MAX_PEER_SENT);
+
+        node.set_time(PEER_SENT_TTL_MS + MAX_PEER_SENT as u64);
+        node.prune_peer_sent();
+        assert!(node.peer_sent.is_empty());
+    }
+
+    #[test]
     fn prekey_published_after_connect_propagates_over_stable_link() {
         // Removing the re-gossip re-flood must NOT regress prekey propagation: a prekey published
         // AFTER the link is up must still reach the peer over the STABLE link (no reconnect), so a
@@ -9385,6 +15593,8 @@ mod tests {
         assert_eq!(nodes[0].message_status(&id), Some((0, false, 0, 0)));
 
         net.pump(&mut nodes);
+        accept_all(&mut nodes[1]);
+        net.pump(&mut nodes);
 
         let (relayed, delivered, hops, _) = nodes[0].message_status(&id).unwrap();
         assert_eq!(relayed, 0, "direct delivery is not counted as a relay peer");
@@ -9422,6 +15632,8 @@ mod tests {
             1,
             "destination received directly"
         );
+        accept_all(&mut nodes[1]);
+        net.pump(&mut nodes);
         assert!(
             nodes[2].queue().is_empty(),
             "relay should not be holding a needless sprayed copy"
@@ -9478,6 +15690,8 @@ mod tests {
             .read_message(&inbox[0])
             .unwrap()
             .expect("a user message");
+        nodes[1].accept_inbox(&inbox[0].id()).unwrap();
+        net.pump(&mut nodes);
         assert_eq!(m.body, b"secret");
         assert!(
             nodes[1].has_session(&nodes[0].address()),
@@ -9526,6 +15740,8 @@ mod tests {
         let msg = nodes[1].read_message(&inbox[0]).unwrap().unwrap();
         assert_eq!(msg.body, b"secret hi");
         assert_eq!(msg.from, nodes[0].address());
+        nodes[1].accept_inbox(&inbox[0].id()).unwrap();
+        net.pump(&mut nodes);
 
         // The ACK returned across the network → Delivered.
         let (_, delivered, _, _) = nodes[0].message_status(&id).unwrap();
@@ -9597,6 +15813,8 @@ mod tests {
                 true,
             )
             .unwrap();
+        net.pump(&mut nodes);
+        accept_all(&mut nodes[2]);
         net.pump(&mut nodes);
 
         let (_, delivered, _, _) = nodes[0].message_status(&id).unwrap();
@@ -9712,6 +15930,8 @@ mod tests {
             .send_message_traced(a2, "text/plain".into(), b"learn me".to_vec(), true)
             .unwrap();
         net.pump(&mut nodes);
+        accept_all(&mut nodes[2]);
+        net.pump(&mut nodes);
 
         assert!(
             nodes[1].knows_route(&a0),
@@ -9811,6 +16031,8 @@ mod tests {
         net.pump(&mut nodes);
 
         assert_eq!(nodes[1].take_inbox().len(), 1, "recipient got the message");
+        accept_all(&mut nodes[1]);
+        net.pump(&mut nodes);
         assert!(
             nodes[0].take_inbox().is_empty(),
             "the ACK is consumed, not inboxed"
@@ -9972,7 +16194,7 @@ mod tests {
         nodes[0].hps_publish("news", b"breaking").unwrap();
         net.pump(&mut nodes);
 
-        let msgs = nodes[1].take_hps_messages();
+        let msgs = take_hps_and_accept(&mut nodes[1]);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].path, "news");
         assert_eq!(msgs[0].body, b"breaking");
@@ -10012,7 +16234,7 @@ mod tests {
         nodes[1].hps_publish("lobby", b"hi all").unwrap();
         net.pump(&mut nodes);
 
-        let msgs = nodes[2].take_hps_messages();
+        let msgs = take_hps_and_accept(&mut nodes[2]);
         assert_eq!(msgs.len(), 1, "the post floods to the other member");
         assert_eq!(msgs[0].body, b"hi all");
         assert_eq!(
@@ -10048,7 +16270,7 @@ mod tests {
         nodes[0].hps_publish("lobby", &big).unwrap();
         net.pump(&mut nodes);
 
-        let msgs = nodes[1].take_hps_messages();
+        let msgs = take_hps_and_accept(&mut nodes[1]);
         assert_eq!(
             msgs.len(),
             1,
@@ -10093,7 +16315,7 @@ mod tests {
         // Member 1 posts; the host (node 0) must receive it.
         nodes[1].hps_publish("lobby", b"hi host").unwrap();
         net.pump(&mut nodes);
-        let host_msgs = nodes[0].take_hps_messages();
+        let host_msgs = take_hps_and_accept(&mut nodes[0]);
         assert_eq!(host_msgs.len(), 1, "host receives the member's post");
         assert_eq!(host_msgs[0].body, b"hi host");
         assert_eq!(host_msgs[0].sender, nodes[1].address());
@@ -10132,7 +16354,7 @@ mod tests {
         net.pump(&mut nodes);
         nodes[0].hps_publish("lobby", b"welcome").unwrap();
         net.pump(&mut nodes);
-        let msgs = nodes[1].take_hps_messages();
+        let msgs = take_hps_and_accept(&mut nodes[1]);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].body, b"welcome");
     }
@@ -10175,7 +16397,7 @@ mod tests {
 
         nodes[0].hps_publish("vip", b"hi vip").unwrap();
         net.pump(&mut nodes);
-        let msgs = nodes[1].take_hps_messages();
+        let msgs = take_hps_and_accept(&mut nodes[1]);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].body, b"hi vip");
     }
@@ -10229,8 +16451,8 @@ mod tests {
 
         nodes[0].hps_publish("room", b"v1").unwrap();
         net.pump(&mut nodes);
-        assert_eq!(nodes[1].take_hps_messages().len(), 1, "m1 reads v1");
-        assert_eq!(nodes[2].take_hps_messages().len(), 1, "m2 reads v1");
+        assert_eq!(take_hps_and_accept(&mut nodes[1]).len(), 1, "m1 reads v1");
+        assert_eq!(take_hps_and_accept(&mut nodes[2]).len(), 1, "m2 reads v1");
 
         // Rotate, removing member 2.
         nodes[0].hps_rekey("room", None, &[m2]).unwrap();
@@ -10238,7 +16460,7 @@ mod tests {
         nodes[0].hps_publish("room", b"v2").unwrap();
         net.pump(&mut nodes);
         assert_eq!(
-            nodes[1].take_hps_messages().len(),
+            take_hps_and_accept(&mut nodes[1]).len(),
             1,
             "retained m1 reads v2"
         );
@@ -10246,6 +16468,1286 @@ mod tests {
             nodes[2].take_hps_messages().is_empty(),
             "removed m2 can't read v2"
         );
+    }
+
+    #[test]
+    fn hps_subscription_expectations_are_bounded_expired_and_restart_safe() {
+        let secret = Identity::generate().to_secret_bytes();
+        let host = Identity::generate().address();
+        let mut node = Node::from_identity_secret(&secret);
+        node.set_time(1_000);
+        for index in 0..=MAX_HPS_SUBSCRIBE_PENDING {
+            node.expect_hps_keys(host, &format!("room-{index}"))
+                .unwrap();
+        }
+        assert_eq!(node.hps_subscribe_pending.len(), MAX_HPS_SUBSCRIBE_PENDING);
+        assert_eq!(
+            node.store.list_kv("hps/sub-pending/").len(),
+            MAX_HPS_SUBSCRIBE_PENDING
+        );
+        assert!(node
+            .expect_hps_keys(host, &"x".repeat(MAX_HPS_PATH_BYTES + 1))
+            .is_err());
+
+        let store = node.clone_store();
+        let mut restored = Node::with_store(Identity::from_secret_bytes(&secret), store);
+        assert_eq!(
+            restored.hps_subscribe_pending.len(),
+            MAX_HPS_SUBSCRIBE_PENDING
+        );
+        restored.tick(1_000 + HPS_SUBSCRIBE_PENDING_TTL_MS);
+        assert!(restored.hps_subscribe_pending.is_empty());
+        assert!(restored.store.list_kv("hps/sub-pending/").is_empty());
+
+        let other_host = Identity::generate().address();
+        restored.expect_hps_keys(other_host, "room-0").unwrap();
+        assert_eq!(restored.hps_subscribe_pending["room-0"].host, other_host);
+    }
+
+    #[test]
+    fn hps_expectation_create_replace_and_expiry_are_critical() {
+        let host = Identity::generate();
+        let mut subscriber = Node::with_store(Identity::generate(), FaultStore::default());
+        subscriber.set_time(100);
+        subscriber.store.fail_critical_put_prefix = Some("hps/sub-pending/".into());
+        assert!(subscriber.hps_subscribe(host.address(), "room").is_err());
+        assert!(subscriber.hps_subscribe_pending.is_empty());
+        assert!(subscriber.store.list_kv("hps/sub-pending/").is_empty());
+        assert!(subscriber.store.have().ids.is_empty());
+        assert!(subscriber.drain_outgoing().is_empty());
+
+        subscriber.store.fail_critical_put_prefix = None;
+        subscriber.expect_hps_keys(host.address(), "room").unwrap();
+        let original = subscriber.hps_subscribe_pending["room"];
+        subscriber.set_time(200);
+        subscriber.store.fail_critical_put_prefix = Some("hps/sub-pending/".into());
+        assert!(subscriber.expect_hps_keys(host.address(), "room").is_err());
+        assert_eq!(
+            subscriber.hps_subscribe_pending["room"].expires_at_ms,
+            original.expires_at_ms
+        );
+
+        subscriber.store.fail_critical_put_prefix = None;
+        subscriber.expect_hps_keys(host.address(), "room").unwrap();
+        let replacement = subscriber.hps_subscribe_pending["room"];
+        assert!(replacement.expires_at_ms > original.expires_at_ms);
+
+        subscriber.set_time(replacement.expires_at_ms);
+        subscriber.store.fail_critical_remove_prefix = Some("hps/sub-pending/".into());
+        assert!(subscriber.expire_hps_subscribe_pending().is_err());
+        assert!(subscriber.hps_subscribe_pending.contains_key("room"));
+        assert!(subscriber
+            .store
+            .get_kv(&Node::<FaultStore>::hps_subscribe_pending_key("room"))
+            .is_some());
+    }
+
+    #[test]
+    fn restored_hps_expectation_holds_keys_until_anchor_then_retries_or_expires() {
+        let app = crate::app::AppKeys::from_secret([42u8; 32]);
+        let host = Identity::generate();
+        let subscriber_secret = Identity::generate().to_secret_bytes();
+        let mut subscriber = Node::with_store_app(
+            Identity::from_secret_bytes(&subscriber_secret),
+            MemoryStore::new(),
+            app.clone(),
+        );
+        subscriber.set_time(1_000);
+        subscriber.expect_hps_keys(host.address(), "fresh").unwrap();
+        let expiry = subscriber.hps_subscribe_pending["fresh"].expires_at_ms;
+        let keys = Bundle::create(
+            &host,
+            Destination::Device(subscriber.address()),
+            &subscriber.address(),
+            &Payload::HpsKeys {
+                path: "fresh".into(),
+                content_key: [7u8; 32],
+                service_pubkey: None,
+                epoch: 1,
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let keys_id = keys.id();
+        let store = subscriber.clone_store();
+        let mut subscriber = Node::with_store_app(
+            Identity::from_secret_bytes(&subscriber_secret),
+            store,
+            app.clone(),
+        );
+        subscriber.set_time(1_001);
+        subscriber.on_bundle(1, keys.clone());
+        assert!(!subscriber.subscriptions.contains_key("fresh"));
+        assert!(!subscriber.store.seen(&keys_id));
+
+        subscriber.tick(1_001);
+        subscriber.on_bundle(1, keys);
+        assert_eq!(subscriber.subscriptions["fresh"].content_key, [7u8; 32]);
+
+        let mut stale = Node::with_store_app(
+            Identity::from_secret_bytes(&subscriber_secret),
+            MemoryStore::new(),
+            app,
+        );
+        stale.set_time(1_000);
+        stale.expect_hps_keys(host.address(), "stale").unwrap();
+        let stale_store = stale.clone_store();
+        let mut stale =
+            Node::with_store(Identity::from_secret_bytes(&subscriber_secret), stale_store);
+        stale.tick(expiry);
+        assert!(!stale.hps_subscribe_pending.contains_key("stale"));
+        assert!(stale.store.list_kv("hps/sub-pending/").is_empty());
+    }
+
+    #[test]
+    fn hps_keys_require_the_persisted_expected_host_and_never_overwrite() {
+        let app = crate::app::AppKeys::from_secret([10u8; 32]);
+        let mut host = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        host.register_service(
+            "room",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
+        let cfg = host.services["room"].clone();
+        let host_addr = host.address();
+        let sub_secret = Identity::generate().to_secret_bytes();
+        let mut sub = Node::with_store_app(
+            Identity::from_secret_bytes(&sub_secret),
+            MemoryStore::new(),
+            app.clone(),
+        );
+        sub.hps_subscribe(host_addr, "room").unwrap();
+        assert_eq!(sub.hps_subscribe_pending["room"].host, host_addr);
+
+        let store = sub.clone_store();
+        let mut sub =
+            Node::with_store_app(Identity::from_secret_bytes(&sub_secret), store, app.clone());
+        assert_eq!(
+            sub.hps_subscribe_pending["room"].host, host_addr,
+            "the expected host/path handshake survives restart"
+        );
+
+        let attacker = Identity::generate();
+        let forged = Bundle::create(
+            &attacker,
+            Destination::Device(sub.address()),
+            &sub.address(),
+            &Payload::HpsKeys {
+                path: "room".into(),
+                content_key: [0x44; 32],
+                service_pubkey: None,
+                epoch: cfg.epoch,
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sub.on_bundle(1, forged);
+        assert!(!sub.subscriptions.contains_key("room"));
+        assert_eq!(sub.hps_subscribe_pending["room"].host, host_addr);
+        sub.tick(1);
+
+        let genuine = Bundle::create(
+            &host.identity,
+            Destination::Device(sub.address()),
+            &sub.address(),
+            &Payload::HpsKeys {
+                path: "room".into(),
+                content_key: cfg.content_key,
+                service_pubkey: cfg.service_pubkey(),
+                epoch: cfg.epoch,
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sub.on_bundle(2, genuine);
+        assert_eq!(sub.subscriptions["room"].content_key, cfg.content_key);
+        assert!(!sub.hps_subscribe_pending.contains_key("room"));
+        assert!(sub
+            .store
+            .get_kv(&Node::<MemoryStore>::hps_subscribe_pending_key("room"))
+            .is_none());
+
+        // Even the expected host cannot replace installed keys with an unsolicited second HpsKeys.
+        let overwrite = Bundle::create(
+            &host.identity,
+            Destination::Device(sub.address()),
+            &sub.address(),
+            &Payload::HpsKeys {
+                path: "room".into(),
+                content_key: [0x55; 32],
+                service_pubkey: None,
+                epoch: cfg.epoch + 1,
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sub.on_bundle(3, overwrite);
+        assert_eq!(sub.subscriptions["room"].content_key, cfg.content_key);
+    }
+
+    #[test]
+    fn hps_rekey_requires_stored_host_and_rejects_path_collision_after_restart() {
+        let app = crate::app::AppKeys::from_secret([11u8; 32]);
+        let host_a = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        let host_b = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        let sub_secret = Identity::generate().to_secret_bytes();
+        let mut sub = Node::with_store_app(
+            Identity::from_secret_bytes(&sub_secret),
+            MemoryStore::new(),
+            app.clone(),
+        );
+        sub.install_subscription("old", host_a.address(), [1u8; 32], None, 1);
+        sub.install_subscription("occupied", host_b.address(), [9u8; 32], None, 7);
+
+        let store = sub.clone_store();
+        let mut sub =
+            Node::with_store_app(Identity::from_secret_bytes(&sub_secret), store, app.clone());
+
+        let wrong_host = Bundle::create(
+            &host_b.identity,
+            Destination::Device(sub.address()),
+            &sub.address(),
+            &Payload::HpsRekey {
+                old_path: "old".into(),
+                new_path: "fresh".into(),
+                epoch: 2,
+                content_key: [2u8; 32],
+                service_pubkey: None,
+                proof: host_b.hps_proof("old", &host_b.address()),
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sub.on_bundle(1, wrong_host);
+        assert_eq!(sub.subscriptions["old"].content_key, [1u8; 32]);
+        assert!(!sub.subscriptions.contains_key("fresh"));
+
+        let collision = Bundle::create(
+            &host_a.identity,
+            Destination::Device(sub.address()),
+            &sub.address(),
+            &Payload::HpsRekey {
+                old_path: "old".into(),
+                new_path: "occupied".into(),
+                epoch: 2,
+                content_key: [2u8; 32],
+                service_pubkey: None,
+                proof: host_a.hps_proof("old", &host_a.address()),
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sub.on_bundle(2, collision);
+        assert_eq!(sub.subscriptions["old"].content_key, [1u8; 32]);
+        assert_eq!(sub.subscriptions["occupied"].content_key, [9u8; 32]);
+    }
+
+    #[test]
+    fn hps_reach_ack_requires_current_key_mac_and_exact_epoch() {
+        let app = crate::app::AppKeys::from_secret([12u8; 32]);
+        let mut host = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        host.register_service(
+            "room",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
+        let cfg = host.services["room"].clone();
+        let tag = host.app.topic_tag("room");
+        let member = Identity::generate();
+        let member_addr = member.address();
+
+        let future_epoch = cfg.epoch + 1;
+        let future_mac =
+            hps::reach_ack_mac(&cfg.content_key, &app.id, &member_addr, &tag, future_epoch);
+        let future = Bundle::create(
+            &member,
+            Destination::Device(host.address()),
+            &host.address(),
+            &Payload::HpsReachAck {
+                topic_tag: tag,
+                epoch: future_epoch,
+                mac: future_mac,
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        host.on_bundle(1, future);
+        assert_eq!(host.hps_reach("room"), 0);
+        assert!(host.hps_members("room").is_empty());
+
+        let bad_mac = Bundle::create(
+            &member,
+            Destination::Device(host.address()),
+            &host.address(),
+            &Payload::HpsReachAck {
+                topic_tag: tag,
+                epoch: cfg.epoch,
+                mac: [0x77; 32],
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        host.on_bundle(2, bad_mac);
+        assert_eq!(host.hps_reach("room"), 0);
+
+        let mac = hps::reach_ack_mac(&cfg.content_key, &app.id, &member_addr, &tag, cfg.epoch);
+        let valid = Bundle::create(
+            &member,
+            Destination::Device(host.address()),
+            &host.address(),
+            &Payload::HpsReachAck {
+                topic_tag: tag,
+                epoch: cfg.epoch,
+                mac,
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        host.on_bundle(3, valid);
+        assert_eq!(host.hps_reach("room"), 1);
+        assert_eq!(host.hps_members("room"), vec![member_addr]);
+    }
+
+    #[test]
+    fn hps_rekey_move_persists_reduced_members_and_removes_old_rows() {
+        let app = crate::app::AppKeys::from_secret([13u8; 32]);
+        let host_secret = Identity::generate().to_secret_bytes();
+        let mut host = Node::with_store_app(
+            Identity::from_secret_bytes(&host_secret),
+            MemoryStore::new(),
+            app.clone(),
+        );
+        host.register_service(
+            "room",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::RequestToJoin,
+            crate::hps::Visibility::Private,
+        );
+        let retained = Identity::generate().address();
+        let removed = Identity::generate().address();
+        host.record_member("room", retained);
+        host.record_member("room", removed);
+        host.hps_pending.insert("room".into(), vec![removed]);
+        host.persist_pending("room");
+
+        host.hps_rekey("room", Some("room-v2"), &[removed]).unwrap();
+        assert!(host.store.get_kv("hps/svc/room").is_none());
+        assert!(host.store.get_kv("hps/members/room").is_none());
+        assert!(host.store.get_kv("hps/pending/room").is_none());
+
+        let store = host.clone_store();
+        let host = Node::with_store_app(Identity::from_secret_bytes(&host_secret), store, app);
+        assert!(!host.services.contains_key("room"));
+        assert!(host.services.contains_key("room-v2"));
+        assert_eq!(
+            host.hps_members("room-v2")
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([retained])
+        );
+        assert!(host.hps_members("room").is_empty());
+        assert!(host.hps_pending("room").is_empty());
+    }
+
+    #[test]
+    fn hps_rekey_failure_at_every_batch_boundary_keeps_the_old_generation() {
+        let app = crate::app::AppKeys::from_secret([17u8; 32]);
+        let host_secret = Identity::generate().to_secret_bytes();
+        let retained = Identity::generate().address();
+        let removed = Identity::generate().address();
+        let mut baseline = Node::with_store_app(
+            Identity::from_secret_bytes(&host_secret),
+            FaultStore::default(),
+            app.clone(),
+        );
+        baseline.register_service(
+            "room",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::RequestToJoin,
+            crate::hps::Visibility::Private,
+        );
+        baseline.record_member("room", retained);
+        baseline.record_member("room", removed);
+        baseline.hps_pending.insert("room".into(), vec![removed]);
+        baseline.persist_pending("room");
+        let old_cfg = baseline.services["room"].clone();
+        let durable = baseline.store.inner.clone();
+
+        for (new_path, mutation_count) in [(None, 2usize), (Some("room-v2"), 5usize)] {
+            for boundary in 0..mutation_count {
+                let mut host = Node::with_store_app(
+                    Identity::from_secret_bytes(&host_secret),
+                    FaultStore {
+                        inner: durable.clone(),
+                        fail_batch_after: Some(boundary),
+                        ..Default::default()
+                    },
+                    app.clone(),
+                );
+
+                assert!(host.hps_rekey("room", new_path, &[removed]).is_err());
+                assert_eq!(host.services["room"].epoch, old_cfg.epoch);
+                assert_eq!(host.services["room"].content_key, old_cfg.content_key);
+                assert_eq!(
+                    host.hps_members("room").into_iter().collect::<HashSet<_>>(),
+                    HashSet::from([retained, removed])
+                );
+                assert!(!host.services.contains_key("room-v2"));
+                assert!(host.drain_outgoing().is_empty());
+
+                let restored = Node::with_store_app(
+                    Identity::from_secret_bytes(&host_secret),
+                    FaultStore {
+                        inner: host.store.inner.clone(),
+                        ..Default::default()
+                    },
+                    app.clone(),
+                );
+                assert_eq!(restored.services["room"].epoch, old_cfg.epoch);
+                assert_eq!(
+                    restored
+                        .hps_members("room")
+                        .into_iter()
+                        .collect::<HashSet<_>>(),
+                    HashSet::from([retained, removed])
+                );
+                assert!(!restored.services.contains_key("room-v2"));
+            }
+        }
+    }
+
+    #[test]
+    fn incoming_hps_rekey_batch_failure_preserves_the_old_subscription_after_restart() {
+        let app = crate::app::AppKeys::from_secret([18u8; 32]);
+        let host = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        let subscriber_secret = Identity::generate().to_secret_bytes();
+        let mut baseline = Node::with_store_app(
+            Identity::from_secret_bytes(&subscriber_secret),
+            FaultStore::default(),
+            app.clone(),
+        );
+        baseline.install_subscription("room", host.address(), [1u8; 32], None, 1);
+        let durable = baseline.store.inner.clone();
+
+        for boundary in 0..2 {
+            let mut subscriber = Node::with_store_app(
+                Identity::from_secret_bytes(&subscriber_secret),
+                FaultStore {
+                    inner: durable.clone(),
+                    fail_batch_after: Some(boundary),
+                    ..Default::default()
+                },
+                app.clone(),
+            );
+            let rekey = Bundle::create(
+                &host.identity,
+                Destination::Device(subscriber.address()),
+                &subscriber.address(),
+                &Payload::HpsRekey {
+                    old_path: "room".into(),
+                    new_path: "room-v2".into(),
+                    epoch: 2,
+                    content_key: [2u8; 32],
+                    service_pubkey: None,
+                    proof: host.hps_proof("room", &host.address()),
+                },
+                BundleOpts {
+                    app: app.id,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            subscriber.on_bundle(1, rekey);
+
+            assert_eq!(subscriber.subscriptions["room"].content_key, [1u8; 32]);
+            assert!(!subscriber.subscriptions.contains_key("room-v2"));
+            let restored = Node::with_store_app(
+                Identity::from_secret_bytes(&subscriber_secret),
+                FaultStore {
+                    inner: subscriber.store.inner.clone(),
+                    ..Default::default()
+                },
+                app.clone(),
+            );
+            assert_eq!(restored.subscriptions["room"].content_key, [1u8; 32]);
+            assert!(!restored.subscriptions.contains_key("room-v2"));
+        }
+    }
+
+    #[test]
+    fn hps_leave_reduced_member_set_survives_host_restart() {
+        let app = crate::app::AppKeys::from_secret([14u8; 32]);
+        let host_secret = Identity::generate().to_secret_bytes();
+        let mut nodes = [
+            Node::with_store_app(
+                Identity::from_secret_bytes(&host_secret),
+                MemoryStore::new(),
+                app.clone(),
+            ),
+            Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].register_service(
+            "room",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
+        let member = nodes[1].address();
+        let old_epoch = nodes[0].services["room"].epoch;
+        nodes[1].hps_subscribe(nodes[0].address(), "room").unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[0].hps_members("room"), vec![member]);
+
+        nodes[1].hps_leave("room").unwrap().unwrap();
+        net.pump(&mut nodes);
+        assert!(nodes[0].hps_members("room").is_empty());
+        assert_eq!(nodes[0].services["room"].epoch, old_epoch + 1);
+        assert!(!nodes[1].subscriptions.contains_key("room"));
+
+        let store = nodes[0].clone_store();
+        let host = Node::with_store_app(Identity::from_secret_bytes(&host_secret), store, app);
+        assert!(
+            host.hps_members("room").is_empty(),
+            "restart must not resurrect a member who left"
+        );
+        assert_eq!(host.services["room"].epoch, old_epoch + 1);
+    }
+
+    #[test]
+    fn hps_leave_persistence_failure_keeps_the_live_subscription() {
+        let app = crate::app::AppKeys::from_secret([19u8; 32]);
+        let host = Identity::generate().address();
+        let mut member = Node::with_store_app(Identity::generate(), FaultStore::default(), app);
+        member.install_subscription("room", host, [3u8; 32], None, 1);
+        member.store.fail_critical_remove_prefix = Some("hps/sub/".into());
+
+        assert!(member.hps_leave("room").is_err());
+        assert!(member.subscriptions.contains_key("room"));
+        assert!(member.store.get_kv("hps/sub/room").is_some());
+        assert!(member.drain_outgoing().is_empty());
+    }
+
+    #[test]
+    fn hps_leave_atomically_removes_topic_state_and_persists_outbound_custody() {
+        let app = crate::app::AppKeys::from_secret([29u8; 32]);
+        let member_secret = Identity::generate().to_secret_bytes();
+        let host = Identity::generate();
+        let mut member = Node::with_store_app(
+            Identity::from_secret_bytes(&member_secret),
+            FaultStore::default(),
+            app.clone(),
+        );
+        member.install_subscription("room", host.address(), [3u8; 32], None, 1);
+        let topic_tag = member.app.topic_tag("room");
+        let message = HpsMessage {
+            id: [7u8; 32],
+            path: "room".into(),
+            sender: host.address(),
+            body: b"pending".to_vec(),
+        };
+        let charge = member
+            .reserve_app_queue(
+                AppQueueKind::HpsMessage,
+                Some(message.sender),
+                Node::<FaultStore>::hps_message_bytes(&message),
+            )
+            .unwrap();
+        assert!(member
+            .accept_hps_publication(topic_tag, 1, message, 10_000, charge)
+            .unwrap());
+        let durable = member.store.inner.clone();
+
+        // Subscription, replay, inbox, and outbound custody are the four mutations in this small
+        // leave. Every failure boundary must expose the complete old state, including after restart.
+        for boundary in 0..4 {
+            let mut attempt = Node::with_store_app(
+                Identity::from_secret_bytes(&member_secret),
+                FaultStore {
+                    inner: durable.clone(),
+                    fail_batch_after: Some(boundary),
+                    ..Default::default()
+                },
+                app.clone(),
+            );
+            assert!(attempt.hps_leave("room").is_err(), "boundary {boundary}");
+            assert!(attempt.subscriptions.contains_key("room"));
+            assert!(attempt.hps_replays.contains_key(&(topic_tag, 1)));
+            assert_eq!(attempt.hps_inbox.len(), 1);
+            assert!(attempt.store.have().ids.is_empty());
+            assert!(attempt.drain_outgoing().is_empty());
+
+            let restored = Node::with_store_app(
+                Identity::from_secret_bytes(&member_secret),
+                FaultStore {
+                    inner: attempt.store.inner.clone(),
+                    ..Default::default()
+                },
+                app.clone(),
+            );
+            assert!(restored.subscriptions.contains_key("room"));
+            assert!(restored.hps_replays.contains_key(&(topic_tag, 1)));
+            assert_eq!(restored.hps_inbox.len(), 1);
+            assert!(restored.store.have().ids.is_empty());
+        }
+
+        let mut committed = Node::with_store_app(
+            Identity::from_secret_bytes(&member_secret),
+            FaultStore {
+                inner: durable,
+                ..Default::default()
+            },
+            app.clone(),
+        );
+        let leave_id = committed.hps_leave("room").unwrap().unwrap();
+        assert!(!committed.subscriptions.contains_key("room"));
+        assert!(!committed.hps_replays.contains_key(&(topic_tag, 1)));
+        assert!(committed.hps_inbox.is_empty());
+        assert!(committed.store.contains(&leave_id));
+
+        let restarted = Node::with_store_app(
+            Identity::from_secret_bytes(&member_secret),
+            FaultStore {
+                inner: committed.store.inner.clone(),
+                ..Default::default()
+            },
+            app,
+        );
+        assert!(!restarted.subscriptions.contains_key("room"));
+        assert!(!restarted.hps_replays.contains_key(&(topic_tag, 1)));
+        assert!(restarted.hps_inbox.is_empty());
+        assert!(restarted.store.contains(&leave_id));
+        assert!(matches!(
+            restarted.store.get(&leave_id).and_then(|bundle| bundle.open(&host).ok()),
+            Some(Payload::HpsLeave { path, .. }) if path == "room"
+        ));
+    }
+
+    #[test]
+    fn hps_publish_signature_rejects_outer_sender_rewrap() {
+        let app = crate::app::AppKeys::from_secret([15u8; 32]);
+        let mut host = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        let mut sub = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        host.register_service(
+            "news",
+            crate::hps::ServiceKind::Service,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
+        let cfg = host.services["news"].clone();
+        sub.install_subscription(
+            "news",
+            host.address(),
+            cfg.content_key,
+            cfg.service_pubkey(),
+            cfg.epoch,
+        );
+        let publish_id = host.hps_publish("news", b"genuine").unwrap();
+        let original = host.store.get(&publish_id).unwrap();
+        let payload = original.open(&hps::broadcast_identity()).unwrap();
+
+        let attacker = Identity::generate();
+        let rewrapped = Bundle::create(
+            &attacker,
+            Destination::Broadcast,
+            &hps::broadcast_identity().address(),
+            &payload,
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sub.on_bundle(1, rewrapped);
+        assert!(sub.take_hps_messages().is_empty());
+
+        sub.on_bundle(2, original);
+        let messages = take_hps_and_accept(&mut sub);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].body, b"genuine");
+    }
+
+    #[test]
+    fn hps_service_rejects_a_valid_service_signature_from_any_sender_but_its_host() {
+        let app = crate::app::AppKeys::from_secret([20u8; 32]);
+        let mut host = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        let mut subscriber =
+            Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        host.register_service(
+            "news",
+            crate::hps::ServiceKind::Service,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
+        let cfg = host.services["news"].clone();
+        subscriber.install_subscription(
+            "news",
+            host.address(),
+            cfg.content_key,
+            cfg.service_pubkey(),
+            cfg.epoch,
+        );
+
+        let attacker = Identity::generate();
+        let topic_tag = subscriber.app.topic_tag("news");
+        let (nonce, ciphertext) = hps::seal_content(&cfg.content_key, b"wrong host");
+        let sig = hps::sign_publish(
+            &cfg.signing_seed.unwrap(),
+            &app.id,
+            &attacker.address(),
+            &topic_tag,
+            cfg.epoch,
+            &nonce,
+            &ciphertext,
+        );
+        let publication = Bundle::create(
+            &attacker,
+            Destination::Broadcast,
+            &hps::broadcast_identity().address(),
+            &Payload::HpsPublish {
+                topic_tag,
+                epoch: cfg.epoch,
+                nonce: nonce.to_vec(),
+                ciphertext,
+                sig: sig.to_vec(),
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        subscriber.on_bundle(1, publication);
+        assert!(subscriber.take_hps_messages().is_empty());
+    }
+
+    #[test]
+    fn hps_publication_commit_is_atomic_and_restart_redelivers_until_acceptance() {
+        let app = crate::app::AppKeys::from_secret([55u8; 32]);
+        let mut host = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        let subscriber_secret = Identity::generate().to_secret_bytes();
+        let mut subscriber = Node::with_store_app(
+            Identity::from_secret_bytes(&subscriber_secret),
+            FaultStore::default(),
+            app.clone(),
+        );
+        host.register_service(
+            "room",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
+        let cfg = host.services["room"].clone();
+        subscriber.install_subscription("room", host.address(), cfg.content_key, None, cfg.epoch);
+        let outer_id = host.hps_publish("room", b"persist me").unwrap();
+        let publication = host.store.get(&outer_id).unwrap();
+
+        subscriber.store.fail_critical_put_prefix = Some("hps/inbox/".into());
+        subscriber.on_bundle(1, publication.clone());
+        assert!(subscriber.take_hps_messages().is_empty());
+        assert!(subscriber.hps_replays.is_empty());
+        assert!(subscriber.store.list_kv("hps/inbox/").is_empty());
+        assert!(!subscriber.store.seen(&outer_id));
+
+        subscriber.store.fail_critical_put_prefix = None;
+        subscriber.on_bundle(1, publication);
+        let first = subscriber.take_hps_messages();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].body, b"persist me");
+        assert_eq!(subscriber.take_hps_messages()[0].id, first[0].id);
+
+        let mut restarted = Node::with_store_app(
+            Identity::from_secret_bytes(&subscriber_secret),
+            FaultStore {
+                inner: subscriber.store.inner.clone(),
+                ..Default::default()
+            },
+            app,
+        );
+        assert_eq!(restarted.take_hps_messages()[0].id, first[0].id);
+        restarted.store.fail_critical_remove_prefix = Some("hps/inbox/".into());
+        assert!(restarted.accept_hps_message(&first[0].id).is_err());
+        assert_eq!(restarted.take_hps_messages().len(), 1);
+
+        let mut redelivered = Node::with_store(
+            Identity::from_secret_bytes(&subscriber_secret),
+            FaultStore {
+                inner: restarted.store.inner.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(redelivered.take_hps_messages()[0].id, first[0].id);
+        assert!(redelivered.accept_hps_message(&first[0].id).unwrap());
+        assert!(redelivered.take_hps_messages().is_empty());
+    }
+
+    #[test]
+    fn durable_hps_inbox_is_bounded_and_expired_without_weakening_replay() {
+        let topic_tag = [8u8; 16];
+        let mut node = Node::new(Identity::generate());
+        node.set_time(100);
+        for index in 0..MAX_DURABLE_HPS_MESSAGES {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let message = HpsMessage {
+                id,
+                path: "room".into(),
+                sender: [index as u8; 32],
+                body: vec![index as u8],
+            };
+            let charge = node
+                .reserve_app_queue(
+                    AppQueueKind::HpsMessage,
+                    Some(message.sender),
+                    Node::<MemoryStore>::hps_message_bytes(&message),
+                )
+                .unwrap();
+            node.accept_hps_publication(
+                topic_tag,
+                1,
+                message,
+                100 + DURABLE_HOST_DELIVERY_TTL_MS,
+                charge,
+            )
+            .unwrap();
+        }
+        assert_eq!(node.hps_inbox.len(), MAX_DURABLE_HPS_MESSAGES);
+        let overflow_id = [0xff; 32];
+        let overflow = HpsMessage {
+            id: overflow_id,
+            path: "room".into(),
+            sender: [4u8; 32],
+            body: Vec::new(),
+        };
+        let charge = AppQueueCharge {
+            kind: AppQueueKind::HpsMessage,
+            source: Some(overflow.sender),
+            bytes: 0,
+        };
+        assert!(node
+            .accept_hps_publication(
+                topic_tag,
+                1,
+                overflow,
+                100 + DURABLE_HOST_DELIVERY_TTL_MS,
+                charge,
+            )
+            .is_err());
+        assert!(!node.hps_replays[&(topic_tag, 1)]
+            .iter()
+            .any(|(id, _)| *id == overflow_id));
+
+        node.tick(100 + DURABLE_HOST_DELIVERY_TTL_MS);
+        assert!(node.hps_inbox.is_empty());
+        assert!(node.store.list_kv("hps/inbox/").is_empty());
+        assert!(!node.hps_replays.contains_key(&(topic_tag, 1)));
+    }
+
+    #[test]
+    fn unaccepted_hps_publication_blocks_replay_until_expiry_cleanup() {
+        let topic_tag = [9u8; 16];
+        let publication_id = [7u8; 32];
+        let mut node = Node::new(Identity::generate());
+        let message = HpsMessage {
+            id: publication_id,
+            path: "room".into(),
+            sender: [5u8; 32],
+            body: b"once".to_vec(),
+        };
+        let charge = node
+            .reserve_app_queue(
+                AppQueueKind::HpsMessage,
+                Some(message.sender),
+                Node::<MemoryStore>::hps_message_bytes(&message),
+            )
+            .unwrap();
+        assert!(node
+            .accept_hps_publication(topic_tag, 1, message.clone(), 100, charge)
+            .unwrap());
+
+        node.set_time(101);
+        let duplicate_charge = node
+            .reserve_app_queue(
+                AppQueueKind::HpsMessage,
+                Some(message.sender),
+                Node::<MemoryStore>::hps_message_bytes(&message),
+            )
+            .unwrap();
+        assert!(!node
+            .accept_hps_publication(topic_tag, 1, message, 200, duplicate_charge)
+            .unwrap());
+        node.release_app_queue(duplicate_charge);
+        assert_eq!(node.hps_inbox.len(), 1);
+
+        node.tick(101);
+        assert!(node.hps_inbox.is_empty());
+        assert!(!node.hps_publication_recorded(&topic_tag, 1, &publication_id));
+    }
+
+    #[test]
+    fn hps_publication_replay_is_rejected_across_rewrap_and_restart_then_expires() {
+        let app = crate::app::AppKeys::from_secret([21u8; 32]);
+        let mut host = Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        let subscriber_secret = Identity::generate().to_secret_bytes();
+        let mut subscriber = Node::with_store_app(
+            Identity::from_secret_bytes(&subscriber_secret),
+            MemoryStore::new(),
+            app.clone(),
+        );
+        host.register_service(
+            "room",
+            crate::hps::ServiceKind::Channel,
+            crate::hps::AccessMode::Open,
+            crate::hps::Visibility::Private,
+        );
+        let cfg = host.services["room"].clone();
+        subscriber.install_subscription("room", host.address(), cfg.content_key, None, cfg.epoch);
+        let original_id = host.hps_publish("room", b"once").unwrap();
+        let payload = host
+            .store
+            .get(&original_id)
+            .unwrap()
+            .open(&hps::broadcast_identity())
+            .unwrap();
+        let rewrap = |created_at| {
+            Bundle::create(
+                &host.identity,
+                Destination::Broadcast,
+                &hps::broadcast_identity().address(),
+                &payload,
+                BundleOpts {
+                    app: app.id,
+                    created_at,
+                    lifetime_ms: 1_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        subscriber.set_time(100);
+        subscriber.on_bundle(1, rewrap(10));
+        assert_eq!(take_hps_and_accept(&mut subscriber).len(), 1);
+        let store = subscriber.clone_store();
+        let mut subscriber = Node::with_store_app(
+            Identity::from_secret_bytes(&subscriber_secret),
+            store,
+            app.clone(),
+        );
+        subscriber.set_time(100);
+        subscriber.on_bundle(2, rewrap(11));
+        assert!(subscriber.take_hps_messages().is_empty());
+
+        subscriber.tick(1_100);
+        subscriber.on_bundle(3, rewrap(12));
+        let messages = take_hps_and_accept(&mut subscriber);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].body, b"once");
+    }
+
+    #[test]
+    fn hps_publication_replay_set_is_capped_and_rehydrates_at_the_cap() {
+        let secret = Identity::generate().to_secret_bytes();
+        let topic_tag = [7u8; 16];
+        let mut node = Node::from_identity_secret(&secret);
+        node.set_time(100);
+        for index in 0..=MAX_HPS_REPLAYS_PER_TOPIC {
+            let mut publication_id = [0u8; 32];
+            publication_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let message = HpsMessage {
+                id: publication_id,
+                path: "room".into(),
+                sender: [9u8; 32],
+                body: vec![index as u8],
+            };
+            let charge = node
+                .reserve_app_queue(
+                    AppQueueKind::HpsMessage,
+                    Some(message.sender),
+                    Node::<MemoryStore>::hps_message_bytes(&message),
+                )
+                .unwrap();
+            assert!(node
+                .accept_hps_publication(topic_tag, 3, message, 10_000 + index as u64, charge,)
+                .unwrap());
+            assert!(node.accept_hps_message(&publication_id).unwrap());
+        }
+        let entries = &node.hps_replays[&(topic_tag, 3)];
+        assert_eq!(entries.len(), MAX_HPS_REPLAYS_PER_TOPIC);
+        assert!(!entries.iter().any(|(id, _)| *id == [0u8; 32]));
+
+        let store = node.clone_store();
+        let restored = Node::with_store(Identity::from_secret_bytes(&secret), store);
+        assert_eq!(
+            restored.hps_replays[&(topic_tag, 3)].len(),
+            MAX_HPS_REPLAYS_PER_TOPIC
+        );
+    }
+
+    #[test]
+    fn hps_replay_generations_are_globally_capped_at_runtime_and_rehydrate() {
+        let topic = |index: usize| {
+            let mut tag = [0u8; 16];
+            tag[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            (tag, index as u32)
+        };
+        let publication = |index: usize| {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            id
+        };
+
+        let mut node = Node::new(Identity::generate());
+        node.set_time(1);
+        for index in 0..MAX_HPS_REPLAYS_GLOBAL {
+            node.hps_replays.insert(
+                topic(index),
+                vec![(publication(index), 1_000 + index as u64)],
+            );
+        }
+        let new_index = MAX_HPS_REPLAYS_GLOBAL;
+        let message = HpsMessage {
+            id: publication(new_index),
+            path: "room".into(),
+            sender: [9u8; 32],
+            body: Vec::new(),
+        };
+        let charge = node
+            .reserve_app_queue(
+                AppQueueKind::HpsMessage,
+                Some(message.sender),
+                Node::<MemoryStore>::hps_message_bytes(&message),
+            )
+            .unwrap();
+        let (new_tag, new_epoch) = topic(new_index);
+        assert!(node
+            .accept_hps_publication(new_tag, new_epoch, message, 10_000, charge)
+            .unwrap());
+        assert_eq!(
+            node.hps_replays.values().map(Vec::len).sum::<usize>(),
+            MAX_HPS_REPLAYS_GLOBAL
+        );
+        assert!(!node.hps_replays.contains_key(&topic(0)));
+        assert!(node.hps_replays.contains_key(&topic(new_index)));
+
+        let secret = Identity::generate().to_secret_bytes();
+        let mut store = MemoryStore::new();
+        for index in 0..=MAX_HPS_REPLAYS_GLOBAL {
+            let (topic_tag, epoch) = topic(index);
+            store.put_kv(
+                &Node::<MemoryStore>::hps_replay_key(&topic_tag, epoch),
+                postcard::to_allocvec(&PersistedHpsReplay {
+                    topic_tag,
+                    epoch,
+                    entries: vec![(publication(index), 10_000)],
+                })
+                .unwrap(),
+            );
+        }
+        let restored = Node::with_store(Identity::from_secret_bytes(&secret), store);
+        assert_eq!(
+            restored.hps_replays.values().map(Vec::len).sum::<usize>(),
+            MAX_HPS_REPLAYS_GLOBAL
+        );
+        assert_eq!(
+            restored.store.list_kv("hps/replay/").len(),
+            MAX_HPS_REPLAYS_GLOBAL,
+            "rehydrate deletes generations beyond the global budget"
+        );
+    }
+
+    #[test]
+    fn hps_rehydrate_preserves_unaccepted_inbox_replay_markers_at_the_global_cap() {
+        let mut store = MemoryStore::new();
+        for index in 0..MAX_HPS_REPLAYS_GLOBAL {
+            let mut topic_tag = [0u8; 16];
+            topic_tag[8..].copy_from_slice(&(index as u64).to_be_bytes());
+            let mut publication_id = [0u8; 32];
+            publication_id[24..].copy_from_slice(&(index as u64).to_be_bytes());
+            store.put_kv(
+                &Node::<MemoryStore>::hps_replay_key(&topic_tag, index as u32),
+                postcard::to_allocvec(&PersistedHpsReplay {
+                    topic_tag,
+                    epoch: index as u32,
+                    entries: vec![(publication_id, 10_000)],
+                })
+                .unwrap(),
+            );
+        }
+
+        // This key sorts after every attacker-controlled row above. Rehydrate must reserve room for
+        // its replay marker before the earlier rows consume the global budget.
+        let protected_topic = ([0xff; 16], u32::MAX);
+        let protected_id = [0xee; 32];
+        let protected_message = HpsMessage {
+            id: protected_id,
+            path: "durable".into(),
+            sender: [7u8; 32],
+            body: b"keep me".to_vec(),
+        };
+        store.put_kv(
+            &Node::<MemoryStore>::hps_replay_key(&protected_topic.0, protected_topic.1),
+            postcard::to_allocvec(&PersistedHpsReplay {
+                topic_tag: protected_topic.0,
+                epoch: protected_topic.1,
+                entries: vec![(protected_id, 10_000)],
+            })
+            .unwrap(),
+        );
+        store.put_kv(
+            &Node::<MemoryStore>::hps_inbox_key(&protected_id),
+            postcard::to_allocvec(&PersistedHpsInbox {
+                message: protected_message.clone(),
+                topic_tag: protected_topic.0,
+                epoch: protected_topic.1,
+                received_at_ms: 1,
+                expires_at_ms: 10_000,
+            })
+            .unwrap(),
+        );
+
+        let restored = Node::with_store(Identity::generate(), store);
+        let messages = restored.take_hps_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, protected_message.id);
+        assert_eq!(messages[0].path, protected_message.path);
+        assert_eq!(messages[0].body, protected_message.body);
+        assert!(restored.hps_publication_recorded(
+            &protected_topic.0,
+            protected_topic.1,
+            &protected_id
+        ));
+        assert_eq!(
+            restored.hps_replays.values().map(Vec::len).sum::<usize>(),
+            MAX_HPS_REPLAYS_GLOBAL
+        );
+        assert!(restored
+            .store
+            .get_kv(&Node::<MemoryStore>::hps_inbox_key(&protected_id))
+            .is_some());
+    }
+
+    #[test]
+    fn hps_reach_ack_suppression_is_bounded_and_expires() {
+        let mut node = Node::new(Identity::generate());
+        node.set_time(1);
+        for index in 0..=MAX_HPS_ACKED {
+            let mut tag = [0u8; 16];
+            tag[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            assert!(node.record_hps_ack((tag, index as u32), 100 + index as u64));
+        }
+        assert_eq!(node.hps_acked.len(), MAX_HPS_ACKED);
+        assert!(!node.hps_acked.contains_key(&([0u8; 16], 0)));
+        node.tick(100 + MAX_HPS_ACKED as u64);
+        assert!(node.hps_acked.is_empty());
+    }
+
+    #[test]
+    fn hps_publish_rejects_validly_signed_future_epoch() {
+        let app = crate::app::AppKeys::from_secret([16u8; 32]);
+        let writer = Identity::generate();
+        let mut reader =
+            Node::with_store_app(Identity::generate(), MemoryStore::new(), app.clone());
+        let path = "room";
+        let content_key = [0x33; 32];
+        let tag = reader.app.topic_tag(path);
+        reader.install_subscription(path, writer.address(), content_key, None, 0);
+
+        let (nonce, ciphertext) = hps::seal_content(&content_key, b"from the future");
+        let future_epoch = 1;
+        let signature = writer
+            .sign(&hps::publish_signing_bytes(
+                &app.id,
+                &writer.address(),
+                &tag,
+                future_epoch,
+                &nonce,
+                &ciphertext,
+            ))
+            .to_vec();
+        let future = Bundle::create(
+            &writer,
+            Destination::Broadcast,
+            &hps::broadcast_identity().address(),
+            &Payload::HpsPublish {
+                topic_tag: tag,
+                epoch: future_epoch,
+                nonce: nonce.to_vec(),
+                ciphertext,
+                sig: signature,
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        reader.on_bundle(1, future);
+        assert!(reader.take_hps_messages().is_empty());
+
+        let (nonce, ciphertext) = hps::seal_content(&content_key, b"current");
+        let signature = writer
+            .sign(&hps::publish_signing_bytes(
+                &app.id,
+                &writer.address(),
+                &tag,
+                0,
+                &nonce,
+                &ciphertext,
+            ))
+            .to_vec();
+        let current = Bundle::create(
+            &writer,
+            Destination::Broadcast,
+            &hps::broadcast_identity().address(),
+            &Payload::HpsPublish {
+                topic_tag: tag,
+                epoch: 0,
+                nonce: nonce.to_vec(),
+                ciphertext,
+                sig: signature,
+            },
+            BundleOpts {
+                app: app.id,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        reader.on_bundle(2, current);
+        let messages = take_hps_and_accept(&mut reader);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].body, b"current");
     }
 
     // --- F-18d: guard_core exception-safety pass -------------------------------------------
@@ -10324,11 +17826,32 @@ mod tests {
             }
             self.inner.put_kv(key, value)
         }
+        fn apply_kv_batch(&mut self, mutations: &[KvMutation]) -> std::result::Result<(), String> {
+            if mutations.iter().any(|mutation| {
+                matches!(mutation, KvMutation::Put { key, .. } if key == &self.panic_key)
+            }) {
+                panic!(
+                    "PanicOnPutKv: simulated fallible-write panic on {}",
+                    self.panic_key
+                );
+            }
+            self.inner.apply_kv_batch(mutations)
+        }
+        fn put_kv_critical(
+            &mut self,
+            key: &str,
+            value: Vec<u8>,
+        ) -> std::result::Result<(), String> {
+            self.inner.put_kv_critical(key, value)
+        }
         fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
             self.inner.get_kv(key)
         }
         fn remove_kv(&mut self, key: &str) {
             self.inner.remove_kv(key)
+        }
+        fn remove_kv_critical(&mut self, key: &str) -> std::result::Result<(), String> {
+            self.inner.remove_kv_critical(key)
         }
         fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
             self.inner.list_kv(prefix)
@@ -10456,6 +17979,22 @@ mod tests {
             }
             fn set_copies(&mut self, id: &BundleId, copies: u16) {
                 self.inner.set_copies(id, copies)
+            }
+            fn apply_kv_batch(
+                &mut self,
+                mutations: &[KvMutation],
+            ) -> std::result::Result<(), String> {
+                self.inner.apply_kv_batch(mutations)
+            }
+            fn put_kv_critical(
+                &mut self,
+                key: &str,
+                value: Vec<u8>,
+            ) -> std::result::Result<(), String> {
+                self.inner.put_kv_critical(key, value)
+            }
+            fn remove_kv_critical(&mut self, key: &str) -> std::result::Result<(), String> {
+                self.inner.remove_kv_critical(key)
             }
         }
 

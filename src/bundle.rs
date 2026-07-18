@@ -54,7 +54,15 @@ pub struct TraceHop {
 // fleet. Deliberately on the UNSIGNED envelope so both the private content id and the wire id exclude
 // it (identical content dedups regardless of access material); the stamp is self-certifying instead
 // (root-signed cert + a tenant signature over this bundle's id). See access.rs and DESIGN.md §35.
-pub const BUNDLE_VERSION: u8 = 8;
+// v8 -> v9: adversarial remediation added a current-content-key MAC to HpsReachAck, changing that
+// payload layout. HPS publication signatures also now bind the app id, outer sender, topic tag, and
+// exact key epoch. v8 already shipped with carriage stamps, so the combined layout requires v9.
+pub const BUNDLE_VERSION: u8 = 9;
+
+/// Maximum encoded size accepted by [`Bundle::from_bytes`]. Oversized application content is carried
+/// in bounded [`Payload::Carrier`] chunks, so a single decoded bundle never needs to allocate beyond
+/// the link record cap. Check this before postcard sees attacker-controlled collection lengths.
+pub const MAX_BUNDLE_WIRE_BYTES: usize = 1 << 20;
 
 /// Globally-unique bundle id: `BLAKE3(src || nonce || payload_hash)`.
 pub type BundleId = [u8; 32];
@@ -295,9 +303,13 @@ pub enum Payload {
     HpsReachAck {
         topic_tag: [u8; 16],
         epoch: u32,
+        /// Keyed-BLAKE3 MAC under the current topic content key, binding the app, member, tag, and
+        /// exact epoch. A signed envelope alone proves who sent an ACK, not that they hold the key.
+        mac: [u8; 32],
     },
     /// A published message, flooded ([`Destination::Broadcast`]) to all subscribers. The body
-    /// is content-key encrypted; `sig` is the sender's signature over `path‖nonce‖ciphertext`.
+    /// is content-key encrypted; `sig` binds app id, outer sender, topic tag, exact epoch, nonce,
+    /// and ciphertext.
     /// `topic_tag` is the opaque per-topic tag (a foreign app that opens the public broadcast
     /// envelope can't tell which topic it is); `epoch` is the key generation.
     HpsPublish {
@@ -705,6 +717,12 @@ impl Bundle {
     /// Append a forwarder (node + carrying app) to the provenance trace (DESIGN.md
     /// §27). Capped so a long-lived bundle can't grow an unbounded header.
     pub fn add_hop(&mut self, node: ShortAddr, app: ShortApp) {
+        if self.is_private() {
+            // Trace is mutable and unsigned. Strip any injected provenance rather than forwarding
+            // or surfacing it on an untraceable bundle; hop count remains independent.
+            self.env.trace.clear();
+            return;
+        }
         const MAX_TRACE: usize = 16;
         if self.env.trace.len() < MAX_TRACE {
             self.env.trace.push(TraceHop { node, app });
@@ -713,7 +731,11 @@ impl Bundle {
 
     /// The provenance trace: who (and which app) forwarded this bundle, in order.
     pub fn trace(&self) -> &[TraceHop] {
-        &self.env.trace
+        if self.is_private() {
+            &[]
+        } else {
+            &self.env.trace
+        }
     }
 
     /// Decrement the hop limit for forwarding. Returns false if undeliverable.
@@ -729,7 +751,13 @@ impl Bundle {
 
     /// Encode to the wire format (postcard — see DESIGN.md §13.4).
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(postcard::to_allocvec(self)?)
+        if self.is_private() && !self.env.trace.is_empty() {
+            let mut clean = self.clone();
+            clean.env.trace.clear();
+            Ok(postcard::to_allocvec(&clean)?)
+        } else {
+            Ok(postcard::to_allocvec(self)?)
+        }
     }
 
     /// Decode from the wire format.
@@ -740,6 +768,9 @@ impl Bundle {
     /// [`Error::UnsupportedVersion`] instead of silently misdecoding into the wrong variant.
     /// See DESIGN.md §13.4 and the append-only enum discipline on [`Destination`]/[`Payload`].
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() > MAX_BUNDLE_WIRE_BYTES {
+            return Err(Error::Other("bundle exceeds wire-size limit".into()));
+        }
         match data.first() {
             None => return Err(Error::Codec(postcard::Error::DeserializeUnexpectedEnd)),
             Some(&v) if !is_supported_bundle_version(v) => {
@@ -753,6 +784,10 @@ impl Bundle {
         Ok(postcard::from_bytes(data)?)
     }
 }
+
+#[cfg(any(test, feature = "wire-vectors"))]
+#[path = "wire_vectors.rs"]
+pub mod wire_vectors;
 
 /// Which bundle wire versions this build can decode. Add older versions here when a
 /// migration path is needed; today only the current version is accepted.
@@ -820,6 +855,7 @@ fn compute_vaccine_id(token: &[u8; 32]) -> BundleId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn sample(from: &Identity, to_addr: &PubKeyBytes) -> Bundle {
         Bundle::create(
@@ -974,6 +1010,30 @@ mod tests {
         }
         // Empty input is a clean codec error, not a panic.
         assert!(Bundle::from_bytes(&[]).is_err());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn malformed_bundle_bytes_never_panic_and_successes_roundtrip_exactly(
+            data in prop::collection::vec(any::<u8>(), 0..65_536)
+        ) {
+            let decoded = std::panic::catch_unwind(|| Bundle::from_bytes(&data));
+            prop_assert!(decoded.is_ok(), "Bundle::from_bytes panicked");
+            if let Ok(bundle) = decoded.unwrap() {
+                let canonical = bundle.to_bytes().expect("a decoded bundle must re-encode");
+                let roundtrip = Bundle::from_bytes(&canonical).expect("canonical bytes must decode");
+                prop_assert_eq!(&roundtrip, &bundle);
+                prop_assert!(std::panic::catch_unwind(|| bundle.verify()).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_bundle_is_rejected_before_postcard_allocation() {
+        let bytes = vec![0u8; MAX_BUNDLE_WIRE_BYTES + 1];
+        assert!(matches!(Bundle::from_bytes(&bytes), Err(Error::Other(_))));
     }
 
     #[test]
@@ -1193,6 +1253,7 @@ mod tests {
                 Payload::HpsReachAck {
                     topic_tag: [0u8; 16],
                     epoch: 0,
+                    mac: [0u8; 32],
                 },
             ),
             (

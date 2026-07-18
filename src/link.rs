@@ -8,6 +8,15 @@ use crate::bundle::BundleId;
 use crate::crypto::{Identity, XPubKeyBytes};
 use crate::error::{Error, Result};
 
+/// Largest frame payload accepted by the generic bearer fragment decoder.
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Largest encoded frame accepted before postcard deserialization.
+pub const MAX_FRAME_WIRE_BYTES: usize = MAX_FRAME_PAYLOAD_BYTES + 64;
+/// Maximum number of fragments retained for one bundle.
+pub const MAX_FRAME_FRAGMENTS: u16 = 4096;
+/// Aggregate reassembly cap, aligned with [`crate::bundle::MAX_BUNDLE_WIRE_BYTES`].
+pub const MAX_REASSEMBLED_BUNDLE_BYTES: usize = crate::bundle::MAX_BUNDLE_WIRE_BYTES;
+
 /// Noise handshake pattern for link sessions: mutual static-key authentication
 /// (XX), X25519 DH, ChaCha20-Poly1305 AEAD, BLAKE2s hashing. Both peers learn and
 /// authenticate each other's X25519 static key ([`Identity::x_public`]).
@@ -147,15 +156,44 @@ pub struct Frame {
     pub bytes: Vec<u8>,
 }
 
+impl Frame {
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    /// Decode one bearer frame without allowing an encoded length to drive an unbounded allocation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_FRAME_WIRE_BYTES {
+            return Err(Error::Other("frame exceeds wire-size limit".into()));
+        }
+        let frame: Frame = postcard::from_bytes(bytes)?;
+        if frame.frag_count == 0
+            || frame.frag_count > MAX_FRAME_FRAGMENTS
+            || frame.frag_index >= frame.frag_count
+            || frame.bytes.len() > MAX_FRAME_PAYLOAD_BYTES
+        {
+            return Err(Error::Other("invalid frame bounds".into()));
+        }
+        Ok(frame)
+    }
+}
+
 /// Split an encoded bundle into frames no larger than `mtu` payload bytes.
 pub fn fragment(bundle_id: BundleId, encoded: &[u8], mtu: usize) -> Vec<Frame> {
-    assert!(mtu > 0, "mtu must be positive");
+    if mtu == 0 || mtu > MAX_FRAME_PAYLOAD_BYTES || encoded.len() > MAX_REASSEMBLED_BUNDLE_BYTES {
+        return Vec::new();
+    }
     let chunks: Vec<&[u8]> = if encoded.is_empty() {
         vec![&[]]
     } else {
         encoded.chunks(mtu).collect()
     };
-    let frag_count = chunks.len() as u16;
+    let Ok(frag_count) = u16::try_from(chunks.len()) else {
+        return Vec::new();
+    };
+    if frag_count > MAX_FRAME_FRAGMENTS {
+        return Vec::new();
+    }
     chunks
         .into_iter()
         .enumerate()
@@ -175,30 +213,52 @@ pub struct Reassembler {
     frag_count: u16,
     parts: Vec<Option<Vec<u8>>>,
     received: u16,
+    total_bytes: usize,
+    valid: bool,
 }
 
 impl Reassembler {
     pub fn new(bundle_id: BundleId, frag_count: u16) -> Self {
+        let valid = frag_count > 0 && frag_count <= MAX_FRAME_FRAGMENTS;
         Self {
             bundle_id,
             frag_count,
-            parts: vec![None; frag_count as usize],
+            parts: if valid {
+                vec![None; frag_count as usize]
+            } else {
+                Vec::new()
+            },
             received: 0,
+            total_bytes: 0,
+            valid,
         }
     }
 
     /// Accept a frame. Returns the reassembled bytes once complete.
     pub fn accept(&mut self, frame: Frame) -> Option<Vec<u8>> {
-        if frame.bundle_id != self.bundle_id || frame.frag_count != self.frag_count {
+        if !self.valid
+            || frame.bundle_id != self.bundle_id
+            || frame.frag_count != self.frag_count
+            || frame.bytes.len() > MAX_FRAME_PAYLOAD_BYTES
+        {
             return None;
         }
         let idx = frame.frag_index as usize;
         if idx >= self.parts.len() {
             return None;
         }
+        let previous = self.parts[idx].as_ref().map_or(0, Vec::len);
+        let next_total = self
+            .total_bytes
+            .saturating_sub(previous)
+            .saturating_add(frame.bytes.len());
+        if next_total > MAX_REASSEMBLED_BUNDLE_BYTES {
+            return None;
+        }
         if self.parts[idx].is_none() {
             self.received += 1;
         }
+        self.total_bytes = next_total;
         self.parts[idx] = Some(frame.bytes);
 
         if self.received == self.frag_count {
@@ -242,6 +302,7 @@ pub trait Bearer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn fragment_reassemble_roundtrip() {
@@ -266,6 +327,71 @@ mod tests {
         let frames = fragment([0u8; 32], &[], 185);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].frag_count, 1);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(192))]
+
+        #[test]
+        fn fragment_roundtrip_preserves_arbitrary_payloads(
+            data in prop::collection::vec(any::<u8>(), 0..65_536),
+            mtu in 1usize..2048,
+        ) {
+            let id = [0x5au8; 32];
+            let frames = fragment(id, &data, mtu);
+            let expected_fragments = data.len().max(1).div_ceil(mtu);
+            if expected_fragments > usize::from(MAX_FRAME_FRAGMENTS) {
+                prop_assert!(frames.is_empty());
+            } else {
+                prop_assert_eq!(frames.len(), expected_fragments);
+                let mut reassembler = Reassembler::new(id, frames[0].frag_count);
+                let mut complete = None;
+                for frame in frames.into_iter().rev() {
+                    let encoded = frame.to_bytes().expect("frame encodes");
+                    let decoded = Frame::from_bytes(&encoded).expect("frame decodes");
+                    if let Some(bytes) = reassembler.accept(decoded) {
+                        complete = Some(bytes);
+                    }
+                }
+                prop_assert_eq!(complete.as_deref(), Some(data.as_slice()));
+            }
+        }
+
+        #[test]
+        fn malformed_frame_bytes_never_panic(
+            data in prop::collection::vec(any::<u8>(), 0..65_600)
+        ) {
+            let decoded = std::panic::catch_unwind(|| Frame::from_bytes(&data));
+            prop_assert!(decoded.is_ok(), "Frame::from_bytes panicked");
+            if let Ok(frame) = decoded.unwrap() {
+                prop_assert!(frame.bytes.len() <= MAX_FRAME_PAYLOAD_BYTES);
+                prop_assert!(frame.frag_count <= MAX_FRAME_FRAGMENTS);
+                prop_assert!(frame.frag_index < frame.frag_count);
+            }
+        }
+    }
+
+    #[test]
+    fn fragment_and_reassembly_reject_zero_and_huge_counts() {
+        assert!(fragment([0u8; 32], b"x", 0).is_empty());
+        let mut zero = Reassembler::new([1u8; 32], 0);
+        assert!(zero
+            .accept(Frame {
+                bundle_id: [1u8; 32],
+                frag_index: 0,
+                frag_count: 0,
+                bytes: Vec::new(),
+            })
+            .is_none());
+        let mut huge = Reassembler::new([1u8; 32], MAX_FRAME_FRAGMENTS + 1);
+        assert!(huge
+            .accept(Frame {
+                bundle_id: [1u8; 32],
+                frag_index: 0,
+                frag_count: MAX_FRAME_FRAGMENTS + 1,
+                bytes: vec![1],
+            })
+            .is_none());
     }
 
     #[test]

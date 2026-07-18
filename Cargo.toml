@@ -33,6 +33,12 @@ license-file = "LICENSE.md"
 repository.workspace = true
 description = "Core protocol for Hop: bundles, crypto, store-and-forward, and routing."
 
+[features]
+# Test-only support used by the committed wire-vector generator and cargo-fuzz harnesses. Neither
+# feature changes production constructors, randomness, or accepted wire semantics.
+wire-vectors = []
+fuzzing = []
+
 [dependencies]
 serde.workspace = true
 postcard.workspace = true
@@ -66,3 +72,12 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 # referenced directly from this crate's source; declared purely so Cargo's feature unification
 # flips on the wasm_js backend for whichever exact getrandom 0.3.x snow resolves to.
 getrandom-for-snow = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+proptest = "1.7"
+serde_json = "1"
+
+[[example]]
+name = "wire-vectors"
+path = "examples/wire_vectors.rs"
+required-features = ["wire-vectors"]

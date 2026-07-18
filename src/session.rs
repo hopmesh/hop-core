@@ -41,6 +41,11 @@ fn dalek_rng() -> UnwrapErr<SysRng> {
 /// claims huge message numbers.
 pub const MAX_SKIP: usize = 1024;
 
+/// Maximum postcard-encoded ratchet message accepted from an untrusted bundle payload. Large user
+/// content is split into carrier chunks before ratcheting, so this cap rejects allocation probes
+/// without constraining valid messages.
+pub const MAX_RATCHET_MESSAGE_BYTES: usize = 1 << 20;
+
 /// Per-message header sent in the clear (and authenticated as AEAD associated
 /// data): the sender's current ratchet public, the previous sending-chain length,
 /// and this message's number within the current chain.
@@ -59,6 +64,23 @@ pub struct Header {
 pub struct RatchetMessage {
     pub header: Header,
     pub ciphertext: Vec<u8>,
+}
+
+impl RatchetMessage {
+    /// Encode the authenticated header and ciphertext exactly as they ride inside a bundle payload.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    /// Decode a ratchet message after applying an aggregate allocation bound.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_RATCHET_MESSAGE_BYTES {
+            return Err(Error::Other(
+                "ratchet message exceeds wire-size limit".into(),
+            ));
+        }
+        Ok(postcard::from_bytes(bytes)?)
+    }
 }
 
 /// One end of a Double Ratchet session with a single peer.
@@ -285,6 +307,7 @@ fn aead_decrypt(mk: &[u8; 32], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::crypto::{self, Identity};
+    use proptest::prelude::*;
 
     fn pair() -> (Session, Session) {
         let alice_id = Identity::generate();
@@ -407,5 +430,37 @@ mod tests {
             b"first",
             "a forged copy must not burn the genuine skipped-message key"
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn authentication_failure_rolls_back_all_ratchet_state(
+            plaintext in prop::collection::vec(any::<u8>(), 0..4096),
+            bit in 0u8..8,
+        ) {
+            let (mut alice, mut bob) = pair();
+            let genuine = alice.encrypt(&plaintext).expect("sender has a chain");
+            let before = postcard::to_allocvec(&bob).expect("session serializes");
+            let mut forged = genuine.clone();
+            forged.ciphertext[0] ^= 1 << bit;
+            prop_assert!(bob.decrypt(&forged).is_err());
+            let after = postcard::to_allocvec(&bob).expect("session serializes");
+            prop_assert_eq!(after, before, "failed authentication advanced ratchet state");
+            prop_assert_eq!(bob.decrypt(&genuine).expect("genuine message still opens"), plaintext);
+        }
+
+        #[test]
+        fn malformed_ratchet_encodings_never_panic(
+            bytes in prop::collection::vec(any::<u8>(), 0..65_536)
+        ) {
+            let parsed = std::panic::catch_unwind(|| RatchetMessage::from_bytes(&bytes));
+            prop_assert!(parsed.is_ok(), "RatchetMessage::from_bytes panicked");
+            if let Ok(message) = parsed.unwrap() {
+                let encoded = message.to_bytes().expect("decoded message re-encodes");
+                prop_assert_eq!(RatchetMessage::from_bytes(&encoded).unwrap(), message);
+            }
+        }
     }
 }
