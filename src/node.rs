@@ -520,6 +520,10 @@ pub struct ServiceRespItem {
 pub struct TelemetryIn {
     pub from: PubKeyBytes,
     pub batch: TelemetryBatch,
+    /// The billing tenant recovered from the bundle's carriage stamp (§35), or `None` if the batch
+    /// was unstamped or the node runs an `Open` access policy. Only attributed batches are billable
+    /// to the `hop_telemetry_events` meter; the tenant is an app/org, never a user (§39-safe).
+    pub tenant: Option<TenantId>,
 }
 
 /// In-progress reassembly of an inbound **carrier stream** (DESIGN.md §20): a bundle too
@@ -3285,7 +3289,19 @@ impl<S: Store> Node<S> {
     /// the receiver reassembles and processes the original bundle as if it arrived whole —
     /// so id, request_ack, delivery status and dedup are all preserved. Transparent: every
     /// `send_*` path funnels through here, so any payload type streams when needed.
-    fn deliver(&mut self, bundle: Bundle) {
+    fn deliver(&mut self, mut bundle: Bundle) {
+        // §35: stamp BEFORE any fragmentation. `to_bytes()` below snapshots the bundle for the
+        // carrier path, so a stamp applied later (in `submit`) would never reach the REASSEMBLED
+        // original: the receiver would see an unstamped bundle and could not attribute it to a
+        // tenant, so the largest (most billable) streamed bundles would silently bill nothing.
+        // Stamping here covers both paths; `submit`'s own `is_none()` guard skips re-stamping the
+        // small case, and the id is stamp-independent (the stamp rides the unsigned envelope).
+        if let Some(stamper) = &self.stamper {
+            let is_vaccine = matches!(bundle.inner.dst, Destination::Vaccine(_));
+            if bundle.env.access.is_none() && !is_vaccine {
+                bundle.env.access = Some(Box::new(stamper.stamp(&bundle.id(), self.now_ms)));
+            }
+        }
         let encoded = match bundle.to_bytes() {
             Ok(b) if b.len() > STREAM_CHUNK => b,
             _ => return self.submit(bundle), // small, or un-encodable: send as one
@@ -4421,11 +4437,22 @@ impl<S: Store> Node<S> {
                                 postcard::to_allocvec(&self.identity_record()).unwrap_or_default();
                             let _ = self.send_service_response(from, id, 0, body);
                         } else if service == SERVICE_TELEMETRY {
-                            // Built-in OTel-over-Hop sink (§40): decode + bounds-check, then surface
-                            // for the collector to forward. Fire-and-forget (no response); a
-                            // malformed or oversized batch is dropped rather than trusted.
+                            // Built-in OTel-over-Hop sink (§40): decode + bounds-check, attribute the
+                            // tenant from the carriage stamp (§35, the SAME verified attribution as
+                            // billing; any-epoch since telemetry is delay-tolerant and may carry a
+                            // legitimately-old spooled stamp), then surface it. Fire-and-forget (no
+                            // response); a malformed or oversized batch is dropped rather than trusted.
                             if let Some(batch) = TelemetryBatch::from_bytes(&args) {
-                                self.telemetry_in.push(TelemetryIn { from, batch });
+                                let tenant = bundle
+                                    .env
+                                    .access
+                                    .as_deref()
+                                    .and_then(|s| self.access_policy.attribute(s, &id));
+                                self.telemetry_in.push(TelemetryIn {
+                                    from,
+                                    batch,
+                                    tenant,
+                                });
                             }
                         } else {
                             // Custom service: hand to the embedding app to fulfill.
@@ -5808,9 +5835,117 @@ mod tests {
         assert_eq!(got[0].from, nodes[0].address());
         assert_eq!(got[0].batch, batch);
         assert_eq!(got[0].batch.billable_events(), 2);
+        assert_eq!(
+            got[0].tenant, None,
+            "no stamper + Open policy: unattributed"
+        );
         // Fire-and-forget: it is not surfaced as a custom service request, and no response returns.
         assert!(nodes[1].take_service_requests().is_empty());
         assert!(nodes[0].take_service_responses().is_empty());
+    }
+
+    #[test]
+    fn telemetry_attributes_the_tenant_from_the_carriage_stamp() {
+        // A device that stamps its bundles with its app's tenant key (§35) sends telemetry to a
+        // collector running the SAME Keyed policy as the billing relays; take_telemetry recovers the
+        // verified TenantId, so telemetry meters to the same tenant as billing (one attribution path).
+        const TENANT: crate::access::TenantId = [7u8; 16];
+        let now = 100 * crate::access::CARRIAGE_EPOCH_MS + 5;
+        let stamper_key = Identity::generate();
+
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        nodes[0].set_time(now);
+        nodes[1].set_time(now);
+        // The sender stamps everything it originates with its tenant key.
+        nodes[0].set_stamper(Some(Stamper::new(
+            TENANT,
+            Identity::from_secret_bytes(&stamper_key.to_secret_bytes()),
+        )));
+        // The collector knows TENANT -> the stamper's pubkey (the same KeyServer the relays hold).
+        let mut server = crate::access::KeyServer::new();
+        server.insert(TENANT, stamper_key.address());
+        nodes[1].set_access_policy(AccessPolicy::Keyed(crate::access::KeyedAccess::new(
+            server,
+            std::collections::HashSet::new(),
+        )));
+        nodes[1].refresh_access();
+
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        let batch = crate::telemetry::TelemetryBatch::new().counter("hop.bundle.delivered", 1, now);
+        nodes[0].send_telemetry(nodes[1].address(), &batch).unwrap();
+        net.pump(&mut nodes);
+
+        let got = nodes[1].take_telemetry();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].tenant,
+            Some(TENANT),
+            "attributed to the tenant via the carriage stamp"
+        );
+    }
+
+    #[test]
+    fn large_streamed_telemetry_is_still_attributable() {
+        // A batch over STREAM_CHUNK is fragmented into carriers. The stamp MUST be applied before
+        // fragmentation, or the reassembled original arrives unstamped and the largest (most
+        // billable) batches would silently bill nothing. Regression for that revenue bug.
+        const TENANT: crate::access::TenantId = [7u8; 16];
+        let now = 100 * crate::access::CARRIAGE_EPOCH_MS + 5;
+        let stamper_key = Identity::generate();
+
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        nodes[0].set_time(now);
+        nodes[1].set_time(now);
+        nodes[0].set_stamper(Some(Stamper::new(
+            TENANT,
+            Identity::from_secret_bytes(&stamper_key.to_secret_bytes()),
+        )));
+        let mut server = crate::access::KeyServer::new();
+        server.insert(TENANT, stamper_key.address());
+        nodes[1].set_access_policy(AccessPolicy::Keyed(crate::access::KeyedAccess::new(
+            server,
+            std::collections::HashSet::new(),
+        )));
+        nodes[1].refresh_access();
+
+        // Max-width records: ~8.5 KB each, so a handful clears the 48 KiB STREAM_CHUNK while still
+        // satisfying within_bounds (which caps COUNTS and string length, not total bytes).
+        let wide = "x".repeat(crate::telemetry::MAX_STR);
+        let mut batch = crate::telemetry::TelemetryBatch::new();
+        for _ in 0..8 {
+            let mut rec = crate::telemetry::Record::counter(&wide, 1, now).with_unit(&wide);
+            for _ in 0..crate::telemetry::MAX_ATTRS {
+                rec = rec.with_attr(&wide, &wide);
+            }
+            batch = batch.push(rec);
+        }
+        assert!(batch.within_bounds(), "a legal batch");
+        assert!(
+            batch.to_bytes().len() > STREAM_CHUNK,
+            "must exercise the streamed path"
+        );
+
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].send_telemetry(nodes[1].address(), &batch).unwrap();
+        for _ in 0..8 {
+            net.pump(&mut nodes); // several rounds: the stream is many carriers
+        }
+
+        let got = nodes[1].take_telemetry();
+        assert_eq!(got.len(), 1, "carriers reassembled into one batch");
+        assert_eq!(
+            got[0].tenant,
+            Some(TENANT),
+            "a streamed batch is still attributable (stamped before fragmentation)"
+        );
     }
 
     #[test]
