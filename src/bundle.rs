@@ -57,7 +57,11 @@ pub struct TraceHop {
 // v8 -> v9: adversarial remediation added a current-content-key MAC to HpsReachAck, changing that
 // payload layout. HPS publication signatures also now bind the app id, outer sender, topic tag, and
 // exact key epoch. v8 already shipped with carriage stamps, so the combined layout requires v9.
-pub const BUNDLE_VERSION: u8 = 9;
+// v9 -> v10: ADV18-08 coarsens the cleartext, id-bound `created_at` on §39 private bundles (and their
+// ACKs) to a 60s bucket so it is not a per-message sender timing fingerprint. This changes the wire
+// bytes (and thus the private wire id) of private bundles minted off a bucket boundary, so a v9 and a
+// v10 node compute different ids for the same logical send; the version gate must keep them apart.
+pub const BUNDLE_VERSION: u8 = 10;
 
 /// Maximum encoded size accepted by [`Bundle::from_bytes`]. Oversized application content is carried
 /// in bounded [`Payload::Carrier`] chunks, so a single decoded bundle never needs to allocate beyond

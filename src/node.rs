@@ -225,6 +225,23 @@ fn mailbox_epoch(now_ms: u64) -> u64 {
     now_ms / MAILBOX_EPOCH_MS
 }
 
+/// security-privacy-r18-08 (ADV18-08): private bundles (and their ACKs) carry `created_at` in the
+/// clear inside the signed inner, bound into the wire id. At millisecond resolution it is a sender
+/// timing fingerprint: two private bundles a sender mints close together are correlatable by exact
+/// stamp, and a relay on both legs can tie an ACK to its forward message by a matched pair of stamps.
+/// Coarsen the stamp to a wide bucket on the private path so the wire value no longer resolves
+/// individual sends. TTL/expiry still hold: bucketing rounds DOWN, so a bundle only ever looks
+/// slightly older (it expires marginally sooner, never later). Latency the ACK reports is likewise
+/// bucket-granular, which is an accepted trade: delivery latency is advisory UX, and per-message
+/// timing precision is exactly the fingerprint we are removing. The bucket is a constant, so every
+/// node coarsens identically.
+const PRIVATE_TIME_BUCKET_MS: u64 = 60_000;
+
+/// Round a wall-clock reading down to the private-path time bucket (ADV18-08).
+fn private_created_at(now_ms: u64) -> u64 {
+    (now_ms / PRIVATE_TIME_BUCKET_MS) * PRIVATE_TIME_BUCKET_MS
+}
+
 /// Signed-prekey rotation period (core-03). The published SPK rotates each epoch so a compromised
 /// prekey secret only exposes the X3DH first-message roots (and recognition tags) of sessions
 /// bootstrapped in that window, not for the identity's whole life. One week balances that bound
@@ -2313,7 +2330,9 @@ impl<S: Store> Node<S> {
                 mailbox_epoch(self.now_ms),
             ))),
             BundleOpts {
-                created_at: self.now_ms,
+                // ADV18-08: coarsen the cleartext, id-bound created_at so it is not a per-message
+                // sender timing fingerprint.
+                created_at: private_created_at(self.now_ms),
                 lifetime_ms: self.default_lifetime_ms,
                 flags: BundleFlags {
                     request_ack,
@@ -2984,7 +3003,9 @@ impl<S: Store> Node<S> {
                 mailbox_epoch(self.now_ms),
             ))),
             BundleOpts {
-                created_at: self.now_ms,
+                // ADV18-08: coarsen the ACK's cleartext created_at too, so a relay on both legs cannot
+                // tie the ACK to its forward message by a matched pair of millisecond stamps.
+                created_at: private_created_at(self.now_ms),
                 lifetime_ms,
                 ..Default::default()
             },
@@ -3317,6 +3338,8 @@ impl<S: Store> Node<S> {
                 // Build (or rebuild) a candidate responder session off-map. A private envelope's
                 // `from` is only a claim until this AEAD succeeds, so a forged fresh ephemeral must
                 // neither replace an established ratchet nor trigger control traffic at the victim.
+                // (ADV18-01 / core-protocol-r18-01: the same off-map-until-authenticated property this
+                // review called for; main landed this restructure independently, so we adopt it.)
                 let fresh = match self.sessions.get(&from) {
                     None => true,
                     Some(ps) => ps.established_by != Some(ek_pub),
@@ -7652,8 +7675,8 @@ impl<S: Store> Node<S> {
                         {
                             return false;
                         }
-                        // The request id, authenticated signer, and response kind must all match before
-                        // any request, store, immunity, UI, or response-queue state is changed.
+                        // r18-07: the request id, authenticated signer, and response kind must all match
+                        // before any request, store, immunity, UI, or response-queue state is changed.
                         if self.response_authorized(
                             &for_bundle_id,
                             &bundle.inner.src,
@@ -7715,6 +7738,8 @@ impl<S: Store> Node<S> {
                         // calls carry no ACK-vaccine of their own, so without this the
                         // request bundle would sit pinned in our store forever. Drop it
                         // everywhere and vaccinate so any in-flight copy is dropped too.
+                        // r18-07: the request id, authenticated signer, and response kind must all match
+                        // before any request/store/immunity/UI/response-queue state is changed.
                         if self.response_authorized(
                             &for_bundle_id,
                             &bundle.inner.src,
@@ -12652,10 +12677,12 @@ mod tests {
         net.connect(&mut nodes, 0, 1, 1, 1);
         exchange_prekeys(&mut net, &mut nodes);
 
-        // Sender sends at t=1000; recipient's clock is 1500ms ahead → it observes a 1500ms
-        // forward leg. (set_time sets the clock directly; pump shuttles bytes without ticking.)
-        nodes[0].set_time(1_000);
-        nodes[1].set_time(2_500);
+        // Sender sends at a bucket-aligned t=60_000 (ADV18-08 coarsens the private created_at to a
+        // 60s bucket, so aligning keeps this measuring the real forward leg rather than a bucket
+        // rounding artifact); recipient's clock is 1500ms ahead → it observes a 1500ms forward leg.
+        // (set_time sets the clock directly; pump shuttles bytes without ticking.)
+        nodes[0].set_time(60_000);
+        nodes[1].set_time(61_500);
         let bob = nodes[1].address();
         let id = nodes[0]
             .send_message(bob, "t".into(), b"time me".to_vec(), true)
@@ -12669,6 +12696,30 @@ mod tests {
         assert_eq!(
             fwd_ms, 1_500,
             "ACK carries the A→B forward latency the recipient saw"
+        );
+    }
+
+    #[test]
+    fn private_bundle_created_at_is_coarsened_on_the_wire() {
+        // ADV18-08: the cleartext, id-bound created_at on a private bundle must be bucketed, not the
+        // exact send millisecond, so it is not a per-message sender timing fingerprint.
+        let sender = Identity::generate();
+        let recipient = Identity::generate();
+        let mut node = Node::new(sender);
+        inject_prekey(&mut node, &recipient);
+        // A send time deliberately OFF a bucket boundary; the wire stamp must round down to the bucket.
+        node.set_time(60_000 + 37_123);
+        let mid = node
+            .send_message(recipient.address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap();
+        let stored = node
+            .store
+            .get(&mid)
+            .expect("sender holds its private bundle");
+        assert!(stored.is_private(), "it is a §39 private bundle");
+        assert_eq!(
+            stored.inner.created_at, 60_000,
+            "created_at is coarsened to the private time bucket, not the exact send ms"
         );
     }
 
