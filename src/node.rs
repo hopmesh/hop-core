@@ -1975,6 +1975,29 @@ impl<S: Store> Node<S> {
         std::mem::take(&mut self.usage_dropped)
     }
 
+    /// §35 storage floor: a snapshot of currently-held sealed bytes per tenant, for the host's
+    /// meter flush to integrate into storage occupancy (byte-milliseconds → `hop_mailbox_gb_month`).
+    ///
+    /// Read-only over the in-memory [`Self::metered_attribution`] map, which is bounded by
+    /// [`MAX_METERED_ATTRIBUTION`] and pruned each tick to only still-held bundles, so this is
+    /// O(held set) with no store scan (it must never touch the hot path). Unlike [`Self::take_usage`]
+    /// this does NOT drain: occupancy is a standing quantity the host samples repeatedly.
+    ///
+    /// Only bundles taken under `Keyed` policy carry a verified tenant, so this reflects billable
+    /// storage on a keyed hosted relay and is empty on an `Open` relay (same scope as carriage). It
+    /// is in-memory ONLY: the §39 mailbox is blind (tenant known solely via the custody-time stamp,
+    /// never persisted), so a bundle held ACROSS a restart is not re-attributed and its occupancy is
+    /// not billed. That under-bills after a restart and NEVER over-bills, which is the safe error;
+    /// persisting per-bundle tenants to bill it would leak a per-object occupancy timeline (§39).
+    pub fn sample_storage_bytes(&self) -> Vec<(TenantId, u64)> {
+        let mut by_tenant: HashMap<TenantId, u64> = HashMap::new();
+        for (tenant, bytes) in self.metered_attribution.values() {
+            let e = by_tenant.entry(*tenant).or_default();
+            *e = e.saturating_add(*bytes);
+        }
+        by_tenant.into_iter().collect()
+    }
+
     /// §35 delivery-justified billing: bill the tenant we recorded (verified) when we took custody
     /// of `id`, because its delivery is now PROVEN (an ACK or §39 vaccine cleared our held copy).
     /// Idempotent: the attribution is removed, so a re-flooded proof cannot double-charge, and a
@@ -18241,6 +18264,70 @@ mod access_gate_tests {
         assert_eq!(usage[0].0, TENANT);
         assert_eq!(usage[0].1.bundles, 1, "billed once, on proven delivery");
         assert!(usage[0].1.payload_bytes > 0);
+    }
+
+    #[test]
+    fn storage_sampler_reflects_held_bytes_per_tenant_and_clears_on_delivery() {
+        // The storage floor samples currently-held sealed bytes per tenant (occupancy), a standing
+        // quantity NOT drained by take_usage. Custody makes it nonzero; a proven delivery (which
+        // removes the attribution via meter_delivered) drops it back to empty.
+        let sender = Identity::generate();
+        let recipient = Identity::generate();
+        let (stamper, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+
+        assert!(relay.sample_storage_bytes().is_empty(), "nothing held yet");
+
+        let mut b = Bundle::create(
+            &sender,
+            Destination::Device(recipient.address()),
+            &recipient.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"carry me".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let bid = b.id();
+        b.env.access = Some(Box::new(stamper.stamp(&bid, NOW)));
+        relay.on_bundle(9, b);
+
+        let held = relay.sample_storage_bytes();
+        assert_eq!(held.len(), 1, "one tenant holding");
+        assert_eq!(held[0].0, TENANT);
+        assert!(held[0].1 > 0, "held sealed bytes are counted");
+        assert!(
+            relay.take_usage().is_empty(),
+            "sampling storage does not drain carriage usage"
+        );
+
+        // A delivery ACK purges the held copy and removes the attribution, so occupancy clears.
+        let ack = Bundle::create(
+            &recipient,
+            Destination::AckTo(sender.address(), bid),
+            &sender.address(),
+            &Payload::Ack {
+                for_bundle_id: bid,
+                status: 0,
+                delivery_hops: 1,
+                delivery_ms: 0,
+                proof: None,
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    is_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        relay.on_bundle(9, ack);
+        assert!(
+            relay.sample_storage_bytes().is_empty(),
+            "delivered bundle no longer occupies storage"
+        );
     }
 
     #[test]
