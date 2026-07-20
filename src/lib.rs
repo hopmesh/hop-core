@@ -26,6 +26,8 @@ pub mod store;
 pub mod stream;
 pub mod telemetry;
 pub mod util;
+/// Wire-byte determination owned by the node layer. Hashed by the wire-version guard.
+pub mod wire_emit;
 
 pub use error::{Error, Result};
 

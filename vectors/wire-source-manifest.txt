@@ -1,11 +1,23 @@
+# Files whose bytes determine the wire format. tools/wire-version-guard.sh hashes each one and
+# fails if any changed without a BUNDLE_VERSION bump. Keep this list to code that actually decides
+# emitted bytes or the accepted byte envelope: every unrelated line in a listed file turns an
+# ordinary change into a false wire bump, which degrades the version into a build counter.
+#
+# Adding a path here is free (widening the guard never needs a bump). Removing one needs an
+# explicit '# retired: OLD -> NEW' record below, and the guard then requires the committed corpus
+# to be byte-identical, so the claim "the code only moved" is checked rather than trusted.
+#
+# retired: core/hop-core/src/node.rs -> core/hop-core/src/wire_emit.rs (link framing, session
+# plaintext, identify body, and carrier chunking extracted; the remaining production lines of
+# node.rs are state machine and bookkeeping that cannot move a wire byte)
 core/hop-core/src/access.rs
 core/hop-core/src/bundle.rs
 core/hop-core/src/crypto.rs
 core/hop-core/src/discover.rs
 core/hop-core/src/hps.rs
 core/hop-core/src/link.rs
-core/hop-core/src/node.rs
 core/hop-core/src/reach.rs
 core/hop-core/src/session.rs
 core/hop-core/src/store.rs
+core/hop-core/src/wire_emit.rs
 core/hop-core/src/wire_vectors.rs
