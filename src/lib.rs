@@ -28,6 +28,8 @@ pub mod telemetry;
 pub mod util;
 /// Wire-byte determination owned by the node layer. Hashed by the wire-version guard.
 pub mod wire_emit;
+/// Wire-byte determination for §35 carriage stamps. Hashed by the wire-version guard.
+pub mod wire_stamp;
 
 pub use error::{Error, Result};
 

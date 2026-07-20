@@ -10,7 +10,17 @@
 # retired: core/hop-core/src/node.rs -> core/hop-core/src/wire_emit.rs (link framing, session
 # plaintext, identify body, and carrier chunking extracted; the remaining production lines of
 # node.rs are state machine and bookkeeping that cannot move a wire byte)
-core/hop-core/src/access.rs
+#
+# retired: core/hop-core/src/access.rs -> core/hop-core/src/wire_stamp.rs (the §35 carriage-stamp
+# LAYOUT moved: the CarriageStamp struct and its postcard field order, both domain separators
+# HINT_CONTEXT and STAMP_CONTEXT, the TenantId width that is the hint preimage, HINT_BYTES,
+# CARRIAGE_EPOCH_MS and epoch_of which fix the emitted epoch value, carriage_hint, stamp_message,
+# and Stamper, the only producer of stamp bytes. What remains in access.rs decides whether to
+# ACCEPT a stamp, never how one is shaped: KeyServer, the denylist, the precomputed hint buckets,
+# the current/previous freshness window, AccessPolicy/Admit, attribute/resolve, and Usage, which
+# is a metering atom for the durable ledger and never rides the mesh envelope. A relay refusing a
+# stamp it used to admit is a policy change, not a format change, so it cannot move a wire byte;
+# the same precedent the node.rs retirement set, where a replay bound stayed out of the manifest)
 core/hop-core/src/bundle.rs
 core/hop-core/src/crypto.rs
 core/hop-core/src/discover.rs
@@ -20,4 +30,5 @@ core/hop-core/src/reach.rs
 core/hop-core/src/session.rs
 core/hop-core/src/store.rs
 core/hop-core/src/wire_emit.rs
+core/hop-core/src/wire_stamp.rs
 core/hop-core/src/wire_vectors.rs
