@@ -1,6 +1,6 @@
 //! Small shared utilities. Compression keeps gossip payloads and relay-cache
-//! entries small — important because every device relays for others (DESIGN.md
-//! §15–§16: "compression is key, keep relays light").
+//! entries small, important because every device relays for others (DESIGN.md
+//! §15 to §16: "compression is key, keep relays light").
 
 use crate::error::{Error, Result};
 

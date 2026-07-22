@@ -1,9 +1,9 @@
-//! Learned routes — utility from observed deliveries (DESIGN.md §27).
+//! Learned routes: utility from observed deliveries (DESIGN.md §27).
 //!
 //! A node learns *which destinations it can route well to* from the traffic it
 //! relays. When the delivery-ACK for a bundle it forwarded comes back **through**
 //! it, the node has confirmed it sits on a working path between that bundle's `src`
-//! and `dst` — in **both** directions, even if it never met either endpoint. It
+//! and `dst`, in **both** directions, even if it never met either endpoint. It
 //! records a recency-decayed reachability score per endpoint: higher = "I'm a good
 //! path toward this address right now".
 //!
@@ -124,7 +124,7 @@ mod tests {
         let (s, d) = (addr(1), addr(2));
         rt.learn(&s, &d, 0);
         assert!(rt.knows(&s, 0), "learned src↔dst should mark src reachable");
-        assert!(rt.knows(&d, 0), "and dst reachable — either direction");
+        assert!(rt.knows(&d, 0), "and dst reachable, either direction");
         assert_eq!(
             rt.utility(&addr(9), 0),
             0.0,

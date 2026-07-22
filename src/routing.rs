@@ -64,7 +64,7 @@ pub trait Router {
 /// Binary spray-and-wait (B) plus gateway-gradient (A). DESIGN.md §6.
 ///
 /// The spray-and-wait copy budget lives in the bundle envelope (it travels with
-/// the bundle), so the router itself is stateless about copies — it only reads
+/// the bundle), so the router itself is stateless about copies; it only reads
 /// `meta.copies`. The custodian performs the actual `floor(n/2)` split on handoff
 /// via [`crate::bundle::Bundle::split_copies`].
 #[derive(Default)]
@@ -97,7 +97,7 @@ impl Router for SprayAndWait {
         }
         // Epidemic routing (DESIGN.md §6): forward to everyone, bounded only by the
         // hop limit. The destination dedups duplicate copies by `BundleId`, and a
-        // delivery ACK floods back as a vaccine that purges copies from relays — so
+        // delivery ACK floods back as a vaccine that purges copies from relays, so
         // we don't meter copies with a spray budget. Direct delivery to the
         // destination still happens via this same Forward (handled by the custodian).
         let _ = to;
@@ -156,7 +156,7 @@ mod tests {
         let dst = [9u8; 32];
         let other = [0u8; 32];
 
-        // Forward to a relay and to the destination alike — copy count is irrelevant
+        // Forward to a relay and to the destination alike, copy count is irrelevant
         // (the destination dedups; a delivery ACK purges copies).
         assert_eq!(
             r.should_forward(&meta(Destination::Device(dst), 5, 1), &other),

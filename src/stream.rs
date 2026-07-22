@@ -12,7 +12,7 @@
 //!   the peer reconnects after a gap, releasing them once acknowledged.
 //!
 //! Together these make partial stream data survive intermittent connectivity
-//! without loss or reordering — the device simply catches up from where it left off.
+//! without loss or reordering, the device simply catches up from where it left off.
 
 use std::collections::BTreeMap;
 
@@ -34,7 +34,7 @@ impl StreamReassembler {
     }
 
     /// Accept one chunk. Returns the chunks (if any) that are now deliverable in
-    /// order — possibly several at once when an arrival fills a gap, or none for a
+    /// order, possibly several at once when an arrival fills a gap, or none for a
     /// duplicate or a still-gapped arrival.
     pub fn accept(&mut self, seq: u64, bytes: Vec<u8>, fin: bool) -> Vec<Vec<u8>> {
         if seq < self.next || self.buffer.contains_key(&seq) {
@@ -71,7 +71,7 @@ impl StreamReassembler {
 }
 
 /// Holds outbound chunks until the peer acknowledges them, so they can be resent
-/// after the peer reconnects from a gap. Bounded — `push` refuses when full
+/// after the peer reconnects from a gap. Bounded: `push` refuses when full
 /// (backpressure: the peer is too far behind).
 pub struct StreamBuffer {
     next_seq: u64,
@@ -105,7 +105,7 @@ impl StreamBuffer {
         self.unacked.retain(|&seq, _| seq > ack);
     }
 
-    /// Chunks still unacknowledged from `seq` onward, in order — to resend after a
+    /// Chunks still unacknowledged from `seq` onward, in order, to resend after a
     /// reconnect. (Pass the peer's last ACK + 1, or 0 to resend everything held.)
     pub fn resend_from(&self, seq: u64) -> Vec<(u64, Vec<u8>)> {
         self.unacked
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn buffers_out_of_order_then_drains_on_gap_fill() {
         let mut r = StreamReassembler::new();
-        // Chunks arrive 2, 1, then 0 — nothing deliverable until 0 fills the gap.
+        // Chunks arrive 2, 1, then 0: nothing deliverable until 0 fills the gap.
         assert!(r.accept(2, b"c".to_vec(), true).is_empty());
         assert!(r.accept(1, b"b".to_vec(), false).is_empty());
         assert_eq!(r.ack_through(), None);
@@ -173,7 +173,7 @@ mod tests {
         b.ack(0); // peer confirmed through seq 0
         assert_eq!(b.pending(), 2);
 
-        // Peer reconnected having last acked 0 — resend from 1.
+        // Peer reconnected having last acked 0, resend from 1.
         let resend = b.resend_from(1);
         assert_eq!(resend, vec![(1, b"1".to_vec()), (2, b"2".to_vec())]);
     }

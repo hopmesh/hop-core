@@ -1,8 +1,8 @@
 //! # hop-core
 //!
 //! The pure-Rust core of Hop, a delay-tolerant mesh network. Everything
-//! deterministic lives here — bundle codec, crypto, store-and-forward, routing,
-//! and link framing — so it runs identically in unit tests, the `hop-sim`
+//! deterministic lives here: bundle codec, crypto, store-and-forward, routing,
+//! and link framing, so it runs identically in unit tests, the `hop-sim`
 //! simulator, and on-device via `hop-ffi`. Only the BLE bearer is native.
 //!
 //! See `DESIGN.md` at the repo root for the full protocol specification.
@@ -36,7 +36,7 @@ pub use error::{Error, Result};
 /// Application namespace on the shared Hop fabric. See DESIGN.md §17.
 ///
 /// Every Hop-enabled app advertises the **same** BLE service UUID and relays for
-/// every other app — the fabric is shared, not per-app, so a single app is never
+/// every other app, the fabric is shared, not per-app, so a single app is never
 /// alone on the mesh. `AppId` tags each bundle and advert so an app can
 /// demultiplex its own traffic; relays forward all apps' traffic regardless and
 /// can't read sealed payloads. Derive a stable id from a reverse-DNS app name via
@@ -55,7 +55,7 @@ pub fn app_id(name: &str) -> AppId {
 }
 
 /// A compact 8-byte form of an [`AppId`], stamped into each trace hop alongside the
-/// node's short address so a route shows *which app carried it* (DESIGN.md §27) — e.g.
+/// node's short address so a route shows *which app carried it* (DESIGN.md §27), e.g.
 /// a relay hop carries [`relay_app_id`]'s short form.
 pub type ShortApp = [u8; 8];
 

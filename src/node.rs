@@ -1,4 +1,4 @@
-//! The node event loop — the orchestration that turns the tested pieces into a
+//! The node event loop, the orchestration that turns the tested pieces into a
 //! running Hop node. See DESIGN.md §3 (it spans every layer).
 //!
 //! A [`Node`] is driven by [`BearerEvent`]s from a bearer and produces opaque
@@ -13,7 +13,7 @@
 //! The loop is transport-agnostic and fully testable without a radio: feed it
 //! events, drain its outgoing bytes, read its inbox. v1 sends each message as one
 //! link packet; MTU fragmentation (`link::fragment`) wraps this when a bearer
-//! needs it — a TODO for the BLE shim.
+//! needs it, a TODO for the BLE shim.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -77,7 +77,7 @@ struct Established {
 
 /// Per-PEER gossip dedup that SURVIVES link re-establishment. The per-`Established` `sent_*` sets
 /// are wiped on every (re)connect; on a flapping BLE link that re-floods the whole directory to the
-/// peer each cycle — the resource-exhaustion field bug (tx >> rx, real messages starve). We snapshot
+/// peer each cycle, the resource-exhaustion field bug (tx >> rx, real messages starve). We snapshot
 /// them here on Disconnect, keyed by peer address, and restore them on the next Up to the same peer.
 #[derive(Default)]
 struct PeerSent {
@@ -115,12 +115,12 @@ pub const DEFAULT_RETX_INTERVAL_MS: u64 = 5_000;
 pub const MAX_RETX_INTERVAL_MS: u64 = 900_000;
 
 /// How often to re-gossip adverts (prekeys/presence) over already-up links, so a forward-secret
-/// session can form without a reconnect (the "move out of range and back to send" bug). Cheap —
+/// session can form without a reconnect (the "move out of range and back to send" bug). Cheap:
 /// receivers dedup unchanged adverts.
 pub const REGOSSIP_INTERVAL_MS: u64 = 12_000;
 
 /// How many distinct peers a delivery-ACK is replicated to before it stops spreading
-/// (DESIGN.md §7). Until then it rides along to every new contact — the ACK both confirms
+/// (DESIGN.md §7). Until then it rides along to every new contact, the ACK both confirms
 /// delivery and vaccinates the mesh, so it's worth replicating, but bounded.
 pub const ACK_REPLICATION_TARGET: usize = 3;
 
@@ -128,7 +128,7 @@ pub const ACK_REPLICATION_TARGET: usize = 3;
 /// message it confirms.
 pub const MAX_ACK_LIFETIME_MS: u32 = 7 * 86_400_000;
 
-/// Don't re-emit a delivery-ACK for the same message more often than this — a burst of
+/// Don't re-emit a delivery-ACK for the same message more often than this, a burst of
 /// duplicate copies can't trigger an ACK storm (the re-ACK recovers a lost ACK; §7).
 pub const REACK_MIN_INTERVAL_MS: u64 = 30_000;
 
@@ -137,7 +137,7 @@ pub const REACK_MIN_INTERVAL_MS: u64 = 30_000;
 pub const DEFAULT_MAX_RELAYED: usize = 128;
 
 /// After we've relayed a not-ours bundle to ≥1 peer, keep it at least this long before
-/// it becomes eviction-eligible — so in a populated area it can be handed off again, and
+/// it becomes eviction-eligible, so in a populated area it can be handed off again, and
 /// so a flood of big transfers can't immediately evict freshly-relayed traffic (DESIGN.md
 /// §6). Under cap pressure, eviction *prefers* such already-relayed, past-grace bundles
 /// and only drops a not-yet-relayed bundle when nothing else can be freed.
@@ -157,7 +157,7 @@ pub const PREKEY_TTL_MS: u32 = 604_800_000;
 
 /// §39 P4 receiver-beacon: how long a laid gradient entry lives without a refresh. Kept SHORT
 /// (relative to [`PREKEY_TTL_MS`]) so a moved/silent recipient stops attracting bundles within
-/// one TTL — no permanent black-hole. Refresh interval must be well under this.
+/// one TTL, no permanent black-hole. Refresh interval must be well under this.
 pub const RECV_BEACON_TTL_MS: u32 = 90_000;
 /// How often a "route-to-me" recipient re-emits its beacon to keep the gradient fresh. Well
 /// under [`RECV_BEACON_TTL_MS`] so a single missed beacon self-heals; the gradient tracks a
@@ -214,7 +214,7 @@ fn prekey_epoch(now_ms: u64) -> u64 {
     now_ms / PREKEY_EPOCH_MS
 }
 
-/// sec-priv-04: the **routing key** for a mailbox-tag — its short prefix ([`crypto::mailbox_route`])
+/// sec-priv-04: the **routing key** for a mailbox-tag, its short prefix ([`crypto::mailbox_route`])
 /// right-padded back into a full [`Tag`] with zeros. Every routing/spool/want-beacon DECISION keys on
 /// this, never on the full tag, so an address-knower who can compute a target's full mailbox-tag only
 /// ever sees a routing bucket shared by an *anonymity set* of every address that collides on the
@@ -226,7 +226,7 @@ fn route_key(tag: &Tag) -> Tag {
     route_key_from_prefix(&crypto::mailbox_route(tag))
 }
 
-/// The gradient/spool/want map key ([`route_key`]) for a mailbox routing PREFIX already in hand — e.g.
+/// The gradient/spool/want map key ([`route_key`]) for a mailbox routing PREFIX already in hand, e.g.
 /// the [`crate::bundle::PrivateHeader::mailbox`] prefix a private bundle now carries on the wire
 /// (core-protocol-r2-02). Right-pads the prefix into a full [`Tag`] with zeros so the map keys stay
 /// `Tag`-typed and identical to those laid from a beacon's full tag via [`route_key`].
@@ -288,7 +288,7 @@ pub const HPS_TOPIC_TTL_MS: u32 = 604_800_000;
 /// briefly so a burst of lookups for the same domain coalesces.
 pub const MIN_HNS_TTL_MS: u64 = 1_000;
 
-/// Ceiling on a cached HNS record's lifetime (1 day) — a stale endpoint address can't linger
+/// Ceiling on a cached HNS record's lifetime (1 day), a stale endpoint address can't linger
 /// forever even if DNS hands back an absurd TTL.
 pub const MAX_HNS_TTL_MS: u64 = 86_400_000;
 
@@ -305,11 +305,11 @@ struct TxInfo {
     /// Hops the original message took to *reach* the destination (forward path length).
     delivered_hops: u8,
     /// **Forward-path** latency to the destination in ms (the destination's receive time
-    /// minus our send time, as it reported in the ACK) — the A→B leg, not the round trip.
+    /// minus our send time, as it reported in the ACK), the A→B leg, not the round trip.
     delivered_ms: u32,
 }
 
-/// §39 P4 (+ sec-priv-04): one soft-state next-hop under a mailbox **route prefix** — "a recipient in
+/// §39 P4 (+ sec-priv-04): one soft-state next-hop under a mailbox **route prefix**, "a recipient in
 /// this prefix's anonymity set is reachable via `inbound`." Recorded from a signed
 /// [`AdvertKind::RecvBeacon`]; per inbound link the closest (fewest-hop), freshest (highest `seq`)
 /// beacon wins. Pruned at `expires_at`.
@@ -317,7 +317,7 @@ struct TxInfo {
 struct GradientLink {
     /// Distance to the recipient in advert-hops (lower = closer; breaks ties when re-pointing).
     hops: u8,
-    /// `beacon.created_at + ttl_ms` — dropped once the clock passes this (no refresh ⇒ no route).
+    /// `beacon.created_at + ttl_ms`, dropped once the clock passes this (no refresh ⇒ no route).
     expires_at: u64,
     /// The beacon's per-publisher `seq`; a strictly-higher seq supersedes on the same link.
     seq: u64,
@@ -334,7 +334,7 @@ struct GradientLink {
 /// SEVERAL distinct recipients reachable via DIFFERENT next hops. A prefix collision is rare (a 2-byte
 /// prefix ⇒ ~1/65536 per peer pair) but must not starve a colliding recipient, so the bucket holds a
 /// bounded set of next-hop links and a matching private bundle is forwarded down ALL live links in it
-/// (never to a link that did not beacon this prefix — the decoy stays excluded, so directed routing
+/// (never to a link that did not beacon this prefix, the decoy stays excluded, so directed routing
 /// still holds). The far end that isn't the intended recipient simply fails the per-message
 /// recognition tag and drops its copy; the intended one recognizes and delivers.
 #[derive(Clone, Debug, Default)]
@@ -353,7 +353,7 @@ const MAX_GRADIENT_LINKS_PER_BUCKET: usize = 8;
 #[derive(Clone, Debug)]
 pub struct QueuedMessage {
     pub id: BundleId,
-    /// True if we originated it (pinned — never evicted). False = relaying for a peer.
+    /// True if we originated it (pinned, never evicted). False = relaying for a peer.
     pub own: bool,
     /// Destination device address, if addressed to one.
     pub to: Option<PubKeyBytes>,
@@ -489,7 +489,7 @@ pub struct HnsEntry {
 }
 
 /// A finished HNS resolution surfaced to the app. `address` is `None` when the domain served no
-/// valid reach record (resolution error — e.g. `hops://thisdoesnotexist.com`).
+/// valid reach record (resolution error, e.g. `hops://thisdoesnotexist.com`).
 pub struct HnsResult {
     pub domain: String,
     pub address: Option<PubKeyBytes>,
@@ -525,7 +525,7 @@ pub struct HttpRespItem {
 /// (built-in `hop.` services are answered by the node and never surface here).
 pub struct ServiceReqItem {
     pub from: PubKeyBytes,
-    /// The request bundle's id — pass it to [`Node::send_service_response`] to reply.
+    /// The request bundle's id. Pass it to [`Node::send_service_response`] to reply.
     pub id: BundleId,
     pub service: String,
     pub method: String,
@@ -846,12 +846,12 @@ pub struct Node<S: Store = MemoryStore> {
     /// anchor because their durable authorization expiry must never be based on the zero origin.
     clock_anchored: bool,
     /// Last time we re-gossiped adverts to all live links (so prekeys/presence propagate over
-    /// STABLE links, not just at link-up — see the re-gossip in `tick`).
+    /// STABLE links, not just at link-up; see the re-gossip in `tick`).
     last_regossip_ms: u64,
     /// Last time we emitted our §39 P4 receiver-beacon (re-emitted on [`RECV_BEACON_REFRESH_MS`]).
     last_recv_beacon_ms: u64,
     /// "Route-to-me" mode: emit a receiver-beacon so private bundles route to us via the gradient.
-    /// Default on (the common case — be reachable); a max-privacy passive recipient sets it off and
+    /// Default on (the common case, be reachable); a max-privacy passive recipient sets it off and
     /// only recognizes what floods past, advertising no linkable mailbox handle (DESIGN.md §39).
     route_to_me: bool,
     links: HashMap<LinkId, LinkState>,
@@ -897,10 +897,10 @@ pub struct Node<S: Store = MemoryStore> {
     /// §39 P4 soft-state routing gradient: mailbox-tag → the next hop *toward* that recipient.
     /// Laid by recipients' signed [`AdvertKind::RecvBeacon`]s as they flood a few hops; a node
     /// then forwards a matching **private** bundle down `inbound` instead of blind-flooding. Soft
-    /// state — pruned by `expires_at` in [`Node::tick`], superseded by a fresher/closer beacon,
+    /// state, pruned by `expires_at` in [`Node::tick`], superseded by a fresher/closer beacon,
     /// capped at [`MAX_RECV_GRADIENT`]. Empty ⇒ flood fallback (the privacy floor / cold start).
     recv_gradient: HashMap<Tag, GradientEntry>,
-    /// §39 P5: mailbox-tags whose recipient just (re)beaconed here — i.e. a want-beacon. The host
+    /// §39 P5: mailbox-tags whose recipient just (re)beaconed here, i.e. a want-beacon. The host
     /// drains these via [`take_wanted_mailboxes`] and reloads that mailbox's durable blind spool, so
     /// an offline-deposited private bundle is pulled the moment the recipient comes back. Bounded.
     wanted_mailboxes: Vec<Tag>,
@@ -914,14 +914,14 @@ pub struct Node<S: Store = MemoryStore> {
     /// Restored sessions have no persisted last-use timestamp. Anchor these to the first real tick
     /// before idle GC so an epoch-scale clock does not immediately reap every restored ratchet.
     unanchored_sessions: HashSet<PubKeyBytes>,
-    /// Bundle ids we've been "vaccinated" against by a passing delivery ACK — we
+    /// Bundle ids we've been "vaccinated" against by a passing delivery ACK; we
     /// drop them on sight so a delivered message stops propagating (epidemic
     /// recovery, DESIGN.md §6). Pruned by age in [`Node::tick`].
     immune: HashMap<BundleId, u64>,
     /// core-protocol-r12-01 (§39 recognition-header chimera): ids of private bundles we've RECOGNIZED
     /// and delivered/handled, so delivery-once is decided HERE rather than off `store.seen`. The private
     /// id binds only the sealed payload (`compute_private_id` excludes the recognition header), so a
-    /// verify()-passing same-id chimera with a corrupted header is never recognized — yet it still marks
+    /// verify()-passing same-id chimera with a corrupted header is never recognized, yet it still marks
     /// `store.seen` on the relay/flood path. Gating first-delivery on `seen` therefore let such a chimera
     /// suppress the genuine copy's `inbox.push` (silent loss) and fire a false "Delivered" ACK. Only a
     /// recognized-for-us bundle ever enters this set, so a chimera cannot poison it and it is not
@@ -1013,7 +1013,7 @@ pub struct Node<S: Store = MemoryStore> {
     /// keeps riding to new contacts until it reaches [`ACK_REPLICATION_TARGET`] peers,
     /// then stops (DESIGN.md §7).
     ack_replicate: HashMap<BundleId, HashSet<PubKeyBytes>>,
-    /// Last time we emitted a delivery-ACK for a given delivered message id — throttles
+    /// Last time we emitted a delivery-ACK for a given delivered message id, throttles
     /// re-ACKs so duplicate floods can't cause an ACK storm.
     last_ack: HashMap<BundleId, u64>,
     /// Carrier chunk id → the original message id it carries (DESIGN.md §20). Lets a chunked
@@ -1023,7 +1023,7 @@ pub struct Node<S: Store = MemoryStore> {
     /// Exact reconstructed originals retained outside the forwarding queue until their own ACK arrives.
     outgoing_carriers: HashMap<BundleId, OutgoingCarrier>,
     /// Content awaiting a forward-secret session (DESIGN.md §25): device-to-device content is
-    /// **never** static-sealed — if we don't yet hold the peer's prekey it's queued here and
+    /// **never** static-sealed, if we don't yet hold the peer's prekey it's queued here and
     /// sent the moment one arrives, so every content message is ratcheted (always a 🔒).
     pending_content: Vec<PendingContent>,
     /// Real bundle id → the UI-facing id it should report under, for content that was deferred
@@ -1031,11 +1031,11 @@ pub struct Node<S: Store = MemoryStore> {
     tx_alias: HashMap<BundleId, BundleId>,
     /// Monotonic counter making each deferred-content handle id unique.
     pending_seq: u64,
-    /// Last time we asked a peer to reset a desynced session — throttles reset requests so a
+    /// Last time we asked a peer to reset a desynced session, throttles reset requests so a
     /// burst of undecryptable messages can't cause a reset storm (DESIGN.md §25).
     last_reset_req: HashMap<PubKeyBytes, u64>,
     /// Whether this node can reach the public internet (and thus public DNS). Any node with
-    /// this set resolves HNS itself — no relay round-trip required (DESIGN.md §30). Off by
+    /// this set resolves HNS itself, no relay round-trip required (DESIGN.md §30). Off by
     /// default; a relay or an internet-connected phone turns it on.
     internet: bool,
     /// HNS resolution cache: `domain → (address?, expires_at_ms)`. `None` is a negative
@@ -1051,7 +1051,7 @@ pub struct Node<S: Store = MemoryStore> {
     hns_result_charges: Vec<AppQueueCharge>,
     /// Domains we're still trying to resolve (DESIGN.md §30). Resolution is delay-tolerant:
     /// if no internet/peer can answer right now, the domain stays here and is re-attempted as
-    /// peers connect, when we gain internet, and periodically — until it resolves or the caller
+    /// peers connect, when we gain internet, and periodically, until it resolves or the caller
     /// stops caring. Cleared once a record (positive or negative) arrives.
     pending_resolves: HashSet<String>,
     /// Last time we re-attempted pending resolutions, to throttle the periodic retry.
@@ -1089,7 +1089,7 @@ pub struct Node<S: Store = MemoryStore> {
     hps_replays: HpsReplayTable,
     /// Persisted records that failed to decode on the last [`Node::rehydrate`] (F-03). A
     /// non-empty report means an upgrade changed a struct's postcard layout and silently
-    /// dropped state (this ate the deferred-send queue when `PendingContent` gained a field —
+    /// dropped state (this ate the deferred-send queue when `PendingContent` gained a field,
     /// commit 6bb5739). The host drains it via [`Node::take_rehydrate_report`] and surfaces it
     /// so a silent state wipe is observable instead of invisible.
     rehydrate_report: RehydrateReport,
@@ -1130,7 +1130,7 @@ pub struct Node<S: Store = MemoryStore> {
 /// healthy case. See [`Node::rehydrate`] and F-03.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RehydrateReport {
-    /// `(kind, count)` pairs — e.g. `("session", 3)` means three ratchet sessions could not
+    /// `(kind, count)` pairs, e.g. `("session", 3)` means three ratchet sessions could not
     /// be decoded (a field was added to `PeerSession` across an upgrade) and were dropped.
     pub dropped: Vec<(&'static str, u32)>,
 }
@@ -1153,13 +1153,13 @@ impl RehydrateReport {
 }
 
 /// What we keep for a subscribed `hps://` topic: the content key, plus (for a service) the
-/// service public key to verify broadcasts against — `None` means a channel (verify each post
+/// service public key to verify broadcasts against, `None` means a channel (verify each post
 /// against its sender's own address).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HpsSubscription {
     pub content_key: [u8; 32],
     pub service_pubkey: Option<[u8; 32]>,
-    /// The topic's host node — needed to re-resolve for reach acks, leave, and rekey.
+    /// The topic's host node, needed to re-resolve for reach acks, leave, and rekey.
     pub host: PubKeyBytes,
     /// Rekey generation we currently hold; a higher-epoch HpsRekey supersedes it.
     pub epoch: u32,
@@ -1185,7 +1185,7 @@ pub struct HpsInviteItem {
     pub kind: hps::ServiceKind,
 }
 
-/// A topic we host or follow — used to rebuild the app's channel list after a restart (the
+/// A topic we host or follow, used to rebuild the app's channel list after a restart (the
 /// node persists topics; the app's in-memory list does not).
 #[derive(Clone)]
 pub struct HpsTopicState {
@@ -1750,7 +1750,7 @@ impl<S: Store> Node<S> {
 
         // Restore forward-secret sessions so a restart / beacon-mode relaunch resumes the
         // ratchet instead of desyncing the peer (DESIGN.md §25). A dropped session here is the
-        // "Securing forever" class — count it loudly rather than desyncing the peer in silence.
+        // "Securing forever" class, count it loudly rather than desyncing the peer in silence.
         for (key, bytes) in self.store.list_kv("session/") {
             let Some(b58) = key.strip_prefix("session/") else {
                 continue;
@@ -1897,7 +1897,7 @@ impl<S: Store> Node<S> {
     /// Set the app id this node **publicly stamps** into each trace hop (DESIGN.md §27).
     ///
     /// Privacy: this advertises "this node carries app X" to every relay on the path,
-    /// so ONLY public infra nodes should set it — a relay sets [`crate::relay_app_id`]
+    /// so ONLY public infra nodes should set it, a relay sets [`crate::relay_app_id`]
     /// to show as "Hop Relay". **End-user devices must leave this at [`FABRIC_APP`]**
     /// (the default) so they never advertise which app they run. (The FFI deliberately
     /// exposes no setter for this.)
@@ -1908,7 +1908,7 @@ impl<S: Store> Node<S> {
     /// Set this node's full app key material from its 32-byte secret (DESIGN.md §17, §32). The
     /// embedding app calls this so its `hps://` channels/services are isolated from other apps:
     /// only same-secret peers can discover, join, or be invited to them. The secret is never
-    /// persisted by core — pass it every launch (like the identity seed). Trace-hop labeling is
+    /// persisted by core, so pass it every launch (like the identity seed). Trace-hop labeling is
     /// unaffected (devices still show as generic "device", §27).
     pub fn set_app_keys(&mut self, keys: AppKeys) {
         self.directory.set_app(keys.id);
@@ -2114,14 +2114,14 @@ impl<S: Store> Node<S> {
         self.pending.len()
     }
 
-    /// Send `body` to `dst` — **untraceably, by default** (DESIGN.md §39). No cleartext
+    /// Send `body` to `dst`, **untraceably, by default** (DESIGN.md §39). No cleartext
     /// src/dst: the bundle floods (`Broadcast`) and is recognized only by the holder of
     /// `dst`'s prekey ("is this mine?"). The content is still forward-secret (the inner
     /// ratchet) and the sender authenticated (its identity rides *inside* the seal). With
     /// `request_ack`, the recipient seals a private ACK back so delivery still confirms.
     ///
-    /// We need `dst`'s published prekey for BOTH the recognition tag and the ratchet, so —
-    /// exactly as the traced path — when we haven't seen it yet we DON'T static-seal: the
+    /// We need `dst`'s published prekey for BOTH the recognition tag and the ratchet, so,
+    /// exactly as the traced path, when we haven't seen it yet we DON'T static-seal: the
     /// content is queued ("Securing…") and flushes the moment the prekey arrives (§25).
     ///
     /// For the opt-in, fully-attributed path (cleartext src/dst, §27 provenance, route
@@ -2145,14 +2145,14 @@ impl<S: Store> Node<S> {
         match self.session_payload(&dst, content_type.clone(), body.clone())? {
             Some((inner, session)) => {
                 let id = self.dispatch_private(dst, spk_pub, inner, session, request_ack, None)?;
-                self.flush_pending_content(); // a session may have just opened — flush deferrals
+                self.flush_pending_content(); // a session may have just opened, flush deferrals
                 Ok(id)
             }
             None => self.defer_content(dst, content_type, body, request_ack, true),
         }
     }
 
-    /// Send `body` to `dst` with full §27 provenance — cleartext src/dst, an identity
+    /// Send `body` to `dst` with full §27 provenance, cleartext src/dst, an identity
     /// signature, route learning, carrier chunking, and relay-vaccinating ACKs. This is the
     /// **opt-in traced** path; the default [`send_message`] is untraceable (§39). Used for
     /// the rare cases that need a directed unicast (e.g. control to a directly-connected
@@ -2168,14 +2168,14 @@ impl<S: Store> Node<S> {
             return Err(Error::Other("message exceeds carrier stream limit".into()));
         }
         // Require ratcheting device-to-device (DESIGN.md §25): if we can build a forward-secret
-        // payload now, send it; otherwise we have no prekey yet — DON'T static-seal, queue the
+        // payload now, send it; otherwise we have no prekey yet: DON'T static-seal, queue the
         // content and return a stable handle. It flushes the moment a prekey arrives.
         match self.session_payload(&dst, content_type.clone(), body.clone())? {
             Some((payload, session)) => {
                 let id = self.dispatch_content(dst, payload, session, request_ack, None)?;
                 // Sending this may have just established a session to `dst` (the prekey path in
                 // session_payload). Any EARLIER content deferred for the same peer ("Securing…")
-                // can ratchet now — flush it immediately instead of waiting for the next tick,
+                // can ratchet now, flush it immediately instead of waiting for the next tick,
                 // which won't run if the app backgrounds right after this send. (The stuck-"Securing"
                 // bug: a queued message never left because its flush only ever fired on tick.)
                 self.flush_pending_content();
@@ -2226,7 +2226,7 @@ impl<S: Store> Node<S> {
     }
 
     /// Build + submit a ratcheted content bundle. `display_id` is `Some` when this content was
-    /// deferred (the real bundle id differs from the handle the UI already holds) — we alias the
+    /// deferred (the real bundle id differs from the handle the UI already holds); we alias the
     /// real id to it so delivery status lands on the right message.
     fn dispatch_content(
         &mut self,
@@ -2274,7 +2274,7 @@ impl<S: Store> Node<S> {
     /// [`dispatch_content`]). With `request_ack` the envelope is marked so it's retx-tracked
     /// in `pending` until the recipient's private ACK clears it (the recipient reads that
     /// cleartext flag to decide whether to ACK). No `forwarded` route-learning and no carrier
-    /// chunking — there's no cleartext dst to route toward (that's the gradient work, P4).
+    /// chunking, there's no cleartext dst to route toward (that's the gradient work, P4).
     fn dispatch_private(
         &mut self,
         dst: PubKeyBytes,
@@ -2289,7 +2289,7 @@ impl<S: Store> Node<S> {
             inner: Box::new(inner),
         };
         // §39 P4: stamp the recipient's mailbox ROUTING PREFIX so a node holding a gradient toward it can
-        // route this bundle there (instead of blind-flooding) — without any cleartext dst. The sender
+        // route this bundle there (instead of blind-flooding), without any cleartext dst. The sender
         // already has `spk_pub`, so it computes the SAME tag the recipient beacons. core-protocol-r2-02:
         // we put only the 2-byte PREFIX on the wire, never the full deterministic tag.
         let bundle = Bundle::create_private(
@@ -2336,7 +2336,7 @@ impl<S: Store> Node<S> {
         let original = std::mem::take(&mut self.pending_content);
         let mut still = Vec::new();
         for pc in original.iter().cloned() {
-            // A §39 private send also needs the recipient's prekey for its recognition tag —
+            // A §39 private send also needs the recipient's prekey for its recognition tag;
             // resolve it before encrypting so we never advance the ratchet only to re-defer.
             let spk_pub = if pc.private {
                 self.directory.prekey(&pc.dst).map(|b| b.spk_pub)
@@ -2396,7 +2396,7 @@ impl<S: Store> Node<S> {
 
     /// Choose a forward-secret payload for a peer message: an established session, or a freshly
     /// opened one from the peer's published prekey. `None` when neither is available yet (no
-    /// prekey) — the caller defers rather than static-sealing (DESIGN.md §25).
+    /// prekey), the caller defers rather than static-sealing (DESIGN.md §25).
     fn session_payload(
         &mut self,
         dst: &PubKeyBytes,
@@ -2458,7 +2458,7 @@ impl<S: Store> Node<S> {
         self.unanchored_sessions.remove(&peer);
     }
 
-    /// GC forward-secret sessions idle past [`SESSION_MAX_IDLE_MS`] — drop them from memory AND the
+    /// GC forward-secret sessions idle past [`SESSION_MAX_IDLE_MS`]: drop them from memory AND the
     /// persisted `session/` store, so a device that meets many peers once doesn't grow that store
     /// forever (D6). A pruned session just re-establishes (with a fresh prekey) if the peer returns.
     fn gc_idle_sessions(&mut self) {
@@ -2593,7 +2593,7 @@ impl<S: Store> Node<S> {
         first_id.ok_or(Error::Crypto("no beacon emitted"))
     }
 
-    /// Whether we hold a forward-secret session with `addr` — i.e. messages to/from
+    /// Whether we hold a forward-secret session with `addr`, i.e. messages to/from
     /// it are ratchet-encrypted rather than static-sealed (DESIGN.md §25).
     pub fn has_session(&self, addr: &PubKeyBytes) -> bool {
         self.sessions.contains_key(addr)
@@ -2605,7 +2605,7 @@ impl<S: Store> Node<S> {
     }
 
     /// §39: does any prekey we still hold the secret for recognize this private bundle as
-    /// ours? One DH + one hash per prekey — the cost of "is this mine?" as the bundle floods
+    /// ours? One DH + one hash per prekey, the cost of "is this mine?" as the bundle floods
     /// past. (We keep retired prekey secrets in `spk_secrets`, so a message in flight when we
     /// rotated is still recognized.)
     fn recognizes(&self, bundle: &Bundle) -> bool {
@@ -2614,7 +2614,7 @@ impl<S: Store> Node<S> {
             .any(|secret| bundle.recognized_by(secret))
     }
 
-    /// The recognition token (ephemeral·SPK DH `shared`) for a private bundle we recognize — the value
+    /// The recognition token (ephemeral·SPK DH `shared`) for a private bundle we recognize, the value
     /// revealed in a delivery vaccine so relays can verify + drop their copy. `None` if not ours.
     fn vaccine_token_for(&self, bundle: &Bundle) -> Option<[u8; 32]> {
         let ph = bundle.inner.private.as_ref()?;
@@ -2636,7 +2636,7 @@ impl<S: Store> Node<S> {
             let Some(b) = self.store.get(&id) else {
                 continue;
             };
-            // r13-01: the tag keys on the content id, not the wire id — match against content_id.
+            // r13-01: the tag keys on the content id, not the wire id, so match against content_id.
             let (Some(tag), Some(content_id)) = (
                 b.inner.private.as_ref().map(|p| p.tag),
                 b.private_content_id(),
@@ -2704,7 +2704,7 @@ impl<S: Store> Node<S> {
             return false; // an unproven private ACK never mutates send state
         };
         let Some(orig) = self.store.get(for_bundle_id) else {
-            return false; // original already cleared (state is settled) — no mutation to authorize
+            return false; // original already cleared (state is settled), no mutation to authorize
         };
         // r13-01: the original's tag keys on ITS content id, not its wire id.
         let (Some(tag), Some(content_id)) = (
@@ -2871,7 +2871,7 @@ impl<S: Store> Node<S> {
     /// copies here), NOT off `store.seen`. `store.seen` is marked by ANY copy on the relay/flood path,
     /// including a same-id chimera whose recognition header was rewritten (the id binds only the sealed
     /// payload). Gating on `seen` let such a chimera mark the id seen, so the genuine copy saw
-    /// `first == false` and its `inbox.push` was skipped — a silent delivery denial plus a false ACK.
+    /// `first == false` and its `inbox.push` was skipped, a silent delivery denial plus a false ACK.
     fn deliver_private(&mut self, bundle: &Bundle, id: &BundleId) -> bool {
         let first = !self.delivered_private.contains(id);
         let (sender, inner) = match bundle.open(&self.identity) {
@@ -2880,7 +2880,7 @@ impl<S: Store> Node<S> {
         };
         match *inner {
             // A private delivery ACK for one of OUR sends: stop carrying/tracking it and mark
-            // it Delivered. (No relay vaccine — the acked id can't ride in cleartext without
+            // it Delivered. (No relay vaccine, the acked id can't ride in cleartext without
             // linking, so other relays drop their copy by TTL; the §39 storage cost.)
             Payload::Ack {
                 for_bundle_id,
@@ -2890,7 +2890,7 @@ impl<S: Store> Node<S> {
                 ..
             } if first => {
                 // core-protocol-r2-04: a private ACK is unsigned and recognized only by our SPK (whose
-                // PUBLIC half is published), and the acked bundle is sealed to our PUBLIC address — so
+                // PUBLIC half is published), and the acked bundle is sealed to our PUBLIC address, so
                 // recognition alone does NOT prove the real recipient sent this. Require the recipient-
                 // only CDH proof: `recognition_tag_from_shared(proof, for_bundle_id)` must equal the
                 // ORIGINAL bundle's own recognition tag, which only a party holding the recipient's SPK
@@ -2898,11 +2898,11 @@ impl<S: Store> Node<S> {
                 // envelope but NOT this token. If the proof is absent or wrong, refuse to mutate send
                 // state (don't flip Delivered, don't remove from store/pending) so a forged ACK cannot
                 // strand a real message on a false "Delivered". A genuine ACK whose original we already
-                // cleared (e.g. the vaccine beat it) is idempotent — nothing left to mutate.
+                // cleared (e.g. the vaccine beat it) is idempotent, nothing left to mutate.
                 if !self.private_ack_proof_ok(&for_bundle_id, proof) {
                     return false;
                 }
-                // r12-01: only a proof-valid ACK counts as handled — a bad-proof forgery returns above
+                // r12-01: only a proof-valid ACK counts as handled, a bad-proof forgery returns above
                 // without marking the id, so a genuine ACK that arrives later is still treated as first.
                 self.delivered_private.insert(*id);
                 self.pending.remove(&for_bundle_id);
@@ -2915,7 +2915,7 @@ impl<S: Store> Node<S> {
                     info.delivered_ms = delivery_ms;
                 }
                 // Observability: record that WE (the sender) just learned this send was delivered, from the
-                // returning ACK — the only way the sender knows. Lets a UI show the sender's real status.
+                // returning ACK, the only way the sender knows. Lets a UI show the sender's real status.
                 if newly && self.observe {
                     self.sends_delivered.push(display);
                 }
@@ -2923,7 +2923,7 @@ impl<S: Store> Node<S> {
             }
             Payload::Ack { .. } => true, // a duplicate ACK, already handled
             // sec-priv-01/core-01: a bare PeerMessage inside an unsigned Private seal is a sender
-            // spoof (no ratchet proves `sender`). Drop it here so we neither inbox nor ACK it —
+            // spoof (no ratchet proves `sender`). Drop it here so we neither inbox nor ACK it;
             // read_message would refuse to surface it anyway, but not inboxing avoids emitting a
             // private ACK to the impersonated address.
             Payload::PeerMessage { .. } => false,
@@ -2939,7 +2939,7 @@ impl<S: Store> Node<S> {
     /// §39: seal a delivery ACK back to `to` (whom we learned from inside the message's seal)
     /// for `for_bundle_id`, reporting the forward path length + the A→B latency we observed. It
     /// floods and is recognized only by `to`. Needs `to`'s prekey; without it we can't ACK
-    /// privately and the sender stays "Sent" (a documented §39 limitation — both ends normally
+    /// privately and the sender stays "Sent" (a documented §39 limitation, both ends normally
     /// publish prekeys).
     fn emit_private_ack(
         &mut self,
@@ -3238,7 +3238,7 @@ impl<S: Store> Node<S> {
         match bundle.open(&self.identity)? {
             // §39 untraceable: the *real* sender rode inside the seal (the envelope src is
             // zeroed). The seal is NOT identity-signed, so `sender` is an unauthenticated claim
-            // here — only a ratcheted inner (SessionInit/SessionMessage, which X3DH/Double-Ratchet
+            // here, only a ratcheted inner (SessionInit/SessionMessage, which X3DH/Double-Ratchet
             // authenticate) may attribute a message to it. `authenticated=false` enforces that.
             Payload::Private { sender, inner } => self.read_inner_message(sender, *inner, false),
             // Normal path: the envelope is Ed25519-signed and verify() checked `src`, so a bare
@@ -3247,11 +3247,11 @@ impl<S: Store> Node<S> {
         }
     }
 
-    /// Decrypt a user-message payload attributed to `from` — shared by the normal path (where
+    /// Decrypt a user-message payload attributed to `from`, shared by the normal path (where
     /// `from` is the cleartext, envelope-signed src) and the §39 private path (where it came from
     /// inside the *unsigned* seal). `authenticated` is true only when `from` is proven by the
     /// envelope signature; when false, a bare `PeerMessage` carries NO proof of `from` and must
-    /// not be surfaced (sender spoofing, sec-priv-01/core-01) — only ratcheted payloads, which
+    /// not be surfaced (sender spoofing, sec-priv-01/core-01), only ratcheted payloads, which
     /// authenticate the sender cryptographically, may attribute a message on the private path.
     /// Establishes the responder side of a session on first `SessionInit`.
     fn read_inner_message(
@@ -3286,7 +3286,7 @@ impl<S: Store> Node<S> {
                     // recipient's public address + published prekey could forge this "from
                     // <victim>". Device-to-device content is always forward-secret (a send
                     // without a ratchet is an error), so a private static PeerMessage is never
-                    // legitimate — drop it rather than attribute it.
+                    // legitimate; drop it rather than attribute it.
                     return Ok(PreparedInbound {
                         message: None,
                         session: None,
@@ -3393,7 +3393,7 @@ impl<S: Store> Node<S> {
         }
     }
 
-    /// Decode a decrypted session inner into a user message — unless it's a re-establishment
+    /// Decode a decrypted session inner into a user message, unless it's a re-establishment
     /// ping (a content-less handshake we send to heal a desynced ratchet), which has done its
     /// job by rebuilding the session and isn't surfaced (DESIGN.md §25).
     fn surface_session_inner(
@@ -3439,7 +3439,7 @@ impl<S: Store> Node<S> {
     }
 
     /// Handle an inbound [`Payload::SessionReset`]: drop our (stale) session with `peer` and
-    /// proactively re-establish so the ratchet heals immediately — even before the next user
+    /// proactively re-establish so the ratchet heals immediately, even before the next user
     /// message. The next `SessionInit` rebuilds the peer's side too (DESIGN.md §25).
     fn handle_session_reset(&mut self, peer: PubKeyBytes) {
         if self.delete_session(&peer).is_err() {
@@ -3455,7 +3455,7 @@ impl<S: Store> Node<S> {
     }
 
     /// Send a `hops://` request to a specific endpoint (DESIGN.md §30): a normal HTTP
-    /// request sealed and addressed to the endpoint's Hop address — opaque to the mesh,
+    /// request sealed and addressed to the endpoint's Hop address, opaque to the mesh,
     /// indistinguishable from any other peer message (there is no mesh-visible "internet
     /// bound" destination). The endpoint executes it against its own backend and the reply
     /// arrives as an [`HttpRespItem`] via [`Node::take_http_responses`]. Returns the
@@ -3498,7 +3498,7 @@ impl<S: Store> Node<S> {
     // domain serves at `https://<domain>/.well-known/hop`. The host does the HTTPS fetch (its
     // TLS cert proves the domain); core verifies the record's signature (it proves the address)
     // and caches `domain -> address` for the record's TTL. Resolution needs the resolving node's
-    // OWN internet — there is deliberately no relayed/mesh-assisted lookup.
+    // OWN internet, there is deliberately no relayed/mesh-assisted lookup.
 
     /// Declare whether this node can reach the public internet (and thus fetch a domain's
     /// well-known). When on, the node resolves HNS itself, surfacing the domains to fetch via
@@ -3583,7 +3583,7 @@ impl<S: Store> Node<S> {
     /// §39 P5: mailbox-tags that just received a want-beacon (a recipient's [`AdvertKind::RecvBeacon`]
     /// newly accepted here), clearing the queue. The host reloads each mailbox's durable blind spool
     /// and re-ingests the held private bundles, which P4's freshly-laid gradient then steers to the
-    /// recipient. The node does no durable I/O itself — it only surfaces the tags (cf. DNS lookups).
+    /// recipient. The node does no durable I/O itself; it only surfaces the tags (cf. DNS lookups).
     pub fn take_wanted_mailboxes(&mut self) -> Vec<Tag> {
         std::mem::take(&mut self.wanted_mailboxes)
     }
@@ -3659,7 +3659,7 @@ impl<S: Store> Node<S> {
             return;
         };
         self.dns_inflight.remove(&key);
-        self.pending_resolves.remove(&key); // resolved (positive or negative) — stop retrying
+        self.pending_resolves.remove(&key); // resolved (positive or negative), stop retrying
         let ttl_ms = (ttl_secs as u64).clamp(MIN_HNS_TTL_MS / 1000, MAX_HNS_TTL_MS / 1000) * 1000;
         self.hns_cache.insert(
             key.clone(),
@@ -4031,7 +4031,7 @@ impl<S: Store> Node<S> {
 
     /// Member: invites we've received and not yet accepted (DESIGN.md §32 Invite mode).
     pub fn take_hps_invites(&mut self) -> Vec<HpsInviteItem> {
-        // Drain the in-memory display queue but DON'T touch the durable copy — an unaccepted
+        // Drain the in-memory display queue but DON'T touch the durable copy, an unaccepted
         // invite must survive a restart (persistence updates only on arrival / accept / decline).
         let invites = std::mem::take(&mut self.hps_invites_in);
         for charge in std::mem::take(&mut self.hps_invite_charges) {
@@ -4040,7 +4040,7 @@ impl<S: Store> Node<S> {
         invites
     }
 
-    /// Decline an invite (member side) — drop it from the durable set so it doesn't reappear.
+    /// Decline an invite (member side): drop it from the durable set so it doesn't reappear.
     pub fn hps_decline_invite(&mut self, host: PubKeyBytes, path: &str) {
         self.remove_hps_invite_item(host, path);
         self.persist_invites();
@@ -4174,7 +4174,7 @@ impl<S: Store> Node<S> {
         Ok(ids)
     }
 
-    /// Publish a message to a topic we can write to — a `Service` we host (signed by the
+    /// Publish a message to a topic we can write to, a `Service` we host (signed by the
     /// service key) or a `Channel` we belong to (signed by our own identity). Floods to all
     /// subscribers via [`Destination::Broadcast`].
     /// Register an `hps://` topic with a caller-supplied pre-shared **content key**, so a group that
@@ -4321,7 +4321,7 @@ impl<S: Store> Node<S> {
             return true;
         };
         // Match the tag to a topic we follow (subscription) OR a channel we host. The host must
-        // receive members' posts too — a channel is group chat, and the host keeps it in
+        // receive members' posts too, a channel is group chat, and the host keeps it in
         // `services`, not `subscriptions`. A *service* we host never receives others' posts
         // (only the owner writes).
         let sub = self
@@ -5848,7 +5848,7 @@ impl<S: Store> Node<S> {
     /// bundles go as one (the common case). A large one (e.g. an image message, or a big
     /// service request/response) is split into ordered `StreamData` chunks carrying its
     /// raw bytes, each sealed to the destination and ACK-tracked for reliable transport;
-    /// the receiver reassembles and processes the original bundle as if it arrived whole —
+    /// the receiver reassembles and processes the original bundle as if it arrived whole,
     /// so id, request_ack, delivery status and dedup are all preserved. Transparent: every
     /// `send_*` path funnels through here, so any payload type streams when needed.
     fn deliver(&mut self, bundle: Bundle) -> Result<()> {
@@ -6440,7 +6440,7 @@ impl<S: Store> Node<S> {
     }
 
     /// Publish (and gossip) a signed service advert so others discover it across the
-    /// mesh — even multiple hops away via relays (§15–§16). Returns the advert id so
+    /// mesh, even multiple hops away via relays (§15 to §16). Returns the advert id so
     /// the caller can later revoke it with a tombstone. The advert carries this node's
     /// address as `publisher`, so a discoverer can seal a message straight back.
     ///
@@ -6525,10 +6525,10 @@ impl<S: Store> Node<S> {
     /// connected to us, as `(id, dst, sealed bytes, expires_at_ms)`. The relay hands
     /// these into the destination region's Firestore mailbox so an offline device
     /// collects them when it next checks in (or that region cold-starts). Returns the
-    /// sealed wire bytes untouched — the relay never opens what it forwards.
+    /// sealed wire bytes untouched, the relay never opens what it forwards.
     /// stores-r3-01: the durable `expireAt` a relay must stamp when it hands off or spools a bundle
     /// into another region's Firestore mailbox. Anchor it to the store's RECEIVER-clamped dedup
-    /// deadline (`seen_expiry`, from stores-r2-01) — the same clock the durable mirror uses — NOT to
+    /// deadline (`seen_expiry`, from stores-r2-01), the same clock the durable mirror uses, NOT to
     /// the sender's advisory `created_at`. A hostile or non-node sender (or the wire/BundleOpts
     /// default) can stamp `created_at = 0`, which would make `created_at + lifetime` land in ~1970,
     /// so the TTL policy would sweep a still-live handed-off/spooled message and an offline recipient
@@ -6548,14 +6548,14 @@ impl<S: Store> Node<S> {
                 continue;
             };
             // Both user messages (Device) and delivery-ACKs (AckTo) are addressed to a
-            // specific node, so both ride the handoff — otherwise an ACK back to an
+            // specific node, so both ride the handoff; otherwise an ACK back to an
             // offline cross-region sender would never arrive (no live peering, §28).
             let dst = match b.inner.dst {
                 Destination::Device(d) | Destination::AckTo(d, _) => d,
                 Destination::Broadcast | Destination::Vaccine(..) => continue,
             };
             if connected.contains(&dst) {
-                continue; // deliverable directly on this node — no handoff needed
+                continue; // deliverable directly on this node, no handoff needed
             }
             if let Ok(bytes) = b.to_bytes() {
                 let expires = self.durable_expiry(&id, &b);
@@ -6565,14 +6565,14 @@ impl<S: Store> Node<S> {
         out
     }
 
-    /// §39 P5: private bundles we should DURABLY spool by mailbox-tag — so an offline / cross-partition
+    /// §39 P5: private bundles we should DURABLY spool by mailbox-tag, so an offline / cross-partition
     /// recipient (whom P4's live gradient can't reach right now) collects it via a later want-beacon pull.
     /// A bundle qualifies iff it's private and carries a mailbox-tag. core-protocol-r2-01: we intentionally
     /// spool even when a live gradient exists for the route, because the gradient keys on a 2-byte PREFIX
-    /// and a live next-hop may be a prefix-COLLIDING different recipient — suppressing the spool then
+    /// and a live next-hop may be a prefix-COLLIDING different recipient, suppressing the spool then
     /// black-holes the true (passive) recipient. When the recipient later beacons, the host reloads the
     /// spool and P4 steers the reloaded copy down the freshly-laid gradient. The relay never opens the
-    /// envelope — sealed bytes verbatim. Returns (id, mailbox-route-prefix, sealed bytes, expires_at).
+    /// envelope, sealed bytes verbatim. Returns (id, mailbox-route-prefix, sealed bytes, expires_at).
     ///
     /// core-protocol-r3-01: ACK spooling is INTENTIONAL, not a leak. A private delivery-ACK
     /// (`emit_private_ack`) is itself a private bundle carrying a mailbox toward the ORIGINAL sender
@@ -6605,8 +6605,8 @@ impl<S: Store> Node<S> {
             // recipient that merely collides on the prefix with this bundle's intended recipient. The old
             // "live ⇒ don't spool" rule black-holed the passive/offline colliding recipient: the forward
             // gate steered the copy only down the colliding recipient's link (which drops it on the
-            // recognition check) AND the spool refused, so the intended recipient — who is passive and
-            // never on the live gradient — could receive it via NEITHER path. We now ALWAYS spool a
+            // recognition check) AND the spool refused, so the intended recipient, who is passive and
+            // never on the live gradient, could receive it via NEITHER path. We now ALWAYS spool a
             // private bundle carrying a mailbox. If the live route happens to be the true recipient, the
             // spooled copy is merely redundant (the recipient dedups by id and the vaccine/TTL reclaims
             // it); if it is a prefix collision, the spool is the ONLY path that reaches the real
@@ -6619,7 +6619,7 @@ impl<S: Store> Node<S> {
         out
     }
 
-    /// Ingest a foreign (relayed) bundle pulled from durable storage — e.g. a
+    /// Ingest a foreign (relayed) bundle pulled from durable storage, e.g. a
     /// cross-partition handoff written into our Firestore partition while we were
     /// already warm (DESIGN.md §28). Stores it for onward relay and offers it to live
     /// links, exactly as if a peer had handed it over. A cold-started node gets the same
@@ -6661,7 +6661,7 @@ impl<S: Store> Node<S> {
             .collect()
     }
 
-    /// `(peer address, link id)` for every live link — lets the host map a direct
+    /// `(peer address, link id)` for every live link, lets the host map a direct
     /// neighbour to the transport(s) carrying it (the bearer owns the link-id → medium
     /// mapping). A peer may appear more than once if reachable over multiple bearers.
     pub fn peer_links(&self) -> Vec<(PubKeyBytes, LinkId)> {
@@ -6692,7 +6692,7 @@ impl<S: Store> Node<S> {
             return Ok(None);
         }
         // Directly-connected fast path: the peer already knows our identity (the link
-        // authenticated it), so untraceability vs them is moot — send a directed unicast
+        // authenticated it), so untraceability vs them is moot; send a directed unicast
         // rather than flooding. Reach any *non*-adjacent address untraceably via send_message.
         Ok(Some(self.send_message_traced(
             *address,
@@ -6770,14 +6770,14 @@ impl<S: Store> Node<S> {
         self.directory.expire(now_ms);
         self.forget_evicted_adverts();
         self.prune_peer_sent();
-        // §39 P4 (+ sec-priv-04): drop stale next-hops — a recipient that stopped beaconing (moved or
+        // §39 P4 (+ sec-priv-04): drop stale next-hops, a recipient that stopped beaconing (moved or
         // went passive) stops attracting bundles down its link within one TTL (no permanent black-hole).
         // Prune expired links per bucket, then drop any bucket left with no live next-hop.
         self.recv_gradient.retain(|_, e| {
             e.links.retain(|(_, gl)| gl.expires_at > now_ms);
             !e.links.is_empty()
         });
-        // Re-advertise hosted Discoverable topics we don't currently have a live advert for —
+        // Re-advertise hosted Discoverable topics we don't currently have a live advert for,
         // e.g. after a restart, where the topic persists but the in-memory directory/advert do
         // not. Runs with the real clock set (above), so created_at is valid; once published the
         // path is in hps_adverts and this skips it. This is what makes a hosted channel
@@ -6831,11 +6831,11 @@ impl<S: Store> Node<S> {
             .retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
         // core-protocol-r12-01: forget the §39 private-delivery marks once the store stops deduping the
         // id (the same window the old `seen`-based gate used), so a still-live duplicate is deduped but
-        // an expired id can't pin the set. Reading `seen` only to bound retention is safe — a chimera
+        // an expired id can't pin the set. Reading `seen` only to bound retention is safe, a chimera
         // that marks `seen` can widen this window slightly but can never make the set CONTAIN an id it
         // never delivered, which is the property that closes the suppression. Also retain while the id is
         // `immune`: a delivery vaccine can race AHEAD of the bundle, so `on_bundle` returns at the immune
-        // check before `store.put` marks `seen` — without this the mark would be pruned and a later
+        // check before `store.put` marks `seen`; without this the mark would be pruned and a later
         // duplicate would re-deliver. `immune` is on the same 1h horizon, so this cannot pin the set open.
         self.delivered_private
             .retain(|id| self.store.seen(id) || self.immune.contains_key(id));
@@ -6890,16 +6890,16 @@ impl<S: Store> Node<S> {
         self.tx_alias
             .retain(|real, _| self.store.contains(real) || self.pending.contains_key(real));
         // Periodically RE-gossip adverts to every live link. Adverts (presence, and crucially
-        // prekeys, §25) are otherwise offered only once per link — at link-up — so a node that
+        // prekeys, §25) are otherwise offered only once per link, at link-up, so a node that
         // didn't have a peer's prekey at connect time could never open a forward-secret session to
         // it until a RECONNECT forced a fresh gossip. That's the "you have to move out of range and
-        // back to send a message" bug — and it's transport-agnostic (BLE, Wi-Fi, relay alike). This
+        // back to send a message" bug, and it's transport-agnostic (BLE, Wi-Fi, relay alike). This
         // re-offers over stable links so the prekey arrives without churning the connection; the
         // receiver dedups unchanged adverts, so it's cheap. (DESIGN.md §16/§25.)
         if now_ms.saturating_sub(self.last_regossip_ms) >= REGOSSIP_INTERVAL_MS {
             self.last_regossip_ms = now_ms;
             // Re-gossip ONLY our OWN prekey/presence to every live link (NOT the whole directory).
-            // Re-flooding the whole directory was O(directory × links) every interval — the multi-peer
+            // Re-flooding the whole directory was O(directory × links) every interval, the multi-peer
             // resource-exhaustion bug (tx >> rx, real messages starve). But re-offering just our own
             // securing adverts is cheap (~2-3 adverts × links) and lets a peer that silently lost state
             // on a STABLE link (no flap to trigger the link-up re-offer) re-secure within the interval.
@@ -6929,7 +6929,7 @@ impl<S: Store> Node<S> {
         {
             self.last_recv_beacon_ms = now_ms;
             // F-06: the mailbox is now bound to our address + epoch (not the prekey), so the beacon is
-            // self-verifying at the relay — no prekey coordination needed. Emits current + window epochs.
+            // self-verifying at the relay, no prekey coordination needed. Emits current + window epochs.
             let _ = self.publish_recv_beacon();
             self.beaconed_tick = true; // observability: emitted a recv-beacon this tick (see drain_beaconed)
         }
@@ -6966,7 +6966,7 @@ impl<S: Store> Node<S> {
         for id in self.pending.keys().copied().collect::<Vec<_>>() {
             let p = self.pending[&id];
             if now_ms >= p.created_at.saturating_add(p.lifetime_ms as u64) {
-                self.pending.remove(&id); // lifetime exhausted — give up
+                self.pending.remove(&id); // lifetime exhausted, give up
                 self.store.remove(&id);
                 continue;
             }
@@ -7075,8 +7075,8 @@ impl<S: Store> Node<S> {
     }
 
     /// Observability: take the ids of our OWN sends that were confirmed delivered (by a returning ACK)
-    /// since the last call. A sender only learns delivery this way — never from the recipient directly
-    /// — so a per-device UI can show the sender "delivered" only once its ACK is home.
+    /// since the last call. A sender only learns delivery this way, never from the recipient directly,
+    /// so a per-device UI can show the sender "delivered" only once its ACK is home.
     pub fn drain_delivered(&mut self) -> Vec<BundleId> {
         std::mem::take(&mut self.sends_delivered)
     }
@@ -7089,7 +7089,7 @@ impl<S: Store> Node<S> {
         self.default_lifetime_ms = ms;
     }
 
-    /// Observability: the §39 P4 recv-gradient as `(route_key, inbound_link, hops)` — the reachable mailbox
+    /// Observability: the §39 P4 recv-gradient as `(route_key, inbound_link, hops)`, the reachable mailbox
     /// **routing prefixes** (sec-priv-04, right-padded into a Tag) this node can steer a private bundle
     /// toward, and the next hop for each. Read-only view of the distributed routing tree (each node
     /// holds a slice). Keys match [`Node::current_mailbox_tag`] (also projected).
@@ -7102,7 +7102,7 @@ impl<S: Store> Node<S> {
             .collect()
     }
 
-    /// Observability: this node's current mailbox **routing key** — its full tag `H(address ‖ epoch)`
+    /// Observability: this node's current mailbox **routing key**, its full tag `H(address ‖ epoch)`
     /// projected onto the sec-priv-04 routing prefix (right-padded into a Tag), i.e. the exact key a
     /// relay's gradient buckets under. Projected (not the raw full tag) so it lines up against
     /// [`Node::recv_gradient_view`] keys now that routing decisions key on the prefix.
@@ -7124,7 +7124,7 @@ impl<S: Store> Node<S> {
         self.directory.prekey(addr).is_some()
     }
 
-    /// Observability: send status for each message we originated — `(display id, distinct peers we've handed
+    /// Observability: send status for each message we originated, `(display id, distinct peers we've handed
     /// it to, delivered)`. Mirrors the debug app's "Sending / Sent · N / Delivered" (peers==0 = Sending,
     /// N>0 = Sent·N, delivered = ACK home). Read-only.
     pub fn sends_status(&self) -> Vec<(BundleId, u16, bool)> {
@@ -7161,7 +7161,7 @@ impl<S: Store> Node<S> {
             BearerEvent::Disconnected(link) => {
                 // Snapshot what we've already gossiped to this PEER so a reconnect doesn't re-flood
                 // the whole directory (the flapping-link resource-exhaustion bug). Keyed by peer, not
-                // by link instance — the link id changes on every reconnect, the peer address doesn't.
+                // by link instance: the link id changes on every reconnect, the peer address doesn't.
                 if let Some(LinkState::Up(est)) = self.links.remove(&link) {
                     self.peer_sent.insert(
                         est.peer,
@@ -7284,7 +7284,7 @@ impl<S: Store> Node<S> {
             );
             // ALWAYS re-offer our OWN adverts (prekey/presence) on link-up: clear them from the
             // restored per-peer dedup so they go out again. A peer that lost state (restart / data-
-            // wipe / cache-evict) must be able to re-secure to us — it needs our prekey. The FOREIGN
+            // wipe / cache-evict) must be able to re-secure to us; it needs our prekey. The FOREIGN
             // directory bulk stays deduped (no reflood), so this re-offers only ~2-3 small adverts.
             let own = self
                 .directory
@@ -7292,12 +7292,12 @@ impl<S: Store> Node<S> {
             // Our own UNDELIVERED messages (awaiting an ACK): re-offer them on link-up too, so a
             // reconnect re-sends them IMMEDIATELY instead of waiting out the exponential-backoff
             // retransmit timer (30s → 15min). A bundle "sent" on a link that then dropped sits in the
-            // restored per-peer dedup marked already-sent — which is what made delivery take minutes
+            // restored per-peer dedup marked already-sent, which is what made delivery take minutes
             // on a flaky BLE link even after securing succeeded.
             let pending_ids: Vec<BundleId> = self.pending.keys().copied().collect();
             // Generalize that to EVERYTHING we still hold: delivery-ACKs and vaccines have no
             // retransmit timer of their own, so a copy lost to a link flap (marked sent, never
-            // received) would otherwise be stranded against this peer FOREVER — the stuck-"Sending…"
+            // received) would otherwise be stranded against this peer FOREVER, the stuck-"Sending…"
             // sender bug. If we still hold a bundle it is still relevant; the receiver
             // dedups duplicates by `seen`, so re-offering on a fresh contact costs only bandwidth.
             let held_ids = self.store.have().ids;
@@ -7375,7 +7375,7 @@ impl<S: Store> Node<S> {
     /// Receive one fragment of an oversized record (DESIGN.md §20). Each fragment is its own
     /// Noise message, so decrypt in arrival order (the bearer is ordered) and concatenate the
     /// plaintext; on the final fragment, decode and dispatch the whole [`Wire`]. An
-    /// out-of-order fragment means loss/corruption — drop the partial record and resync.
+    /// out-of-order fragment means loss/corruption: drop the partial record and resync.
     fn on_record_frag(&mut self, link: LinkId, idx: u16, cnt: u16, ct: &[u8]) {
         let ready = {
             let Some(LinkState::Up(est)) = self.links.get_mut(&link) else {
@@ -7468,7 +7468,7 @@ impl<S: Store> Node<S> {
         //
         // core-protocol-r2-03 / security-privacy-r2-01: a §39 delivery vaccine is ALSO unsigned and
         // freely mintable (its id self-verifies as `H(domain‖token)` for any attacker-chosen token),
-        // yet it is not `is_private()` so the original gate missed it — a peer could flood unique-token
+        // yet it is not `is_private()` so the original gate missed it: a peer could flood unique-token
         // vaccines uncapped, each forcing a store scan (bounded now by the `seen` gate, but still work).
         // Subject Vaccine bundles to the SAME per-link limit as private bundles, so a single hostile
         // link cannot mint vaccines faster than [`MAX_PRIV_BUNDLES_PER_WINDOW`].
@@ -7486,12 +7486,12 @@ impl<S: Store> Node<S> {
         let mut locally_accepted = false;
 
         // A broadcast is processed by everyone and relayed by everyone, then falls through to
-        // the store+offer flood below — we never short-circuit, since halting the flood at the
+        // the store+offer flood below; we never short-circuit, since halting the flood at the
         // recipient would out it.
         if matches!(bundle.inner.dst, Destination::Broadcast) {
             if bundle.is_private() {
                 // §39 "is this mine?": trial-match against our prekeys on EVERY arrival (a
-                // cheap DH+hash) — so a flooded duplicate can re-ACK if our first ACK was
+                // cheap DH+hash), so a flooded duplicate can re-ACK if our first ACK was
                 // lost. deliver_private delivers/handles the inner payload only once.
                 if self.recognizes(&bundle) {
                     if !self.deliver_private(&bundle, &id) {
@@ -7515,7 +7515,7 @@ impl<S: Store> Node<S> {
             }
             if self.store.seen(&id) {
                 // A duplicate of something we already delivered. If it wanted an ACK, our
-                // ACK may have been lost — re-emit it (throttled) so the sender can stop
+                // ACK may have been lost; re-emit it (throttled) so the sender can stop
                 // retransmitting. Never re-deliver to the inbox.
                 let is_user_content = matches!(
                     bundle.open(&self.identity),
@@ -7897,7 +7897,7 @@ impl<S: Store> Node<S> {
                             }
                         }
                     }
-                    // Member → host: reach ack — tally unique acking addresses (§32).
+                    // Member → host: reach ack, tally unique acking addresses (§32).
                     Ok(Payload::HpsReachAck {
                         topic_tag,
                         epoch,
@@ -8074,7 +8074,7 @@ impl<S: Store> Node<S> {
                     self.emit_ack(&bundle);
                 }
             }
-            // Mark seen (dedup) but don't hold — we never relay what's addressed to us.
+            // Mark seen (dedup) but don't hold; we never relay what's addressed to us.
             let stored = self.store.put(bundle, self.now_ms);
             self.store.remove(&id);
             return stored || self.store.seen(&id);
@@ -8114,7 +8114,7 @@ impl<S: Store> Node<S> {
                         self.store.remove(&delivered);
                         self.relay_order.retain(|x| *x != delivered);
                         self.immune.insert(delivered, self.now_ms);
-                        // The ACK for a bundle we forwarded is passing back through us — we're
+                        // The ACK for a bundle we forwarded is passing back through us; we're
                         // on a working path between its endpoints, in both directions (§27).
                         if let Some((s, d, _)) = self.forwarded.remove(&delivered) {
                             self.routes.learn(&s, &d, self.now_ms);
@@ -8131,7 +8131,7 @@ impl<S: Store> Node<S> {
                 // O(held-private-bundles) DH+hash scan, and a vaccine is `is_ack` so it is EXEMPT from
                 // the F-07 per-link private-ingest limit. Without a dedup gate here, EVERY flooded
                 // duplicate copy of the SAME vaccine (all sharing one id = H(domain‖token)) would
-                // re-run the whole scan — CPU amplification an attacker triggers by re-injecting one
+                // re-run the whole scan, CPU amplification an attacker triggers by re-injecting one
                 // vaccine. Short-circuit on the store's `seen` set: the first copy scans + resolves
                 // once, subsequent copies (same id) are skipped before the scan. A forged random-token
                 // vaccine still scans at most once per unique id, and the per-link rate limit on
@@ -8139,7 +8139,7 @@ impl<S: Store> Node<S> {
                 Destination::Vaccine(token) if !self.store.seen(&id) => {
                     if let Some(delivered) = self.resolve_vaccine_target(&token) {
                         // The SENDER treats a verified vaccine as PROOF OF DELIVERY. Its private ACK
-                        // can be lost (a throttled link, a single-carrier contact) — and once the
+                        // can be lost (a throttled link, a single-carrier contact), and once the
                         // vaccine has immunized the mesh, retransmits can never trigger a re-ACK, so
                         // a lost ack would strand the sender on "Sending…" forever. The vaccine floods
                         // network-wide and carries the same CDH token only the true recipient can
@@ -8173,7 +8173,7 @@ impl<S: Store> Node<S> {
                 _ => {}
             }
         } else if self.immune.contains_key(&id) {
-            return true; // already delivered elsewhere — don't re-store or re-flood it
+            return true; // already delivered elsewhere; don't re-store or re-flood it
         }
 
         // core-protocol-r3-02: a delivery vaccine may have raced ahead of this private bundle and
@@ -8283,7 +8283,7 @@ impl<S: Store> Node<S> {
     }
 
     /// Keep relayed (not-ours) bundles within `max_relayed`. Custody policy (DESIGN.md §6):
-    /// **never drop a bundle we haven't relayed at least once if we can avoid it** — so a
+    /// **never drop a bundle we haven't relayed at least once if we can avoid it**, so a
     /// flood of big transfers can't evict legitimate, not-yet-forwarded messages, and so
     /// the cap acts as a *sliding window* (chunks flow through: relayed, then evicted after
     /// a grace window) rather than a hard limit on transfer size. Eviction therefore
@@ -8315,7 +8315,7 @@ impl<S: Store> Node<S> {
 
     /// Choose an eviction victim by lowest utility (priority, route, oldest). When
     /// `settled_only`, consider only bundles we've already relayed once and held past
-    /// [`EVICT_GRACE_MS`] — the preferred, safe-to-drop set.
+    /// [`EVICT_GRACE_MS`], the preferred, safe-to-drop set.
     fn pick_evict_victim(&self, now: u64, settled_only: bool) -> Option<(usize, BundleId)> {
         self.relay_order
             .iter()
@@ -8442,7 +8442,7 @@ impl<S: Store> Node<S> {
             if let Some((mailbox, publisher, hops, created_at, ttl_ms, seq)) = beacon {
                 // F-05 + F-06: bind the beacon to its owner before laying a gradient. The mailbox tag
                 // is `H(address ‖ epoch)`, and a beacon is identity-signed by that address, so a node
-                // can only beacon a mailbox it can compute for ITS OWN address — an attacker can't
+                // can only beacon a mailbox it can compute for ITS OWN address, an attacker can't
                 // forge a victim's mailbox because it can't sign an advert as the victim (`directory
                 // .ingest` already verified the signature, so `publisher` is authentic here). Accept
                 // the current epoch and the recent window, so a just-rotated tag still routes.
@@ -8467,12 +8467,12 @@ impl<S: Store> Node<S> {
         }
     }
 
-    /// §39 P4 (+ sec-priv-04): record/refresh a routing next-hop from a verified receiver-beacon — a
+    /// §39 P4 (+ sec-priv-04): record/refresh a routing next-hop from a verified receiver-beacon, a
     /// recipient in `mailbox`'s prefix anonymity set is reachable via `from_link`. Per link the freshest
     /// (higher `seq`, then fewer hops) beacon wins; a moved recipient re-points its own link, and a
     /// DISTINCT colliding recipient on another link adds a second next-hop (both are then served, so a
     /// collision can't starve either). After recording, immediately re-offer any already-HELD private
-    /// bundles down the new link — without this, a bundle parked before the gradient existed waits
+    /// bundles down the new link; without this, a bundle parked before the gradient existed waits
     /// forever (the relay already deduped it on the bridge link at link-up).
     fn record_gradient(
         &mut self,
@@ -8546,7 +8546,7 @@ impl<S: Store> Node<S> {
                 entry.links.push((from_link, fresh));
             }
         }
-        // §39 P5: a newly-accepted beacon IS a want-beacon — surface the mailbox so the host reloads
+        // §39 P5: a newly-accepted beacon IS a want-beacon; surface the mailbox so the host reloads
         // its durable blind spool (an offline-deposited bundle is pulled the moment we hear from the
         // recipient). Bounded so a beacon storm can't grow this unboundedly; a dropped tag just waits
         // for the next periodic re-beacon. (Deduped against the tail to avoid a refresh re-queuing it.)
@@ -8579,7 +8579,7 @@ impl<S: Store> Node<S> {
 
     /// Utility of a stored bundle for transmit-ordering and eviction (DESIGN.md §27):
     /// service priority dominates (×100 keeps priority bands separate), and learned
-    /// reachability toward the destination orders bundles *within* a band — so a bundle
+    /// reachability toward the destination orders bundles *within* a band, so a bundle
     /// toward a destination we have a route to beats one toward an unknown destination.
     fn bundle_utility(&self, id: &BundleId, now: u64) -> f64 {
         let Some(b) = self.store.get(id) else {
@@ -8588,7 +8588,7 @@ impl<S: Store> Node<S> {
         self.bundle_utility_of(&b, now)
     }
 
-    /// Utility from an ALREADY-loaded bundle — avoids a `store.get` per call. `offer_bundles_to_link`
+    /// Utility from an ALREADY-loaded bundle; avoids a `store.get` per call. `offer_bundles_to_link`
     /// uses this so its transmit-order sort does O(N) reads (load once), not O(N log N) (one read per
     /// sort comparison), which under the held node Mutex was starving link handshakes.
     fn bundle_utility_of(&self, b: &Bundle, now: u64) -> f64 {
@@ -8605,7 +8605,7 @@ impl<S: Store> Node<S> {
         // zeroed short-addr) so the recipient learns only the hop count + carrier type ("device"),
         // never WHICH devices carried it. Infra relays self-identify (their address is public) so a
         // recipient can still see "via Hop Relay". A device's own address is in the bundle `src`
-        // anyway, so hiding it in the trace loses nothing — it only protects intermediate relays.
+        // anyway, so hiding it in the trace loses nothing; it only protects intermediate relays.
         let me_short = if self.trace_app == FABRIC_APP {
             ShortAddr::default()
         } else {
@@ -8615,7 +8615,7 @@ impl<S: Store> Node<S> {
         let now = self.now_ms;
         // Snapshot ids, ordered by utility so the most-likely-to-deliver bundles go
         // first during a short contact (DESIGN.md §27).
-        // Load each bundle ONCE, compute its utility, then sort by the precomputed value — O(N)
+        // Load each bundle ONCE, compute its utility, then sort by the precomputed value: O(N)
         // store reads, not the O(N log N) the per-comparison bundle_utility(id) used to do. Under
         // the held node Mutex that read storm (×fsync from synchronous=FULL) starved link Noise
         // handshakes and prekey gossip, which is what made messages hang "Securing" under load.
@@ -8736,11 +8736,11 @@ impl<S: Store> Node<S> {
             let meta = BundleMeta::from(&b);
             let direct = is_for(&b, &peer);
             // If we can reach the destination directly right now, don't spray copies
-            // to relays — direct delivery on the destination's own link completes it.
+            // to relays; direct delivery on the destination's own link completes it.
             let dest_here = self.dest_is_connected(&b);
 
             // Our own originated messages: keep until the delivery ACK arrives (or
-            // they expire), so we can re-flood if undelivered — don't release on a
+            // they expire), so we can re-flood if undelivered; don't release on a
             // mere handoff (DESIGN.md §6, §7).
             let own = self.tx.contains_key(&id);
 
@@ -8756,7 +8756,7 @@ impl<S: Store> Node<S> {
                         copy.add_hop(me_short, me_app); // provenance (§27)
                                                         // Release custody only for fire-and-forget bundles. For request_ack
                                                         // ones (carrier chunks, messages), keep custody until the delivery
-                                                        // ACK confirms receipt — handing to the destination is optimistic, and
+                                                        // ACK confirms receipt; handing to the destination is optimistic, and
                                                         // a chunk it misses in a brief background window must be re-offerable
                                                         // on its next wake, not deleted here (the ACK vaccine removes it for
                                                         // real). Without this, a large transfer to a backgrounded device can
@@ -8769,7 +8769,7 @@ impl<S: Store> Node<S> {
                         None
                     }
                 }
-                // Destination is directly reachable on its own link — deliver there,
+                // Destination is directly reachable on its own link, so deliver there,
                 // don't also flood it to relays (the dest would just dedup the copies).
                 ForwardDecision::Forward if dest_here => None,
                 ForwardDecision::Forward => {
@@ -8800,7 +8800,7 @@ impl<S: Store> Node<S> {
                     self.relay_fwd.entry(id).or_insert(now);
                 }
                 // A delivery-ACK we originated: count distinct peers it's reached; once it
-                // has spread to ACK_REPLICATION_TARGET, it's done — drop it so it stops
+                // has spread to ACK_REPLICATION_TARGET, it's done: drop it so it stops
                 // riding to every contact (DESIGN.md §7).
                 if let Some(peers) = self.ack_replicate.get_mut(&id) {
                     peers.insert(peer);
@@ -8809,7 +8809,7 @@ impl<S: Store> Node<S> {
                         self.store.remove(&id);
                     }
                 }
-                // "Sent N peers" counts relay handoffs only — not direct delivery to
+                // "Sent N peers" counts relay handoffs only, not direct delivery to
                 // the destination itself (that shows as Delivered once the ACK is back).
                 if !direct {
                     // Attribute to the UI-facing message (carrier chunk → original; deferred
@@ -8932,7 +8932,7 @@ fn is_for(bundle: &Bundle, addr: &PubKeyBytes) -> bool {
 }
 
 /// Forward-path latency (ms) a receiver reports in its ACK: its receive time `now` minus the
-/// message's `created_at` (the sender's send time). Saturating + clamped to `u32` — a negative
+/// message's `created_at` (the sender's send time). Saturating + clamped to `u32`, a negative
 /// value (clock skew where the receiver's clock trails the sender's) reads as 0, and anything
 /// beyond ~49 days clamps rather than wrapping.
 fn forward_ms(now: u64, created_at: u64) -> u32 {
@@ -9120,7 +9120,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Publish + gossip prekeys so `send_message` can open forward-secret sessions — content is
+    /// Publish + gossip prekeys so `send_message` can open forward-secret sessions, content is
     /// never static-sealed now, so a test that sends via `send_message` must do this first (§25).
     fn exchange_prekeys(net: &mut Wire2, nodes: &mut [Node]) {
         for n in nodes.iter_mut() {
@@ -9130,7 +9130,7 @@ mod tests {
     }
 
     /// Inject `who`'s (epoch-0) prekey straight into `node`'s directory via a genuine signed PreKey
-    /// advert — the same thing gossip would deliver, but without wiring a live link. Lets a test send a
+    /// advert, the same thing gossip would deliver, but without wiring a live link. Lets a test send a
     /// §39 private message to an OFFLINE recipient (the sender only needs the recipient's published SPK).
     fn inject_prekey<S: Store>(node: &mut Node<S>, who: &Identity) {
         let spk = who.derive_prekey();
@@ -9782,7 +9782,7 @@ mod tests {
 
     /// Build a §39 private delivery-ACK sealed to `to` for `for_bundle_id`, carrying `proof`
     /// (core-protocol-r2-04). Models both a genuine recipient ACK (valid proof) and an attacker's
-    /// forgery (no / wrong proof) — the sender recognizes either, but only accepts one.
+    /// forgery (no / wrong proof), the sender recognizes either, but only accepts one.
     fn make_private_ack(
         to: &PubKeyBytes,
         to_spk_pub: &XPubKeyBytes,
@@ -9855,7 +9855,7 @@ mod tests {
         // stores-r3-01: a relay's durable handoff/spool `expireAt` must be anchored to the store's
         // RECEIVER-clamped dedup deadline (seen_expiry, stores-r2-01), NOT recomputed from the
         // sender's advisory created_at. The wire/BundleOpts default is created_at=0 (and a hostile
-        // or non-node sender can stamp it), so the OLD `created_at + lifetime` landed at ~1970 —
+        // or non-node sender can stamp it), so the OLD `created_at + lifetime` landed at ~1970,
         // a durable expireAt in the PAST, which the TTL policy sweeps, silently losing a still-live
         // handed-off/spooled message to an offline recipient. Assert both paths now use now+lifetime.
         let now_ms = 1_700_000_000_000u64; // a real 2023 wall clock, far past created_at=0
@@ -9935,7 +9935,7 @@ mod tests {
     #[test]
     fn identify_service_round_trips() {
         // Calling the built-in hop.identify on a peer returns its name/kind/address,
-        // answered by the node itself — nothing surfaces to the responder's app (§29).
+        // answered by the node itself; nothing surfaces to the responder's app (§29).
         let mut nodes = [
             Node::new(Identity::generate()),
             Node::new(Identity::generate()),
@@ -9970,7 +9970,7 @@ mod tests {
 
     #[test]
     fn unnamed_node_identifies_with_no_name() {
-        // A device with no name set returns None — the caller falls back to its short
+        // A device with no name set returns None, the caller falls back to its short
         // address. The full address still comes back so the caller can resolve it.
         let mut nodes = [
             Node::new(Identity::generate()),
@@ -11072,7 +11072,7 @@ mod tests {
     #[test]
     fn deferred_content_flushes_when_peer_initiates_session() {
         // A message sent before we know the recipient's prekey is deferred ("Securing…"). If the
-        // recipient then messages US first, that establishes a session — and the deferred message
+        // recipient then messages US first, that establishes a session, and the deferred message
         // must ratchet + send right then, WITHOUT waiting for a tick. (The stuck-"Securing" bug:
         // flush only ran on tick/prekey-advert, so a message queued just before the app
         // backgrounded never left even though a session later formed via the inbound path.)
@@ -11105,7 +11105,7 @@ mod tests {
         for b in nodes[0].take_inbox() {
             let _ = nodes[0].read_message(&b); // establishing the session here must flush the deferral
         }
-        net.pump(&mut nodes); // shuttle the now-flushed deferred message — NO tick() anywhere
+        net.pump(&mut nodes); // shuttle the now-flushed deferred message, NO tick() anywhere
 
         let mut bob_got: Vec<Vec<u8>> = Vec::new();
         for b in nodes[1].take_inbox() {
@@ -11123,7 +11123,7 @@ mod tests {
     fn out_of_order_session_messages_decrypt_at_the_node_layer() {
         // Over a multi-copy DTN, two SessionMessages can be reassembled/processed out of
         // order. read_message must recover the earlier one from the ratchet's skipped-key
-        // store — not just at the Session unit level, but through the node accessor (§25).
+        // store, not just at the Session unit level, but through the node accessor (§25).
         let mut nodes = [
             Node::new(Identity::generate()),
             Node::new(Identity::generate()),
@@ -11185,7 +11185,7 @@ mod tests {
     #[test]
     fn partial_carrier_stream_resumes_after_restart() {
         // The image-in-background bug: a receiver gets some chunks, ACKs them (relay drops
-        // its copies), then iOS suspends/relaunches the app — wiping in-memory reassembly.
+        // its copies), then iOS suspends/relaunches the app, wiping in-memory reassembly.
         // Persisted chunks let it resume on the next wake instead of stalling forever (§20).
         let secret = Identity::generate().to_secret_bytes();
         let from = Identity::generate().address();
@@ -12201,7 +12201,7 @@ mod tests {
     #[test]
     fn relay_keeps_request_ack_bundle_until_acked() {
         // A relay must keep custody of a request_ack bundle until the delivery ACK confirms
-        // receipt — not release it on the optimistic handoff. Otherwise a chunk the
+        // receipt, not release it on the optimistic handoff. Otherwise a chunk the
         // destination misses in a brief background window is lost and dedup blocks
         // re-injection, so a large transfer can never complete (DESIGN.md §6, §20).
         let mut relay = Node::new(Identity::generate());
@@ -12245,7 +12245,7 @@ mod tests {
             if !bob.take_inbox().is_empty() {
                 got = true;
                 accept_all(&mut bob);
-                break; // bob has the message; its pending outgoing is the ACK — withhold it
+                break; // bob has the message; its pending outgoing is the ACK: withhold it
             }
             for (l, bytes) in bob.drain_outgoing() {
                 if l == 2 {
@@ -12256,7 +12256,7 @@ mod tests {
         assert!(got, "bob received the message");
         assert!(
             relay.store.contains(&id),
-            "relay keeps custody — ACK not yet seen"
+            "relay keeps custody, ACK not yet seen"
         );
 
         // Deliver bob's withheld ACK; the vaccine now releases the relay's copy.
@@ -12270,7 +12270,7 @@ mod tests {
 
     #[test]
     fn large_message_arrives_through_a_relay() {
-        // The real image scenario: sender and recipient never meet directly — a relay in
+        // The real image scenario: sender and recipient never meet directly, a relay in
         // the middle carries the carrier-chunk bundles and the recipient reassembles (§20).
         let mut nodes = [
             Node::new(Identity::generate()), // 0 sender
@@ -12281,7 +12281,7 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1); // sender <-> relay
         net.connect(&mut nodes, 1, 2, 2, 2); // relay  <-> recipient
-        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted: needs prekeys (§25)
 
         let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect(); // ~300KB
         let dst = nodes[2].address();
@@ -12291,7 +12291,7 @@ mod tests {
         net.pump(&mut nodes);
 
         // The chunked message reports real relay progress + delivery under its original id
-        // (carriers travel as separate bundles but attribute back — not a stuck "Sending").
+        // (carriers travel as separate bundles but attribute back, not a stuck "Sending").
         let (relayed, delivered, _, _) = nodes[0].message_status(&orig).expect("tracked");
         assert!(
             relayed >= 1,
@@ -12392,7 +12392,7 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1); // Alice <-> Carol
         net.connect(&mut nodes, 1, 2, 2, 2); // Carol <-> Bob
-        exchange_prekeys(&mut net, &mut nodes); // content is forward-secret — need prekeys (§25)
+        exchange_prekeys(&mut net, &mut nodes); // content is forward-secret: needs prekeys (§25)
 
         let alice = nodes[0].address();
         let bob = nodes[2].address();
@@ -12401,7 +12401,7 @@ mod tests {
             .unwrap();
         net.pump(&mut nodes);
 
-        // The relay never recognized it as anyone's — it just floods past.
+        // The relay never recognized it as anyone's; it just floods past.
         assert!(
             nodes[1].take_inbox().is_empty(),
             "the relay can't tell the message is Bob's"
@@ -12426,7 +12426,7 @@ mod tests {
         );
         assert!(
             matches!(inbox[0].inner.dst, Destination::Broadcast),
-            "floods — no cleartext dst"
+            "floods, no cleartext dst"
         );
 
         // ...and Bob reads the *real* sender (from inside the seal) plus the content.
@@ -12499,7 +12499,7 @@ mod tests {
         // unauthenticated claim. An attacker who knows only the recipient's public address + their
         // published prekey (both flood in adverts) crafts Private{ sender: <victim>, inner: bare
         // PeerMessage } sealed to the recipient. The recipient must recognize it (well-formed) but
-        // must NOT surface it as a message "from <victim>" — only ratcheted inners authenticate a sender.
+        // must NOT surface it as a message "from <victim>", only ratcheted inners authenticate a sender.
         let victim = Identity::generate(); // whom the attacker wants to impersonate
         let bob_id = Identity::generate(); // the recipient
         let bob_prekey = bob_id.derive_prekey(); // public: an attacker harvests this from Bob's advert
@@ -12527,7 +12527,7 @@ mod tests {
         let mut bob = Node::new(bob_id);
         assert!(
             bob.recognizes(&bundle),
-            "the seal is well-formed and addressed to Bob — he recognizes it"
+            "the seal is well-formed and addressed to Bob, so he recognizes it"
         );
         assert!(
             bob.read_message(&bundle).unwrap().is_none(),
@@ -12537,7 +12537,7 @@ mod tests {
 
     #[test]
     fn private_conversation_round_trips_both_ways() {
-        // A full private exchange: Alice → Bob, then Bob → Alice — both untraceable and both
+        // A full private exchange: Alice → Bob, then Bob → Alice, both untraceable and both
         // forward-secret (the reply rides the session Bob established from Alice's first message).
         let mut nodes = [
             Node::new(Identity::generate()),
@@ -12650,7 +12650,7 @@ mod tests {
     #[test]
     fn private_send_defers_until_prekey_then_floods() {
         // require-ratchet (§25) holds for private sends too: with no prekey for Bob yet, the
-        // message is queued ("Sending…"), never static-sealed — then flushes the moment Bob's
+        // message is queued ("Sending…"), never static-sealed, then flushes the moment Bob's
         // prekey advert arrives, and reaches him untraceably.
         let mut nodes = [
             Node::new(Identity::generate()),
@@ -12688,7 +12688,7 @@ mod tests {
     fn private_message_delivery_is_confirmed_by_a_private_ack() {
         // request_ack on the default (private) path: the recipient recognizes the message and
         // seals an Ack back to the sender it learned from inside the seal. The ack floods, the
-        // sender recognizes it, and the message flips to Delivered — all without either end
+        // sender recognizes it, and the message flips to Delivered, all without either end
         // ever appearing in cleartext on the wire.
         let mut nodes = [
             Node::new(Identity::generate()), // 0 Alice
@@ -12718,7 +12718,7 @@ mod tests {
             delivered,
             "the private ACK flipped Alice's message to Delivered"
         );
-        // The relay is an endpoint for neither leg — both were anonymous broadcasts.
+        // The relay is an endpoint for neither leg; both were anonymous broadcasts.
         assert!(
             nodes[1].take_inbox().is_empty(),
             "the relay is not an endpoint for either leg"
@@ -12786,7 +12786,7 @@ mod tests {
 
     // --- §39 P4 gradient routing -----------------------------------------------
 
-    /// 4-node A—R—B with a decoy D also hanging off R (the relay/bridge has 3 links). Models the
+    /// 4-node A-R-B with a decoy D also hanging off R (the relay/bridge has 3 links). Models the
     /// live bug: a remote sender A reaches a recipient B only through a relay R, with other clients
     /// (D) also on R.
     fn gradient_topology() -> ([Node; 4], Wire2) {
@@ -12808,7 +12808,7 @@ mod tests {
     fn private_bundle_routes_down_the_gradient_not_flooded_to_decoys() {
         // The fix for the relay-bridged regression: B advertises a receiver-beacon → R lays a
         // gradient toward B; A's private message then routes DOWN it (R→B only), reaching B
-        // WITHOUT being flooded to the decoy D — directed delivery, not blind flood.
+        // WITHOUT being flooded to the decoy D: directed delivery, not blind flood.
         let (mut nodes, mut net) = gradient_topology();
 
         nodes[2].publish_recv_beacon().unwrap(); // B in "route-to-me" mode
@@ -12840,7 +12840,7 @@ mod tests {
         );
         assert!(
             !nodes[3].store.contains(&id),
-            "decoy D never got a copy — directed, not flooded"
+            "decoy D never got a copy: directed, not flooded"
         );
     }
 
@@ -12855,7 +12855,7 @@ mod tests {
         );
 
         // With every node advanced into epoch 1, B's beacon lays a gradient for BOTH the current
-        // (epoch 1) and previous (epoch 0) mailbox tags — so a bundle addressed just before the
+        // (epoch 1) and previous (epoch 0) mailbox tags, so a bundle addressed just before the
         // rotation boundary (sender a bit behind) still routes instead of being stranded.
         let (mut nodes, mut net) = gradient_topology(); // A, R, B, D ; prekeys already exchanged
         for n in nodes.iter_mut() {
@@ -12883,7 +12883,7 @@ mod tests {
     #[test]
     fn beacon_cannot_hijack_another_nodes_mailbox() {
         // F-05: a beacon signed by a NON-owner must not lay a gradient for a victim's mailbox.
-        // The mailbox tag is H(SPK) and the SPK is public, so Mallory can name B's mailbox — but
+        // The mailbox tag is H(SPK) and the SPK is public, so Mallory can name B's mailbox, but
         // the gradient only installs if the mailbox matches the *publisher's own* prekey.
         let (mut nodes, mut net) = gradient_topology();
         let bmail = crypto::mailbox_tag(&nodes[2].address(), 0); // B's mailbox
@@ -12933,7 +12933,7 @@ mod tests {
     fn private_bundle_floods_as_fallback_without_a_gradient() {
         // No beacon ⇒ no gradient ⇒ R falls back to the epidemic flood, so the decoy D DOES
         // receive (+ stores) a copy it can't open. This is the contrast that proves the gradient
-        // is what makes routing directed — and that delivery still works on the cold-start floor.
+        // is what makes routing directed, and that delivery still works on the cold-start floor.
         let (mut nodes, mut net) = gradient_topology();
 
         let bmail = route_key(&crypto::mailbox_tag(&nodes[2].address(), 0));
@@ -12955,7 +12955,7 @@ mod tests {
         );
         assert!(
             nodes[3].store.contains(&id),
-            "decoy D got a copy — flooded (no gradient to steer it)"
+            "decoy D got a copy: flooded (no gradient to steer it)"
         );
     }
 
@@ -12963,7 +12963,7 @@ mod tests {
     fn reply_ack_returns_via_intermittent_carrier() {
         // Intermittent-carrier topology (a stuck case the browser sim surfaced): `you` is BLE-only and meets a carrier only in passes; the
         // carrier and `friend` sit on a relay. m1 you→friend acks fine. friend's REPLY m2 reaches
-        // `you` on a later pass — and m2's ACK must ride back on subsequent passes. Without the
+        // `you` on a later pass, and m2's ACK must ride back on subsequent passes. Without the
         // fix this ack never comes home (friend stays "Sending…" forever).
         let mut nodes = [
             Node::new(Identity::generate()), // 0 you (intermittent)
@@ -13015,7 +13015,7 @@ mod tests {
             .unwrap();
         settle(&mut nodes, &mut net, &mut now, 120); // m2 spreads to relay + carrier, parks there
 
-        // pass 2: the carrier meets you again — m2 must deliver, and you's ACK must start back.
+        // pass 2: the carrier meets you again, m2 must deliver, and you's ACK must start back.
         net.connect(&mut nodes, 0, 13, 1, 14);
         settle(&mut nodes, &mut net, &mut now, 60);
         assert_eq!(
@@ -13040,7 +13040,7 @@ mod tests {
     #[test]
     fn a_verified_vaccine_is_delivery_proof_for_the_sender() {
         // The sender's private ACK can be lost, and once the vaccine immunizes the mesh a
-        // retransmit can never trigger a re-ACK — so the SENDER must accept a verified vaccine
+        // retransmit can never trigger a re-ACK, so the SENDER must accept a verified vaccine
         // as proof of delivery (same CDH token, same forgery bar as the relay-purge check).
         let (mut nodes, mut net) = gradient_topology();
         let bob = nodes[2].address();
@@ -13055,7 +13055,7 @@ mod tests {
             .sends_status()
             .iter()
             .any(|(i, _, d)| i == &id && *d);
-        // (If the ack already made it through the pump, the point still holds — craft the vaccine
+        // (If the ack already made it through the pump, the point still holds; craft the vaccine
         // path explicitly against a FRESH sender copy below.)
         let eph = nodes[1]
             .store
@@ -13105,7 +13105,7 @@ mod tests {
     fn delivery_vaccine_purges_relay_copy_but_a_forged_token_cannot() {
         // §39 vaccine: on delivery the recipient reveals its recognition DH; a relay holding the
         // bundle verifies token→tag and drops its copy. A forged token (anyone who saw the flood
-        // knows the id) must NOT purge it — only a real delivery can. No src/dst is ever revealed.
+        // knows the id) must NOT purge it, only a real delivery can. No src/dst is ever revealed.
         let (mut nodes, mut net) = gradient_topology();
 
         // No-ack send ⇒ B delivers but emits NO vaccine, so R keeps its relayed copy for us to test.
@@ -13131,7 +13131,7 @@ mod tests {
             .ephemeral;
         let real = crypto::recognition_shared(&nodes[2].prekey.secret_bytes(), &eph);
 
-        // A forged vaccine (wrong token) is rejected — R keeps its copy.
+        // A forged vaccine (wrong token) is rejected; R keeps its copy.
         let forged = Bundle::create_vaccine(
             [0xAB; 32],
             BundleOpts {
@@ -13321,7 +13321,7 @@ mod tests {
         // SPOOLABLE (durably held by mailbox-tag) and NOT on the device-handoff path. When the
         // recipient later beacons, the relay lays a gradient AND surfaces the mailbox as "wanted"
         // (the want-beacon → the host reloads the durable spool), and the bundle is no longer
-        // spoolable — P4 now owns it (spool XOR live-route, no double-send).
+        // spoolable; P4 now owns it (spool XOR live-route, no double-send).
         let bob = Identity::generate();
         let bob_mailbox = crypto::mailbox_tag(&bob.address(), 0);
         // sec-priv-04 / core-protocol-r2-02: the spool/gradient/want keys are the tag's routing PREFIX,
@@ -13365,7 +13365,7 @@ mod tests {
 
         // Bob comes online behind the relay and beacons (the want-beacon). He publishes his
         // prekey too (as every real node does on startup), so the relay can bind his mailbox to
-        // its owner before laying a gradient (F-05 — a beacon whose owner is unknown is dropped).
+        // its owner before laying a gradient (F-05, a beacon whose owner is unknown is dropped).
         let mut nodes = [relay, Node::from_identity_secret(&bob.to_secret_bytes())];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1); // relay <-> bob
@@ -13388,7 +13388,7 @@ mod tests {
             "wanted drains once"
         );
         // core-protocol-r2-01: the bundle STAYS spoolable even with a live gradient. The gradient keys
-        // on a 2-byte prefix, so a live next-hop may be a prefix-COLLIDING different recipient — the old
+        // on a 2-byte prefix, so a live next-hop may be a prefix-COLLIDING different recipient, the old
         // "spool XOR route" rule black-holed the true (passive) recipient in that case. We now keep the
         // durable spool as a safety net; a redundant delivery to the genuine recipient is deduped by id.
         assert!(
@@ -13461,7 +13461,7 @@ mod tests {
         );
     }
 
-    /// Find two distinct identities whose current mailbox-tags collide on the routing prefix — the
+    /// Find two distinct identities whose current mailbox-tags collide on the routing prefix, the
     /// anonymity set an address-knower cannot resolve. A birthday search over a 2-byte prefix finds a
     /// pair quickly; bounded so the test can never hang.
     fn colliding_recipients(epoch: u64) -> (Identity, Identity) {
@@ -13479,14 +13479,14 @@ mod tests {
             }
             seen.insert(route, secret);
         }
-        panic!("no prefix collision found — prefix width unexpectedly large");
+        panic!("no prefix collision found: prefix width unexpectedly large");
     }
 
     #[test]
     fn colliding_recipients_share_one_route_bucket_but_each_gets_only_its_own_message() {
         // sec-priv-04: two recipients whose mailbox-tags collide on the routing prefix are
         // INDISTINGUISHABLE at the routing layer (one gradient/spool bucket = an anonymity set), yet
-        // delivery stays correct — each opens ONLY its own message, because the final "is this mine?"
+        // delivery stays correct: each opens ONLY its own message, because the final "is this mine?"
         // test is the per-message recognition tag, which is unique and unlinkable. This proves both the
         // unlinkability property AND that delivery still works.
         let (b1, b2) = colliding_recipients(0);
@@ -13496,10 +13496,10 @@ mod tests {
         assert_eq!(
             route_key(&t1),
             route_key(&t2),
-            "but they collide on the routing prefix — the anonymity set"
+            "but they collide on the routing prefix, the anonymity set"
         );
 
-        // Stand up A—R with both recipients hanging off R, so a private send must route through R.
+        // Stand up A-R with both recipients hanging off R, so a private send must route through R.
         let mut nodes = [
             Node::new(Identity::generate()),                   // 0 A (sender)
             Node::new(Identity::generate()),                   // 1 R (relay)
@@ -13513,7 +13513,7 @@ mod tests {
         exchange_prekeys(&mut net, &mut nodes);
 
         // Both recipients go "route-to-me". Because their tags share a prefix, R holds exactly ONE
-        // gradient bucket for the pair — an observer of R's gradient sees the prefix, not which of the
+        // gradient bucket for the pair; an observer of R's gradient sees the prefix, not which of the
         // two (or any other colliding address) is behind it.
         nodes[2].publish_recv_beacon().unwrap();
         nodes[3].publish_recv_beacon().unwrap();
@@ -13525,7 +13525,7 @@ mod tests {
         );
         // sec-priv-04 unlinkability: the two distinct recipients occupy exactly ONE gradient KEY (the
         // shared prefix). An address-knower reading R's gradient sees a single opaque prefix bucket, not
-        // which of the (≥2) colliding addresses is behind it — that is the anonymity set.
+        // which of the (≥2) colliding addresses is behind it; that is the anonymity set.
         assert_eq!(
             nodes[1].recv_gradient.len(),
             1,
@@ -13539,7 +13539,7 @@ mod tests {
         );
 
         // A sends a distinct private message to EACH. Both stamp the same route bucket, so both ride
-        // the same gradient — yet each recipient recognizes and opens only the one sealed to it.
+        // the same gradient, yet each recipient recognizes and opens only the one sealed to it.
         nodes[0]
             .send_message(b1.address(), "t".into(), b"for-b1".to_vec(), true)
             .unwrap();
@@ -13584,7 +13584,7 @@ mod tests {
         relay.set_time(0);
         relay.record_gradient(bucket, victim_link, 1, 0, ttl, 1);
 
-        // A Sybil fleet parks the remaining 7 slots at t=1000 with FAR-FUTURE expiry (a longer TTL) —
+        // A Sybil fleet parks the remaining 7 slots at t=1000 with FAR-FUTURE expiry (a longer TTL):
         // under nearest-to-expiry eviction these fresher-expiry links would outrank the victim's.
         relay.set_time(1_000);
         for i in 0..(MAX_GRADIENT_LINKS_PER_BUCKET - 1) {
@@ -13604,7 +13604,7 @@ mod tests {
         relay.set_time(3_000);
         relay.record_gradient(bucket, 2_000 as LinkId, 3, 3_000, ttl * 10, 1);
 
-        // The victim's link MUST survive — the evicted one is a stale-seen parked Sybil, not the victim.
+        // The victim's link MUST survive; the evicted one is a stale-seen parked Sybil, not the victim.
         assert!(
             relay.recv_gradient[&bucket]
                 .links
@@ -13624,7 +13624,7 @@ mod tests {
         // core-protocol-r2-02: the FULL 16-byte mailbox tag = H(address ‖ epoch) is a public
         // deterministic function of a broadly-known address. If it rode verbatim in the cleartext
         // header, a bundle-capturing address-knower could recompute the target's tag and UNIQUELY
-        // re-link the recipient off the header — defeating the sec-priv-04 anonymity-set claim. Assert
+        // re-link the recipient off the header, defeating the sec-priv-04 anonymity-set claim. Assert
         // the header (and the whole serialized wire) carries only the 2-byte routing PREFIX, so the full
         // deterministic tag never appears on the wire.
         let bob = Identity::generate();
@@ -13642,7 +13642,7 @@ mod tests {
             .get(&mid)
             .expect("sender holds its private bundle");
 
-        // The header field is exactly the prefix — and, being only 2 bytes, cannot be the full tag.
+        // The header field is exactly the prefix, and, being only 2 bytes, cannot be the full tag.
         let hdr_mailbox = pb.inner.private.as_ref().unwrap().mailbox;
         assert_eq!(
             hdr_mailbox,
@@ -13651,7 +13651,7 @@ mod tests {
         );
 
         // The full deterministic tag must NOT appear anywhere in the serialized bundle. (The
-        // per-message recognition `tag` DOES ride in the header, but it is ephemeral+unlinkable — only
+        // per-message recognition `tag` DOES ride in the header, but it is ephemeral+unlinkable, only
         // the address-derived mailbox tag is the linkability leak we are closing.)
         let wire = pb.to_bytes().unwrap();
         assert!(
@@ -13671,8 +13671,8 @@ mod tests {
     fn a_passive_colliding_recipient_is_not_black_holed_by_an_active_one() {
         // core-protocol-r2-01 (REGRESSION): B2 is a PASSIVE (max-privacy) recipient that never beacons.
         // B1 collides with B2 on the 2-byte route prefix and IS beaconing. Before the fix, a relay
-        // steered B2's private bundle ONLY down B1's (colliding) link — where B1 fails the per-message
-        // recognition tag and drops it — AND the spool gate refused to spool it because a "live gradient"
+        // steered B2's private bundle ONLY down B1's (colliding) link, where B1 fails the per-message
+        // recognition tag and drops it, AND the spool gate refused to spool it because a "live gradient"
         // existed for the (shared) route. Result: B2's message reached B2 via NEITHER the live route NOR
         // the durable spool: a silent black-hole. The fix ALWAYS spools a private bundle carrying a
         // mailbox, so B2 still collects it via its want-beacon pull when it later checks in.
@@ -13684,7 +13684,7 @@ mod tests {
         );
         let b2_route = route_key(&crypto::mailbox_tag(&b2.address(), 0));
 
-        // A — R with the ACTIVE colliding recipient B1 behind R. B2 is offline/passive (not connected).
+        // A-R with the ACTIVE colliding recipient B1 behind R. B2 is offline/passive (not connected).
         let mut nodes = [
             Node::new(Identity::generate()),                   // 0 A (sender)
             Node::new(Identity::generate()),                   // 1 R (relay)
@@ -13702,7 +13702,7 @@ mod tests {
         inject_prekey(&mut nodes[0], &b2);
 
         // Only the ACTIVE colliding recipient B1 beacons. R lays a gradient for the shared prefix bucket
-        // with exactly B1's link — B2, being passive, is NOT in it.
+        // with exactly B1's link; B2, being passive, is NOT in it.
         nodes[2].publish_recv_beacon().unwrap();
         net.pump(&mut nodes);
         assert!(
@@ -13716,7 +13716,7 @@ mod tests {
             .unwrap();
         net.pump(&mut nodes);
 
-        // B1 (the active decoy) must NOT open B2's message — the recognition tag is unique per recipient.
+        // B1 (the active decoy) must NOT open B2's message; the recognition tag is unique per recipient.
         let b1_bodies: Vec<Vec<u8>> = nodes[2]
             .take_inbox()
             .iter()
@@ -13727,7 +13727,7 @@ mod tests {
             "the colliding active decoy B1 never opens B2's message"
         );
 
-        // THE FIX: R still spools B2's bundle even though a live gradient (B1's) exists for the route —
+        // THE FIX: R still spools B2's bundle even though a live gradient (B1's) exists for the route;
         // otherwise B2 would be black-holed. Before the fix this list was empty.
         let spool = nodes[1].spoolable_private_bundles();
         assert!(
@@ -13851,7 +13851,7 @@ mod tests {
     #[test]
     fn a_forged_private_ack_cannot_mark_a_send_delivered() {
         // core-protocol-r2-04: a §39 private ACK is unsigned and recognized only via the sender's
-        // PUBLISHED SPK, and the acked bundle is sealed to the sender's PUBLIC address — so an attacker
+        // PUBLISHED SPK, and the acked bundle is sealed to the sender's PUBLIC address, so an attacker
         // who knows the sender's address and an in-flight bundle id can forge a Private{Ack{id}} the
         // sender recognizes. Without a recipient-only CDH proof this flipped the send to Delivered and
         // stopped retransmission though the real recipient never received it. Assert a forged ACK (no
@@ -13861,7 +13861,7 @@ mod tests {
         let sender_addr = sender.address();
         let sender_spk = sender.derive_prekey().public;
         // A second handle on the same identity so we can inject the sender's own prekey after `sender`
-        // is moved into the node (Identity is not Clone — reconstruct from the secret bytes).
+        // is moved into the node (Identity is not Clone, so reconstruct from the secret bytes).
         let sender_twin = Identity::from_secret_bytes(&sender.to_secret_bytes());
 
         let mut node = Node::new(sender);
@@ -13918,8 +13918,8 @@ mod tests {
             "still held after the wrong-token forgery"
         );
 
-        // (2) GENUINE ACK: the real recipient computes the CDH proof = recognition_shared(spk_secret, eph)
-        // — exactly the vaccine token, computable ONLY with the recipient's SPK secret.
+        // (2) GENUINE ACK: the real recipient computes the CDH proof = recognition_shared(spk_secret, eph),
+        // exactly the vaccine token, computable ONLY with the recipient's SPK secret.
         let proof =
             crypto::recognition_shared(&recipient.derive_prekey().secret_bytes(), &orig_eph);
         let genuine = make_private_ack(&sender_addr, &sender_spk, mid, Some(proof));
@@ -13959,20 +13959,20 @@ mod tests {
     #[test]
     fn a_recognition_header_chimera_is_rejected_at_verify_so_it_cannot_occupy_a_genuine_private_id()
     {
-        // core-protocol-r13-01 (§39 recognition-header chimera, 7th vector — the ROOT fix). Before r13
+        // core-protocol-r13-01 (§39 recognition-header chimera, 7th vector, the ROOT fix). Before r13
         // the private id bound ONLY the sealed payload, so an attacker who saw a genuine private bundle
         // could reuse its sealed bytes and rewrite the recognition header (tag/ephemeral/mailbox) to
-        // garbage while keeping the SAME id — it self-verified. At a keep-first relay that chimera won the
+        // garbage while keeping the SAME id, and it self-verified. At a keep-first relay that chimera won the
         // store race, occupied the id, re-flooded its unrecognizable header, and DROPPED the genuine
         // same-id copy (store.put -> false), starving any recipient reachable only through that relay.
         // r13 binds the header into the wire id (id = H(content_id ‖ ephemeral ‖ mailbox ‖ tag)), so a
-        // header rewrite yields a DIFFERENT id — a relay recomputes it with no secret and verify() rejects
+        // header rewrite yields a DIFFERENT id, a relay recomputes it with no secret and verify() rejects
         // a bundle whose id doesn't match its own header. The chimera can never occupy the genuine id.
         let bob = Identity::generate();
         let (_alice, mid, genuine) = genuine_private_to(&bob);
 
         // Attacker reuses the sealed bytes (same content_id) but flips the recognition tag, KEEPING the
-        // genuine id field — exactly the pre-r13 occupation attack.
+        // genuine id field, exactly the pre-r13 occupation attack.
         let mut chimera = genuine.clone();
         chimera.inner.private.as_mut().unwrap().tag[0] ^= 0xFF;
         assert_eq!(
@@ -13983,7 +13983,7 @@ mod tests {
         assert!(genuine.verify().is_ok(), "the genuine bundle verifies");
         assert!(
             chimera.verify().is_err(),
-            "r13: a header-rewrite chimera no longer self-verifies — the id binds the header"
+            "r13: a header-rewrite chimera no longer self-verifies, the id binds the header"
         );
 
         // A RELAY (not the recipient) sees the chimera FIRST. on_bundle rejects it at verify() before the
@@ -14010,7 +14010,7 @@ mod tests {
         assert_eq!(
             relay.store.get(&mid).unwrap().inner.private.as_ref().unwrap().tag,
             genuine.inner.private.as_ref().unwrap().tag,
-            "the held copy carries the GENUINE recognition tag — a recipient behind the relay can recognize it"
+            "the held copy carries the GENUINE recognition tag, a recipient behind the relay can recognize it"
         );
     }
 
@@ -14031,7 +14031,7 @@ mod tests {
             "the genuine send requested an ACK"
         );
 
-        // Flip request_ack while KEEPING the genuine id field — the pre-r14 occupation attempt.
+        // Flip request_ack while KEEPING the genuine id field, the pre-r14 occupation attempt.
         let mut twin = genuine.clone();
         twin.inner.flags.request_ack = false;
         assert_eq!(
@@ -14042,7 +14042,7 @@ mod tests {
         assert!(genuine.verify().is_ok(), "the genuine bundle verifies");
         assert!(
             twin.verify().is_err(),
-            "r14: a flipped-scalar twin no longer self-verifies — the id binds flags (and every scalar)"
+            "r14: a flipped-scalar twin no longer self-verifies, the id binds flags (and every scalar)"
         );
 
         // A relay rejects the twin at verify() before the store, so it can't occupy the id or strip the ACK.
@@ -14070,13 +14070,13 @@ mod tests {
         let (_alice, mid, genuine) = genuine_private_to(&bob);
         let mut bob_node = Node::new(bob);
 
-        // A header chimera is rejected at Bob's verify() gate — nothing delivered, nothing marked seen.
+        // A header chimera is rejected at Bob's verify() gate: nothing delivered, nothing marked seen.
         let mut chimera = genuine.clone();
         chimera.inner.private.as_mut().unwrap().tag[0] ^= 0xFF;
         bob_node.on_bundle(1, chimera);
         assert!(
             bob_node.take_inbox().is_empty(),
-            "the header chimera is rejected at verify — nothing delivered"
+            "the header chimera is rejected at verify: nothing delivered"
         );
         assert!(
             !bob_node.store.seen(&mid),
@@ -14093,7 +14093,7 @@ mod tests {
         bob_node.on_bundle(3, genuine.clone());
         assert!(
             bob_node.take_inbox().is_empty(),
-            "a genuine duplicate is deduped — delivered exactly once"
+            "a genuine duplicate is deduped, delivered exactly once"
         );
     }
 
@@ -14452,7 +14452,7 @@ mod tests {
             relay.store.seen(&vid),
             "first vaccine copy is recorded as seen"
         );
-        // A duplicate copy (same id) must be short-circuited by the seen gate before the scan — we assert
+        // A duplicate copy (same id) must be short-circuited by the seen gate before the scan; we assert
         // the observable proxy: it is not re-stored/re-flooded and the seen set is unchanged.
         relay.on_bundle(11, vax.clone());
         assert!(
@@ -14573,7 +14573,7 @@ mod tests {
 
     #[test]
     fn vaccine_carries_no_plaintext_delivered_id_but_a_holder_still_drops() {
-        // sec-priv-07: the delivery vaccine floods ONLY the recognition token — no plaintext delivered
+        // sec-priv-07: the delivery vaccine floods ONLY the recognition token, no plaintext delivered
         // id. Prove (1) a party that did NOT capture the flood cannot read any bundle id off the wire
         // (the anti-packet's bytes contain neither the delivered id nor anything an outsider can bind to
         // one), and (2) a real HOLDER of the delivered bundle still recovers the match by the token and
@@ -14608,7 +14608,7 @@ mod tests {
         );
 
         // (1) A non-capturing observer sees only the serialized anti-packet. The delivered id must NOT
-        // appear anywhere in those bytes — that is the concrete metadata the old wire leaked.
+        // appear anywhere in those bytes; that is the concrete metadata the old wire leaked.
         let wire = vax.to_bytes().unwrap();
         assert!(
             !wire.windows(32).any(|w| w == id),
@@ -14642,7 +14642,7 @@ mod tests {
     #[test]
     fn large_message_auto_streams_and_arrives_whole() {
         // A big message (e.g. an image body) exceeds one bundle, so it's transparently
-        // carried as a stream of chunks and reassembled — arriving as a normal inbox
+        // carried as a stream of chunks and reassembled, arriving as a normal inbox
         // message with the right content type and exact bytes (DESIGN.md §20).
         let mut nodes = [
             Node::new(Identity::generate()),
@@ -14650,7 +14650,7 @@ mod tests {
         ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
-        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted: needs prekeys (§25)
 
         let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect(); // ~200KB → multi-chunk
         nodes[0]
@@ -14752,7 +14752,7 @@ mod tests {
 
     #[test]
     fn hns_missing_record_is_a_negative_result() {
-        // hops://thisdoesnotexist.com — no reachable well-known. The host reports None; we cache
+        // hops://thisdoesnotexist.com, no reachable well-known. The host reports None; we cache
         // the negative and surface a resolution error (address None), so we don't refetch on repeat.
         let mut node = Node::new(Identity::generate());
         node.set_internet(true);
@@ -14847,7 +14847,7 @@ mod tests {
     #[test]
     fn duplicate_to_destination_re_acks_then_throttles() {
         // If our delivery-ACK is lost, the sender retransmits; a duplicate reaching the
-        // destination must re-emit the ACK (so the sender can stop) — but throttled, so a
+        // destination must re-emit the ACK (so the sender can stop), but throttled, so a
         // burst of duplicates can't cause an ACK storm (DESIGN.md §7).
         let mut nodes = [
             Node::new(Identity::generate()),
@@ -14856,7 +14856,7 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
 
-        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted: needs prekeys (§25)
         let id = nodes[0]
             .send_to(&nodes[1].address(), "t".into(), b"hi".to_vec(), true)
             .unwrap()
@@ -15044,7 +15044,7 @@ mod tests {
     #[test]
     fn eviction_prefers_already_relayed_over_not_yet_relayed() {
         // Custody policy (§6): under cap pressure, a bundle we've already relayed (and held
-        // past the grace window) is evicted before one we haven't relayed yet — so a flood
+        // past the grace window) is evicted before one we haven't relayed yet, so a flood
         // of big transfers can't push out legitimate, not-yet-forwarded messages.
         let mut nodes = [
             Node::new(Identity::generate()),
@@ -15121,7 +15121,7 @@ mod tests {
         // Field bug (resource exhaustion): an iOS rotating-MAC dialer can open MORE THAN ONE
         // L2CAP channel to the same Android peer, so the node ends up with two Up links to the
         // SAME peer. If it doesn't dedup them, traffic can loop between the two links and exhaust
-        // the (few-KB/s) BLE pipe — which is exactly the megabyte flood seen on-device. This test
+        // the (few-KB/s) BLE pipe, which is exactly the megabyte flood seen on-device. This test
         // reproduces it deterministically: connect two nodes with TWO link pairs, then verify the
         // network reaches quiescence with BOUNDED traffic (no loop) and the peer is identified once.
         let mut nodes = [
@@ -15161,11 +15161,11 @@ mod tests {
 
         assert!(
             quiesced,
-            "node never reached quiescence — TRAFFIC LOOP (rounds={rounds}, bytes={total_bytes})"
+            "node never reached quiescence, TRAFFIC LOOP (rounds={rounds}, bytes={total_bytes})"
         );
         assert!(
             total_bytes < 50_000,
-            "two-link handshake + one tiny message moved {total_bytes} bytes — amplification loop"
+            "two-link handshake + one tiny message moved {total_bytes} bytes, amplification loop"
         );
         // The message must actually be delivered exactly once (not lost in the loop, not duplicated).
         assert_eq!(
@@ -15181,7 +15181,7 @@ mod tests {
         // continuously on near-empty stores (tx ~3-4x rx), saturating the few-KB/s pipe so real
         // messages crawl through over minutes/hours. This reproduces steady-state operation: two
         // connected nodes, prekeys exchanged, then many "ticks" with the periodic presence/prekey
-        // re-publish the bearer does — and asserts an idle link moves only a TRICKLE, not a flood.
+        // re-publish the bearer does, and asserts an idle link moves only a TRICKLE, not a flood.
         let mut nodes = [
             Node::new(Identity::generate()),
             Node::new(Identity::generate()),
@@ -15253,20 +15253,20 @@ mod tests {
             tick_pump(&mut nodes, now, &mut bytes);
         }
 
-        // 30 idle seconds on an established link should move only a handful of presence adverts —
+        // 30 idle seconds on an established link should move only a handful of presence adverts:
         // KB, not the tens-to-hundreds of KB the device shows. A flood means a gossip re-send loop.
         assert!(
             bytes < 20_000,
-            "idle link flooded {bytes} bytes in 30s — steady-state gossip loop"
+            "idle link flooded {bytes} bytes in 30s, steady-state gossip loop"
         );
     }
 
     #[test]
     fn regossip_does_not_reflood_the_directory() {
         // Field bug (resource exhaustion at scale): the 12s re-gossip cleared sent_adverts on every
-        // link and re-sent the WHOLE directory — O(directory x links) every cycle. In a busy multi-
+        // link and re-sent the WHOLE directory, O(directory x links) every cycle. In a busy multi-
         // peer mesh that floods the few-KB/s BLE pipe (tx >> rx, since the peer just dedups) and
-        // starves real messages — minutes-to-hours delivery. New adverts already propagate on their
+        // starves real messages, minutes-to-hours delivery. New adverts already propagate on their
         // own (not in sent_adverts), and prekeys/presence are periodically RE-published, so the full
         // re-flood is redundant. Assert the re-gossip moves only a trickle when nothing changed.
         let mut nodes = [
@@ -15297,7 +15297,7 @@ mod tests {
         net.pump(&mut nodes); // node 1 receives the 40 adverts once (initial sync)
 
         // Run 5 re-gossip cycles with NO new adverts; measure bytes moved. An unchanged directory
-        // should move almost nothing — the bug re-floods all 40 adverts every 12s cycle.
+        // should move almost nothing; the bug re-floods all 40 adverts every 12s cycle.
         let mut bytes = 0usize;
         let mut now = 1_000u64;
         for _ in 0..5 {
@@ -15330,7 +15330,7 @@ mod tests {
     fn reconnect_does_not_reflood_the_directory_3node() {
         // Field bug (resource exhaustion): the per-link gossip dedup (sent_adverts/sent_bundles) lived
         // on the `Established` instance and was wiped on every (re)establishment. BLE links flap, so
-        // each reconnect re-offered the WHOLE directory to the peer — the ~116 rec/s, byte-identical-
+        // each reconnect re-offered the WHOLE directory to the peer, the ~116 rec/s, byte-identical-
         // across-links flood that saturated the pipe and starved real messages. The fix keys the dedup
         // on the PEER (snapshot on Disconnect, restore on Up), so after the one-time initial sync a
         // flapping link moves ~nothing.
@@ -15345,7 +15345,7 @@ mod tests {
         net.connect(&mut nodes, 0, 2, 2, 20);
         net.connect(&mut nodes, 1, 12, 2, 21);
 
-        // Each node's OWN securing adverts (prekey + presence) — these SHOULD re-offer on every flap.
+        // Each node's OWN securing adverts (prekey + presence): these SHOULD re-offer on every flap.
         for n in nodes.iter_mut() {
             n.publish_prekey().unwrap();
             let _ = n.publish_service(
@@ -15356,7 +15356,7 @@ mod tests {
                 120_000,
             );
         }
-        // A LARGE FOREIGN directory (40 other devices' service adverts) — the bulk that must NOT be
+        // A LARGE FOREIGN directory (40 other devices' service adverts), the bulk that must NOT be
         // re-flooded on a flap. This is what made the field flood catastrophic.
         for i in 0..40u32 {
             let pubid = Identity::generate();
@@ -15605,7 +15605,7 @@ mod tests {
         // Removing the re-gossip re-flood must NOT regress prekey propagation: a prekey published
         // AFTER the link is up must still reach the peer over the STABLE link (no reconnect), so a
         // deferred forward-secret message flushes. This was the "move out of range and back to send"
-        // case — now served by immediate new-advert propagation, not a directory re-flood.
+        // case, now served by immediate new-advert propagation, not a directory re-flood.
         let mut nodes = [
             Node::new(Identity::generate()),
             Node::new(Identity::generate()),
@@ -15624,7 +15624,7 @@ mod tests {
             "no prekey yet → nothing delivered"
         );
 
-        // node 1 publishes its prekey AFTER connect — over the stable link it must reach node 0.
+        // node 1 publishes its prekey AFTER connect; over the stable link it must reach node 0.
         nodes[1].publish_prekey().unwrap();
         net.pump(&mut nodes);
 
@@ -15639,7 +15639,7 @@ mod tests {
     fn send_to_connected_peer_is_forward_secret() {
         // Messaging a connected peer is always forward-secret (DESIGN.md §25): once prekeys
         // are exchanged, send_to opens a ratchet session and the message decrypts via
-        // read_message — content is never static-sealed.
+        // read_message; content is never static-sealed.
         let mut nodes = [
             Node::new(Identity::generate()),
             Node::new(Identity::generate()),
@@ -15689,7 +15689,7 @@ mod tests {
         ];
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 1);
-        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted: needs prekeys (§25)
 
         let id = nodes[0]
             .send_to(
@@ -15726,7 +15726,7 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 1, 1, 2); // 0 <-> 1 (destination)
         net.connect(&mut nodes, 0, 3, 2, 4); // 0 <-> 2 (relay)
-        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted: needs prekeys (§25)
 
         let id = nodes[0]
             .send_message_traced(
@@ -15751,7 +15751,7 @@ mod tests {
             "relay should not be holding a needless sprayed copy"
         );
         let (relayed, delivered, hops, _) = nodes[0].message_status(&id).unwrap();
-        assert_eq!(relayed, 0, "no relay handoffs — delivered directly");
+        assert_eq!(relayed, 0, "no relay handoffs, delivered directly");
         assert!(delivered);
         assert_eq!(hops, 1);
     }
@@ -15915,7 +15915,7 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 10, 1, 11);
         net.connect(&mut nodes, 1, 12, 2, 13);
-        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted: needs prekeys (§25)
 
         let id = nodes[0]
             .send_message_traced(
@@ -16003,7 +16003,7 @@ mod tests {
         assert_eq!(inbox.len(), 1);
         let trace = inbox[0].trace();
         assert_eq!(trace.len(), 2, "exactly the two forwarders, in order");
-        // Provenance privacy (§27): device hops carry the count + app label but NOT the address —
+        // Provenance privacy (§27): device hops carry the count + app label but NOT the address;
         // they're anonymized to a zeroed short-addr, so the recipient can't see WHICH devices relayed.
         let _ = (s0, s1);
         assert!(
@@ -16020,7 +16020,7 @@ mod tests {
     #[test]
     fn relay_and_source_learn_route_from_returning_ack() {
         // 0 <-> 1 <-> 2. After 0 → 2 is delivered and the ACK floods back, the relay (1)
-        // has learned it sits on the 0↔2 route — in both directions — and the source (0)
+        // has learned it sits on the 0↔2 route, in both directions, and the source (0)
         // has learned it can reach 2 (DESIGN.md §27).
         let mut nodes = [
             Node::new(Identity::generate()),
@@ -16030,7 +16030,7 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 10, 1, 11);
         net.connect(&mut nodes, 1, 12, 2, 13);
-        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted: needs prekeys (§25)
         let a0 = nodes[0].address();
         let a2 = nodes[2].address();
 
@@ -16187,9 +16187,9 @@ mod tests {
         .unwrap();
         node.submit(b);
         assert_eq!(node.pending_count(), 1);
-        node.tick(500); // before lifetime — still pending
+        node.tick(500); // before lifetime, still pending
         assert_eq!(node.pending_count(), 1);
-        node.tick(2_000); // past lifetime — given up
+        node.tick(2_000); // past lifetime, given up
         assert_eq!(node.pending_count(), 0);
     }
 
@@ -16197,8 +16197,8 @@ mod tests {
     fn discover_presence_two_hops_away_and_message_it() {
         // 0 <-> 1 <-> 2. 0 and 2 never connect directly. 0 publishes an app-level
         // "presence" service carrying its display name; 2 discovers it via 1's gossip,
-        // then messages 0's address — routed through 1. (The name↔address tie is an
-        // app concern; the protocol only knows the service advert — DESIGN.md §4.)
+        // then messages 0's address, routed through 1. (The name↔address tie is an
+        // app concern; the protocol only knows the service advert, DESIGN.md §4.)
         let mut nodes = [
             Node::new(Identity::generate()),
             Node::new(Identity::generate()),
@@ -16207,7 +16207,7 @@ mod tests {
         let mut net = Wire2::new();
         net.connect(&mut nodes, 0, 10, 1, 11);
         net.connect(&mut nodes, 1, 12, 2, 13);
-        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted — need prekeys (§25)
+        exchange_prekeys(&mut net, &mut nodes); // content is ratcheted: needs prekeys (§25)
 
         nodes[0]
             .publish_service(
@@ -16299,7 +16299,7 @@ mod tests {
         nodes[1].hps_subscribe(nodes[0].address(), "news").unwrap();
         net.pump(&mut nodes);
 
-        // A subscriber can't publish to a service it doesn't host — only the owner broadcasts.
+        // A subscriber can't publish to a service it doesn't host, only the owner broadcasts.
         assert!(nodes[1].hps_publish("news", b"forged").is_err());
 
         // The owner broadcasts; the subscriber decrypts + verifies against the service key.
@@ -16516,7 +16516,7 @@ mod tests {
 
     #[test]
     fn hps_app_secret_isolates_join() {
-        // A node with a DIFFERENT app secret can't join an Open topic — the host rejects the
+        // A node with a DIFFERENT app secret can't join an Open topic, the host rejects the
         // foreign app id + proof, so no keys are handed off (§32 app isolation).
         let mut nodes = [app_node(1), app_node(2)];
         let mut net = Wire2::new();

@@ -2,14 +2,14 @@
 //!
 //! A node learns, from whom it repeatedly meets, which topics it is a *good relay*
 //! for. The motivating case: "I see 4 people who want job-board updates from
-//! company X every day, and I regularly pass company X — so I'm a reliable bridge
+//! company X every day, and I regularly pass company X, so I'm a reliable bridge
 //! for that topic and should prioritize carrying and offering it."
 //!
 //! This is PRoPHET-style delivery predictability (recency/frequency-weighted
 //! encounter history) specialized to pub/sub topics. Two signals per topic:
-//! - **demand** — distinct peers we meet who *want* the topic, weighted by how
+//! - **demand**: distinct peers we meet who *want* the topic, weighted by how
 //!   regularly we meet them;
-//! - **supply** — peers we meet who *carry/originate* the topic.
+//! - **supply**: peers we meet who *carry/originate* the topic.
 //!
 //! A node sitting between strong demand and live supply scores high and should
 //! pin that topic (full retention) and offer it first during short BLE contacts.

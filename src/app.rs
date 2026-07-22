@@ -6,7 +6,7 @@
 //! 32-byte **app secret** (host-supplied at node construction, like the identity seed). All
 //! app-scoping key material derives deterministically from it.
 //!
-//! Crucially the public [`AppId`] fingerprint is for **demux/filtering only** — it travels in
+//! Crucially the public [`AppId`] fingerprint is for **demux/filtering only**: it travels in
 //! cleartext in every bundle/advert header and proves nothing at runtime. Access control is the
 //! MAC ([`AppKeys::join_proof`]) and discovery confidentiality is the AEAD key
 //! ([`AppKeys::disc_key`]); both come from the secret, so only same-secret apps interoperate.
@@ -24,7 +24,7 @@ pub type AppSecret = [u8; 32];
 pub struct AppKeys {
     /// The raw secret (kept so we can re-derive / compare).
     pub secret: AppSecret,
-    /// Public 16-byte fingerprint — the [`AppId`] stamped on bundles/adverts. Demux only.
+    /// Public 16-byte fingerprint, the [`AppId`] stamped on bundles/adverts. Demux only.
     pub id: AppId,
     /// ChaCha20Poly1305 key that encrypts `hps://` discovery-advert bodies so a foreign app
     /// can't even enumerate topic names. `None` on the fabric namespace (open by design).
@@ -58,7 +58,7 @@ impl AppKeys {
         }
     }
 
-    /// A label-only app id with no secret key material — used by infra (the relay daemon) to
+    /// A label-only app id with no secret key material, used by infra (the relay daemon) to
     /// stamp a recognizable [`AppId`] on trace hops without enabling `hps://` isolation (a relay
     /// carries every app's traffic regardless). Behaves like the fabric for isolation purposes.
     pub fn label_only(id: AppId) -> Self {
