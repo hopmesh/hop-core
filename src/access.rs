@@ -60,6 +60,18 @@ pub use crate::wire_stamp::{
     carriage_hint, epoch_of, CarriageStamp, Stamper, TenantId, CARRIAGE_EPOCH_MS, HINT_BYTES,
 };
 
+/// How many epochs old a stamp may be and still attribute on a *bounded* attribution path
+/// ([`AccessPolicy::attribute_fresh`]), counted back from the verifier's current epoch.
+///
+/// This is the replay bound for paths that have NO dedup of their own (the §40 telemetry ingest is
+/// the motivating one: it neither dedups by bundle id nor tracks a replay window, so an unbounded
+/// attribution leaves a captured stamp valid for its bundle id forever). It is deliberately much
+/// wider than the 2-epoch `resolve` window because telemetry is delay-tolerant by design: a device
+/// that was offline overnight still has to land its spooled batch. One day is the compromise, and
+/// it IS a cap on delay tolerance: a batch that spools longer than this attributes to nobody and,
+/// under a fail-closed collector, is refused rather than served free.
+pub const MAX_ATTRIBUTION_AGE_EPOCHS: u64 = 24;
+
 /// The relay's keylist: which tenants are authorized, and the public key that verifies each
 /// one's stamps. This IS "an unauthed key cannot ride": a stamp whose signer is not in the
 /// keyserver never verifies. In production the fleet syncs this from the account service; a
@@ -178,6 +190,30 @@ impl KeyedAccess {
         None
     }
 
+    /// [`Self::attribute`] plus a freshness bound: the stamp must claim an epoch that is not in the
+    /// future and is no more than [`MAX_ATTRIBUTION_AGE_EPOCHS`] behind the verifier's own epoch.
+    ///
+    /// This is the form every attribution path that does NOT dedup for itself must use. The
+    /// unbounded [`Self::attribute`] is correct only where a bundle was already admitted once
+    /// against a fresh stamp and its re-delivery is deduped downstream (the durable re-ingest
+    /// path). Everywhere else, "verifies for its own signed epoch" means a captured stamp attributes
+    /// forever, which is a replay hole rather than delay tolerance.
+    fn attribute_fresh(
+        &self,
+        stamp: &CarriageStamp,
+        bundle_id: &BundleId,
+        now_ms: u64,
+    ) -> Option<TenantId> {
+        let now_epoch = epoch_of(now_ms);
+        if stamp.epoch > now_epoch {
+            return None; // a future-dated stamp is never fresh
+        }
+        if now_epoch.saturating_sub(stamp.epoch) > MAX_ATTRIBUTION_AGE_EPOCHS {
+            return None; // older than the replay window this path allows
+        }
+        self.attribute(stamp, bundle_id)
+    }
+
     /// Look up + verify a stamp for `bundle_id` at `now_ms`, returning the billed tenant.
     fn resolve(
         &self,
@@ -243,6 +279,27 @@ impl AccessPolicy {
         match self {
             AccessPolicy::Open => None,
             AccessPolicy::Keyed(k) => k.attribute(stamp, id),
+        }
+    }
+
+    /// Attribute a stamp to its tenant, verifying the signature against its own signed epoch AND
+    /// bounding that epoch to [`MAX_ATTRIBUTION_AGE_EPOCHS`] behind `now_ms` (and never ahead of
+    /// it). `None` under `Open` (devices never meter), if the stamp does not verify, or if it is
+    /// outside the window.
+    ///
+    /// Use this on any attribution path WITHOUT its own dedup or replay check (the §40 telemetry
+    /// ingest). [`Self::attribute`] stays unbounded for the durable re-ingest path, where a
+    /// legitimately-old spooled stamp is re-read for a bundle that was already admitted once
+    /// against a fresh stamp.
+    pub fn attribute_fresh(
+        &self,
+        stamp: &CarriageStamp,
+        id: &BundleId,
+        now_ms: u64,
+    ) -> Option<TenantId> {
+        match self {
+            AccessPolicy::Open => None,
+            AccessPolicy::Keyed(k) => k.attribute_fresh(stamp, id, now_ms),
         }
     }
 
@@ -454,6 +511,69 @@ mod tests {
             policy.admit(Some(&s5), &[1u8; 32], 6 * CARRIAGE_EPOCH_MS),
             Admit::Granted(Some(TENANT))
         );
+    }
+
+    #[test]
+    fn attribute_is_unbounded_but_attribute_fresh_bounds_the_epoch() {
+        // The durable re-ingest path needs the unbounded form (a spooled stamp is legitimately
+        // old); every path without its own dedup must use the bounded one.
+        let (stamper, server) = one_tenant();
+        let e = 1000u64;
+        let id = [21u8; 32];
+        let stamp = stamper.stamp(&id, e * CARRIAGE_EPOCH_MS + 10);
+        let policy = keyed(server, HashSet::new(), e * CARRIAGE_EPOCH_MS);
+
+        // Far outside any window: `attribute` still resolves it, by design.
+        let way_later = (e + 500) * CARRIAGE_EPOCH_MS;
+        assert_eq!(policy.attribute(&stamp, &id), Some(TENANT));
+        assert_eq!(
+            policy.attribute_fresh(&stamp, &id, way_later),
+            None,
+            "a captured stamp must not attribute forever on the bounded path"
+        );
+    }
+
+    #[test]
+    fn attribute_fresh_accepts_in_window_and_rejects_out_of_window() {
+        let (stamper, server) = one_tenant();
+        let e = 700u64;
+        let id = [22u8; 32];
+        let stamp = stamper.stamp(&id, e * CARRIAGE_EPOCH_MS + 10);
+        let policy = keyed(server, HashSet::new(), e * CARRIAGE_EPOCH_MS);
+
+        // Same epoch, and at the far edge of the window: accepted (delay tolerance preserved).
+        for age in [0, 1, MAX_ATTRIBUTION_AGE_EPOCHS] {
+            let now = (e + age) * CARRIAGE_EPOCH_MS;
+            assert_eq!(
+                policy.attribute_fresh(&stamp, &id, now),
+                Some(TENANT),
+                "age {age} epochs is inside the window"
+            );
+        }
+        // One epoch past the window: refused.
+        let past = (e + MAX_ATTRIBUTION_AGE_EPOCHS + 1) * CARRIAGE_EPOCH_MS;
+        assert_eq!(policy.attribute_fresh(&stamp, &id, past), None);
+        // Future-dated (verifier clock behind the stamp): refused.
+        let before = (e - 1) * CARRIAGE_EPOCH_MS;
+        assert_eq!(policy.attribute_fresh(&stamp, &id, before), None);
+    }
+
+    #[test]
+    fn attribute_fresh_still_requires_a_verifying_signature_in_window() {
+        // Freshness is an ADDITIONAL bound, never a substitute for the signature check.
+        let now = 50 * CARRIAGE_EPOCH_MS;
+        let (_, server) = one_tenant();
+        let policy = keyed(server, HashSet::new(), now);
+        let id = [23u8; 32];
+        let attacker = Identity::generate();
+        let forged = CarriageStamp {
+            hint: carriage_hint(&TENANT, epoch_of(now)),
+            sig: attacker.sign(&stamp_message(&id, epoch_of(now))).to_vec(),
+            epoch: epoch_of(now),
+        };
+        assert_eq!(policy.attribute_fresh(&forged, &id, now), None);
+        // And an Open policy attributes nothing, bounded or not.
+        assert_eq!(AccessPolicy::Open.attribute_fresh(&forged, &id, now), None);
     }
 
     #[test]

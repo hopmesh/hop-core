@@ -159,6 +159,38 @@ impl TelemetryBatch {
     pub fn billable_events(&self) -> u64 {
         self.records.len() as u64
     }
+
+    /// The measured payload size of this batch, recorded alongside [`Self::billable_events`].
+    ///
+    /// Event count alone is a poor proxy for the resource this batch actually consumes: the decode
+    /// bounds are on SHAPE, not content, so one record may carry up to `MAX_ATTRS` attributes of
+    /// `MAX_STR` bytes each. Bytes-per-event is therefore attacker-controlled across roughly three
+    /// orders of magnitude, and a single "billable event" can be several KB of arbitrary strings.
+    /// Recording bytes makes the real consumption visible; pricing off it is a separate decision
+    /// and is deliberately NOT made here.
+    ///
+    /// Counted as the variable-length content (every string in the resource and the records) plus a
+    /// fixed per-record allowance for the scalar fields. Computed from the decoded batch rather
+    /// than re-encoding it, so metering allocates nothing on the hot path.
+    pub fn payload_bytes(&self) -> u64 {
+        /// Flat allowance per record for `signal`, `value`, and `time_ms`.
+        const RECORD_OVERHEAD: u64 = 24;
+        let attrs_len = |attrs: &[(String, String)]| -> u64 {
+            attrs
+                .iter()
+                .map(|(k, v)| k.len() as u64 + v.len() as u64)
+                .sum()
+        };
+        let mut total = attrs_len(&self.resource);
+        for r in &self.records {
+            total = total
+                .saturating_add(RECORD_OVERHEAD)
+                .saturating_add(r.name.len() as u64)
+                .saturating_add(r.unit.len() as u64)
+                .saturating_add(attrs_len(&r.attrs));
+        }
+        total
+    }
 }
 
 fn attrs_ok(attrs: &[(String, String)]) -> bool {
@@ -205,6 +237,43 @@ mod tests {
         let batch = TelemetryBatch::new().push(Record::counter(&big, 1, 0));
         assert!(!batch.within_bounds());
         assert!(TelemetryBatch::from_bytes(&batch.to_bytes()).is_none());
+    }
+
+    #[test]
+    fn payload_bytes_tracks_content_that_the_event_count_hides() {
+        // The point of the measure: two batches with the SAME billable_events can differ by orders
+        // of magnitude in bytes, because the decode bounds are on shape, not content.
+        let small = TelemetryBatch::new().counter("a", 1, 0);
+        let mut fat = TelemetryBatch::new();
+        let mut rec = Record::counter("a", 1, 0);
+        for i in 0..MAX_ATTRS {
+            rec = rec.with_attr(&format!("k{i}"), &"v".repeat(MAX_STR));
+        }
+        fat = fat.push(rec);
+        assert_eq!(small.billable_events(), fat.billable_events());
+        assert!(fat.within_bounds(), "the fat batch is entirely legal");
+        assert!(
+            fat.payload_bytes() > small.payload_bytes() * 100,
+            "one legal event can carry orders of magnitude more bytes: {} vs {}",
+            fat.payload_bytes(),
+            small.payload_bytes()
+        );
+    }
+
+    #[test]
+    fn payload_bytes_counts_resource_and_record_strings() {
+        let empty = TelemetryBatch::new();
+        assert_eq!(empty.payload_bytes(), 0, "no records, no content");
+        // Resource labels count even with no records.
+        let res = TelemetryBatch::new().with_resource("platform", "ios"); // 8 + 3
+        assert_eq!(res.payload_bytes(), 11);
+        // A record adds its overhead plus name + unit + attrs.
+        let one = TelemetryBatch::new().push(
+            Record::gauge("hop.delivery.latency_ms", 1, 0) // name 23
+                .with_unit("ms") // 2
+                .with_attr("bearer", "ble"), // 6 + 3
+        );
+        assert_eq!(one.payload_bytes(), 24 + 23 + 2 + 6 + 3);
     }
 
     #[test]

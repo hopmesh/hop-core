@@ -546,6 +546,7 @@ pub struct ServiceRespItem {
 /// A telemetry batch received via `hop.telemetry` (OTel-over-Hop, §40), already decoded and
 /// bounds-checked, for the embedding collector to drain and forward (to an OTel collector or a
 /// warehouse) and to meter for the `hop_telemetry_events` observability dimension.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TelemetryIn {
     pub from: PubKeyBytes,
     pub batch: TelemetryBatch,
@@ -651,6 +652,13 @@ impl AppPayloadPolicy {
             }
         };
         Self(bits)
+    }
+
+    /// This policy plus one extra queue kind. Used for opt-in capabilities that are orthogonal to
+    /// [`NodeKind`] (a telemetry collector is an ordinary endpoint that ALSO ingests §40 batches),
+    /// so enabling one never widens the policy for every deployment of that kind.
+    const fn with(self, kind: AppQueueKind) -> Self {
+        Self(self.0 | (1 << kind as usize))
     }
 
     fn supports(self, kind: AppQueueKind) -> bool {
@@ -940,6 +948,9 @@ pub struct Node<S: Store = MemoryStore> {
     app_queue_limits: AppQueueLimits,
     app_queue_usage: AppQueueUsage,
     app_payload_policy: AppPayloadPolicy,
+    /// Opt-in §40 telemetry ingest, orthogonal to [`NodeKind`] (see [`Node::set_telemetry_ingest`]).
+    /// Re-applied by every `set_kind`, so configuration order cannot silently disable a collector.
+    telemetry_ingest: bool,
     pending_app_deliveries: HashMap<BundleId, PendingAppDelivery>,
     durable_inbox_charges: HashMap<BundleId, AppQueueCharge>,
     /// Egress HTTP requests addressed to us (as a gateway) awaiting fulfillment (§9).
@@ -1106,6 +1117,10 @@ pub struct Node<S: Store = MemoryStore> {
     /// [`MAX_METERED_TENANTS`]. Carried but unattributed = lost revenue; surfaced via
     /// [`Node::take_usage_dropped`] so overflow is never silent.
     usage_dropped: u64,
+    /// Per-tenant CARRIAGE we performed that produced no delivery event, and is therefore
+    /// currently UNBILLED (see [`Node::take_carriage`]). Accumulated when a held bundle's
+    /// attribution is pruned without ever having been billed by `meter_delivered`.
+    carriage: HashMap<TenantId, Usage>,
     /// §35 custody beacon: whether this node advertises a `Wire::Have` on connect. Off by default
     /// (devices should not burn a constrained BLE link with a full held set); relays turn it on.
     emit_have: bool,
@@ -1271,6 +1286,9 @@ impl<S: Store> Node<S> {
             app_queue_limits: AppQueueLimits::default(),
             app_queue_usage: AppQueueUsage::default(),
             app_payload_policy: AppPayloadPolicy::all(),
+            // A default node is a Device, whose policy already carries the Telemetry bit; the flag
+            // only matters once a host narrows the kind (an Endpoint-kind collector).
+            telemetry_ingest: false,
             pending_app_deliveries: HashMap::new(),
             durable_inbox_charges: HashMap::new(),
             http_requests: Vec::new(),
@@ -1341,6 +1359,7 @@ impl<S: Store> Node<S> {
             metered_attribution: HashMap::new(),
             access_refused: 0,
             usage_dropped: 0,
+            carriage: HashMap::new(),
             emit_have: false,
         };
         node.rehydrate();
@@ -1973,6 +1992,31 @@ impl<S: Store> Node<S> {
     /// call. Nonzero means the flush interval is too long for the tenant cardinality.
     pub fn take_usage_dropped(&mut self) -> u64 {
         std::mem::take(&mut self.usage_dropped)
+    }
+
+    /// Drain the per-tenant UNBILLED carriage measured since the last call: bundles this node
+    /// took custody of, carried, and eventually released (evicted or TTL-expired) without ever
+    /// seeing a delivery event, so the delivery-justified meter ([`Node::take_usage`]) never
+    /// charged for them.
+    ///
+    /// This is MEASUREMENT, not billing. It exists because a whole traffic class currently rides
+    /// for free by construction: §40 telemetry sets `request_ack: false`, its collector never
+    /// responds, and it is `Destination::Device` so no §39 vaccine fires. Whether any of it should
+    /// be priced is a product decision; this only makes the volume visible. Hosts write it to a
+    /// SEPARATE ledger prefix and must not fold it into the reach meter.
+    pub fn take_carriage(&mut self) -> Vec<(TenantId, Usage)> {
+        self.carriage.drain().collect()
+    }
+
+    /// Accumulate one carried-but-never-delivered bundle against its tenant. Bounded by the same
+    /// tenant-cardinality cap as the billing meter, so a tenant-churn flood cannot grow the map.
+    fn record_carriage(&mut self, tenant: TenantId, bytes: u64) {
+        if self.carriage.len() >= MAX_METERED_TENANTS && !self.carriage.contains_key(&tenant) {
+            return;
+        }
+        let c = self.carriage.entry(tenant).or_default();
+        c.bundles = c.bundles.saturating_add(1);
+        c.payload_bytes = c.payload_bytes.saturating_add(bytes);
     }
 
     /// §35 storage floor: a snapshot of currently-held sealed bytes per tenant, for the host's
@@ -5369,7 +5413,33 @@ impl<S: Store> Node<S> {
     /// Set what kind of node this is (returned by `hop.identify`).
     pub fn set_kind(&mut self, kind: NodeKind) {
         self.kind = kind;
-        self.app_payload_policy = AppPayloadPolicy::for_kind(kind);
+        self.apply_app_payload_policy();
+    }
+
+    /// Opt this node in (or out) of ingesting §40 `hop.telemetry` batches, independently of its
+    /// [`NodeKind`]. A collector daemon runs as an ordinary `Endpoint` and turns this on; without
+    /// it the ingest gate drops every batch, because no non-`Device` kind carries the
+    /// `Telemetry` bit. Kept as its own flag (rather than OR-ed into the policy once) so a later
+    /// [`Node::set_kind`] re-applies it instead of silently clearing it.
+    pub fn set_telemetry_ingest(&mut self, on: bool) {
+        self.telemetry_ingest = on;
+        self.apply_app_payload_policy();
+    }
+
+    /// Whether this node accepts §40 telemetry batches (hosts assert their configuration wired
+    /// through, which is what the daemon-level regression test checks).
+    pub fn telemetry_ingest(&self) -> bool {
+        self.app_payload_policy.supports(AppQueueKind::Telemetry)
+    }
+
+    /// Recompute the app payload policy from the node kind plus the orthogonal opt-ins, then drop
+    /// anything already queued that the new policy no longer supports.
+    fn apply_app_payload_policy(&mut self) {
+        let mut policy = AppPayloadPolicy::for_kind(self.kind);
+        if self.telemetry_ingest {
+            policy = policy.with(AppQueueKind::Telemetry);
+        }
+        self.app_payload_policy = policy;
         self.discard_unsupported_app_queues();
     }
 
@@ -6647,9 +6717,25 @@ impl<S: Store> Node<S> {
         // removed its own entry (via meter_delivered) synchronously; what remains here for a
         // no-longer-held id is an evicted or TTL-expired bundle that never delivered, and is
         // therefore never billed as carriage (decision 2). Cheap: only runs when non-empty.
+        //
+        // Those pruned entries are exactly the CARRIAGE GAP: real work this relay did (accept,
+        // store, spool, forward) for an attributed tenant that produced no delivery event, so the
+        // delivery-justified meter never sees it. §40 telemetry is the systematic case (it sets
+        // `request_ack: false`, the collector never responds, and `Destination::Device` fires no
+        // §39 vaccine, so NO telemetry bundle can ever bill). Record it on its own axis before
+        // dropping it, so the gap is measured instead of invisible. It is NOT billed anywhere.
         if !self.metered_attribution.is_empty() {
-            self.metered_attribution
-                .retain(|id, _| self.store.contains(id));
+            let mut uncharged: Vec<(TenantId, u64)> = Vec::new();
+            self.metered_attribution.retain(|id, (tenant, bytes)| {
+                let held = self.store.contains(id);
+                if !held {
+                    uncharged.push((*tenant, *bytes));
+                }
+                held
+            });
+            for (tenant, bytes) in uncharged {
+                self.record_carriage(tenant, bytes);
+            }
         }
         // Persisted PeerSession intentionally has no wall-clock field. Rehydrate marks restored
         // sessions unanchored, so their first real tick establishes an idle-GC baseline instead of
@@ -7684,18 +7770,24 @@ impl<S: Store> Node<S> {
                         } else if service == SERVICE_TELEMETRY {
                             // Built-in OTel-over-Hop sink (§40): decode + bounds-check, attribute the
                             // tenant from the carriage stamp (§35, the SAME verified attribution as
-                            // billing; any-epoch since telemetry is delay-tolerant and may carry a
-                            // legitimately-old spooled stamp), then surface it. Fire-and-forget (no
-                            // response); a malformed or oversized batch is dropped rather than trusted.
+                            // billing), then surface it. Fire-and-forget (no response); a malformed
+                            // or oversized batch is dropped rather than trusted.
+                            //
+                            // Attribution is BOUNDED (`attribute_fresh`), not any-epoch: this path
+                            // performs no dedup and no replay check, so the unbounded form would
+                            // leave a captured stamp valid for its bundle id indefinitely. The
+                            // window (`MAX_ATTRIBUTION_AGE_EPOCHS`) is wide enough that a device
+                            // offline overnight still attributes, which is the delay tolerance §40
+                            // actually needs; the unbounded `attribute` stays for the durable
+                            // re-ingest path, which was already admitted once against a fresh stamp.
                             if let Some(batch) = TelemetryBatch::from_bytes(&args) {
                                 if !self.app_payload_policy.supports(AppQueueKind::Telemetry) {
                                     return false;
                                 }
-                                let tenant = bundle
-                                    .env
-                                    .access
-                                    .as_deref()
-                                    .and_then(|stamp| self.access_policy.attribute(stamp, &id));
+                                let now = self.now_ms;
+                                let tenant = bundle.env.access.as_deref().and_then(|stamp| {
+                                    self.access_policy.attribute_fresh(stamp, &id, now)
+                                });
                                 let Some(charge) = self.reserve_app_queue(
                                     AppQueueKind::Telemetry,
                                     Some(from),
@@ -9937,6 +10029,118 @@ mod tests {
         // Fire-and-forget: it is not surfaced as a custom service request, and no response returns.
         assert!(nodes[1].take_service_requests().is_empty());
         assert!(nodes[0].take_service_responses().is_empty());
+    }
+
+    #[test]
+    fn a_non_device_kind_needs_the_telemetry_opt_in_to_ingest() {
+        // The live bug: a collector daemon narrows its node to Endpoint, whose payload policy is
+        // HttpRequest|HpsMessage with NO Telemetry bit, so the ingest gate silently dropped every
+        // batch. set_telemetry_ingest is the narrow opt-in; Endpoint stays closed by default so
+        // unrelated hops:// endpoints never become telemetry sinks.
+        for (kind, ingest, expect) in [
+            (NodeKind::Device, false, true), // a device carries Telemetry in its own policy
+            (NodeKind::Endpoint, false, false), // the bug: dropped
+            (NodeKind::Endpoint, true, true), // the fix
+            (NodeKind::Relay, false, false),
+            (NodeKind::Relay, true, true),
+        ] {
+            let mut nodes = [
+                Node::new(Identity::generate()),
+                Node::new(Identity::generate()),
+            ];
+            nodes[1].set_kind(kind);
+            nodes[1].set_telemetry_ingest(ingest);
+            assert_eq!(nodes[1].telemetry_ingest(), expect, "{kind:?}/{ingest}");
+
+            let mut net = Wire2::new();
+            net.connect(&mut nodes, 0, 1, 1, 1);
+            let batch = crate::telemetry::TelemetryBatch::new().counter("hop.x", 1, 0);
+            nodes[0].send_telemetry(nodes[1].address(), &batch).unwrap();
+            net.pump(&mut nodes);
+            assert_eq!(
+                nodes[1].take_telemetry().len(),
+                usize::from(expect),
+                "{kind:?} with ingest={ingest} should {} the batch",
+                if expect { "accept" } else { "drop" }
+            );
+        }
+    }
+
+    #[test]
+    fn the_telemetry_opt_in_survives_a_later_set_kind() {
+        // Configuration order must not silently disable a collector: set_kind recomputes the
+        // policy, so the opt-in has to be re-applied rather than OR-ed in once and lost.
+        let mut node: Node<MemoryStore> = Node::new(Identity::generate());
+        node.set_telemetry_ingest(true);
+        node.set_kind(NodeKind::Endpoint);
+        assert!(
+            node.telemetry_ingest(),
+            "set_kind after the opt-in must not clear it"
+        );
+        node.set_telemetry_ingest(false);
+        assert!(!node.telemetry_ingest(), "and it can be turned back off");
+    }
+
+    #[test]
+    fn a_stale_telemetry_stamp_no_longer_attributes() {
+        // §35 attribution on the telemetry path is BOUNDED: this ingest performs no dedup and no
+        // replay check, so a captured stamp must stop attributing once it ages out, instead of
+        // staying valid for its bundle id forever.
+        const TENANT: crate::access::TenantId = [7u8; 16];
+        let stamper_key = Identity::generate();
+        let stamped_at = 100 * crate::access::CARRIAGE_EPOCH_MS + 5;
+
+        // `age` epochs between the sender stamping and the collector verifying.
+        let attributed_after = |age: u64| -> Option<crate::access::TenantId> {
+            let mut nodes = [
+                Node::new(Identity::generate()),
+                Node::new(Identity::generate()),
+            ];
+            nodes[0].set_time(stamped_at);
+            nodes[0].set_stamper(Some(Stamper::new(
+                TENANT,
+                Identity::from_secret_bytes(&stamper_key.to_secret_bytes()),
+            )));
+            let mut server = crate::access::KeyServer::new();
+            server.insert(TENANT, stamper_key.address());
+            nodes[1].set_kind(NodeKind::Endpoint);
+            nodes[1].set_telemetry_ingest(true);
+            nodes[1].set_access_policy(AccessPolicy::Keyed(crate::access::KeyedAccess::new(
+                server,
+                std::collections::HashSet::new(),
+            )));
+            // The collector's clock is `age` epochs ahead of the stamp.
+            nodes[1].set_time(stamped_at + age * crate::access::CARRIAGE_EPOCH_MS);
+            nodes[1].refresh_access();
+
+            let mut net = Wire2::new();
+            net.connect(&mut nodes, 0, 1, 1, 1);
+            let batch = crate::telemetry::TelemetryBatch::new().counter("hop.x", 1, 0);
+            nodes[0].send_telemetry(nodes[1].address(), &batch).unwrap();
+            net.pump(&mut nodes);
+            let got = nodes[1].take_telemetry();
+            assert_eq!(got.len(), 1, "the batch itself still arrives");
+            got[0].tenant
+        };
+
+        // Well inside the window (a device offline for hours still bills correctly).
+        assert_eq!(attributed_after(0), Some(TENANT));
+        assert_eq!(
+            attributed_after(2),
+            Some(TENANT),
+            "past `resolve`'s 2-epoch window"
+        );
+        assert_eq!(
+            attributed_after(crate::access::MAX_ATTRIBUTION_AGE_EPOCHS),
+            Some(TENANT),
+            "the far edge of the window still attributes"
+        );
+        // Past the window: unattributed, so a fail-closed collector refuses it.
+        assert_eq!(
+            attributed_after(crate::access::MAX_ATTRIBUTION_AGE_EPOCHS + 1),
+            None,
+            "a stale captured stamp must not attribute forever"
+        );
     }
 
     #[test]
@@ -18425,6 +18629,83 @@ mod access_gate_tests {
         assert!(
             relay.take_usage().is_empty(),
             "an undelivered hold is never billed"
+        );
+    }
+
+    #[test]
+    fn undelivered_carriage_is_measured_on_its_own_axis_but_never_billed() {
+        // The carriage gap made visible: work the relay really did (accept, store, carry) for an
+        // attributed tenant that produced no delivery event. It must NOT reach the billing meter,
+        // and it MUST show up in take_carriage so the volume stops being invisible.
+        let (stamper, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+        let mut b = foreign(b"carried, never delivered");
+        let id = b.id();
+        b.env.access = Some(Box::new(stamper.stamp(&id, NOW)));
+        relay.on_bundle(9, b);
+        relay.store.remove(&id); // eviction / expiry
+        relay.tick(NOW + 1);
+
+        assert!(relay.take_usage().is_empty(), "never billed");
+        let carriage = relay.take_carriage();
+        assert_eq!(carriage.len(), 1);
+        assert_eq!(carriage[0].0, TENANT);
+        assert_eq!(carriage[0].1.bundles, 1);
+        assert!(carriage[0].1.payload_bytes > 0, "bytes are measured too");
+        assert!(relay.take_carriage().is_empty(), "drained");
+    }
+
+    #[test]
+    fn a_delivered_bundle_is_billed_and_never_double_counted_as_carriage() {
+        // meter_delivered removes the attribution synchronously, so the tick prune cannot also
+        // record it as unbilled carriage. The two axes must never both fire for one bundle.
+        let sender = Identity::generate();
+        let recipient = Identity::generate();
+        let (stamper, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+
+        let mut b = Bundle::create(
+            &sender,
+            Destination::Device(recipient.address()),
+            &recipient.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"carry me".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap();
+        let bid = b.id();
+        b.env.access = Some(Box::new(stamper.stamp(&bid, NOW)));
+        relay.on_bundle(9, b);
+
+        let ack = Bundle::create(
+            &recipient,
+            Destination::AckTo(sender.address(), bid),
+            &sender.address(),
+            &Payload::Ack {
+                for_bundle_id: bid,
+                status: 0,
+                delivery_hops: 1,
+                delivery_ms: 0,
+                proof: None,
+            },
+            BundleOpts {
+                flags: BundleFlags {
+                    is_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        relay.on_bundle(9, ack);
+        relay.tick(NOW + 1);
+
+        assert_eq!(relay.take_usage().len(), 1, "billed on proven delivery");
+        assert!(
+            relay.take_carriage().is_empty(),
+            "a billed delivery is never also counted as unbilled carriage"
         );
     }
 
