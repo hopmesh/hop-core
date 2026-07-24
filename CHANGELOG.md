@@ -5,6 +5,8 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- revive dead ingest, fail closed, bound stamps, measure bytes and carriage (1912c75)
+- integrate the storage dimension onto current main (aedcfb2)
 - bump corpus + all wire-version consumers to v10 (e68d804)
 - coarsen private created_at to defeat a sender timing fingerprint (ADV18-08) (c80f342)
 - bind a response to the endpoint we asked, not just the id (ADV18-07) (ea39ccd)
@@ -24,6 +26,7 @@ git-cliff. Do not edit by hand.
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
+- purge em-dashes and en-dashes from source (d222435)
 - gate ssrf ip filter behind reqwest feature; fmt (a6f4665)
 - drop the root license, license per-component (FSL-1.1-ALv2) (#146) (be2a5a7)
 
@@ -36,6 +39,9 @@ git-cliff. Do not edit by hand.
 - decouple hop-core's vocabulary from the sim (comments only) (#119) (d153989)
 
 ### Features
+- finish inbound (import), drop export_pr (41c095e)
+- §35 storage dimension, per-tenant held-byte occupancy (d58a544)
+- auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 - telemetry metering, tenant-attributed observability (§40 -> §37) (b823dcc)
 - OTel-over-Hop telemetry transport (DESIGN.md §40) (8da170c)
 - custody beacon (mode-1 HaveSet exchange) to cut duplicate-ingress COGS (708b565)
@@ -56,6 +62,9 @@ git-cliff. Do not edit by hand.
 - observe bundle-per-link transfers for the swarm viz (325a0ae)
 
 ### Other
+- rework the console deploy onto the new GitHub-is-change-management pipeline (b53b9d0)
+- narrow the manifest off access.rs to the carriage-stamp layout (e3d032d)
+- narrow the manifest to code that decides wire bytes (b58fed8)
 - box the envelope stamp (clippy large-variant), fmt, §35 addendum (6b601b6)
 - publish the Rust crates under the hop-mesh-* namespace (3bb9d0c)
 - CLA gate on contributions (preserve commercial relicensing of core) (5a9aa7d)
