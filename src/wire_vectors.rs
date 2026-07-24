@@ -21,7 +21,7 @@ use crate::session::{Header, RatchetMessage};
 use crate::store::HaveSet;
 
 pub const CORPUS_SCHEMA: u32 = 1;
-pub const CORPUS_FILE: &str = "vectors/bundle-v10.json";
+pub const CORPUS_FILE: &str = "vectors/bundle-v11.json";
 
 const CREATED_AT: u64 = 1_725_000_123_456;
 const LIFETIME_MS: u32 = 604_800_000;
@@ -554,6 +554,7 @@ fn payload_specs(
             payload: Payload::SessionInit {
                 ek_pub: bytes32(0x21),
                 spk_pub: bytes32(0x41),
+                opk_id: None,
                 msg: ratchet.clone(),
             },
             destination: Destination::Device(recipient),
@@ -574,6 +575,7 @@ fn payload_specs(
                 inner: Box::new(Payload::SessionInit {
                     ek_pub: bytes32(0x22),
                     spk_pub: bytes32(0x42),
+                    opk_id: None,
                     msg: ratchet.clone(),
                 }),
             },
@@ -823,6 +825,7 @@ fn private_specs(fixed_id: BundleId) -> Vec<PrivateSpec> {
             inner: Payload::SessionInit {
                 ek_pub: bytes32(0x24),
                 spk_pub: bytes32(0x44),
+                opk_id: None,
                 msg: session_message(0x34, 31, 37, vec![0xb1, 0xb2, 0xb3]),
             },
             mailbox: Some([0xa5, 0x5a]),
@@ -1206,6 +1209,8 @@ fn advert_vectors(sender: &Identity) -> Vec<EncodingVector> {
         AdvertKind::PreKey {
             spk_pub: spk.public,
             spk_sig: spk.sig.to_vec(),
+            opks: Vec::new(),
+            opk_sig: Vec::new(),
         },
         AdvertKind::Tombstone {
             revokes: bytes32(0xa0),
@@ -1349,7 +1354,7 @@ mod tests {
     #[test]
     fn corpus_covers_every_current_wire_enum_variant() {
         let corpus = corpus();
-        assert_eq!(corpus.bundle_version, 10);
+        assert_eq!(corpus.bundle_version, 11);
         let destinations: BTreeSet<_> = corpus
             .destinations
             .iter()

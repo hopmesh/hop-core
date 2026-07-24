@@ -33,7 +33,7 @@ use crate::error::{Error, Result};
 use crate::hps;
 use crate::link::{BearerEvent, LinkHandshake, LinkId, LinkSession, Role};
 use crate::route::RouteTable;
-use crate::routing::{BundleMeta, ForwardDecision, Router, SprayAndWait};
+use crate::routing::{BundleMeta, EpidemicRouter, ForwardDecision, Router};
 use crate::session::Session;
 use crate::store::{KvMutation, KvPageRow, MemoryStore, Store, MAX_SEEN_LIFETIME_MS};
 use crate::stream::StreamReassembler;
@@ -209,6 +209,36 @@ const PREKEY_EPOCH_MS: u64 = 7 * 86_400_000;
 /// advert) must still resolve, so we keep this many previous epochs' secrets before wiping them.
 const PREKEY_EPOCH_WINDOW: u64 = 1;
 
+/// How many one-time prekeys a node publishes per batch (DESIGN.md §25).
+///
+/// **This is a flood-bandwidth knob, and it was measured, not guessed.** The batch
+/// rides the prekey advert, which gossips. Each OPK costs 36 wire bytes (u32 id +
+/// 32-byte public) plus a fixed 64-byte batch signature. Against the
+/// `idle_established_link_does_not_flood` budget, 30 idle seconds cost 13,082 bytes
+/// before OPKs and 20,210 with a batch of 16, i.e. a batch of 16 added ~54% to idle
+/// gossip. Eight keeps that under half, matching the cap bitchat settled on
+/// (`PrekeyBundle.maxPrekeys = 8`) from real deployment.
+///
+/// Without a dispenser, more OPKs do not buy uniqueness (two senders can still pick
+/// the same one), only a longer runway before senders start reusing. So this trades
+/// flood bytes for reuse pressure and nothing else, and 8 with replenishment at
+/// [`OPK_REPLENISH_BELOW`] is a long runway.
+const OPK_BATCH_SIZE: usize = 8;
+
+/// How long a **used** one-time prekey secret is retained before it is wiped.
+///
+/// Not zero, and this is the whole DTN subtlety: with no server handing out OPKs
+/// exclusively, two senders can pick the same one, and a store-and-forward network
+/// delivers late and out of order. Deleting on first use would black-hole a
+/// legitimately delayed second message that referenced the same OPK. Retaining for a
+/// bounded window keeps those deliverable while still ending the secret's life long
+/// before the SPK epoch does, which is the forward-secrecy win over SPK-only.
+const OPK_RETAIN_AFTER_USE_MS: u64 = 6 * 3_600_000;
+
+/// Replenish the published batch when fewer than this many unused OPKs remain, so a
+/// busy node does not run dry between SPK rotations and silently fall back to 3-DH.
+const OPK_REPLENISH_BELOW: usize = 4;
+
 /// The current prekey epoch for a clock reading.
 fn prekey_epoch(now_ms: u64) -> u64 {
     now_ms / PREKEY_EPOCH_MS
@@ -369,7 +399,12 @@ struct PeerSession {
     /// For an initiator that hasn't heard back yet: the X3DH material to repeat in a
     /// `SessionInit` so any copy can bootstrap the peer. `None` once confirmed (we've
     /// received a message from them) or for a responder.
-    init_material: Option<(XPubKeyBytes, XPubKeyBytes)>, // (ek_pub, spk_pub)
+    /// `(ek_pub, spk_pub, opk_id)` while the peer has not yet replied, so every resend
+    /// of the bootstrapping `SessionInit` repeats the SAME handshake inputs. Resending
+    /// with a different `opk_id` would derive a different root at the responder and the
+    /// copies would stop being interchangeable, which is the property that lets ANY
+    /// copy bootstrap the peer.
+    init_material: Option<(XPubKeyBytes, XPubKeyBytes, Option<u32>)>,
     /// The initiator ephemeral that established this session, remembered so a *new*
     /// `SessionInit` (a peer that reinstalled / lost its ratchet) is recognized as a fresh
     /// handshake and **rebuilds** the session instead of failing to decrypt (DESIGN.md §25).
@@ -839,7 +874,7 @@ struct PersistedHpsInbox {
 pub struct Node<S: Store = MemoryStore> {
     identity: Identity,
     pub store: S,
-    router: SprayAndWait,
+    router: EpidemicRouter,
     pub directory: Directory,
     now_ms: u64,
     /// A non-zero host clock has been supplied. Response-bearing requests are refused before this
@@ -887,6 +922,27 @@ pub struct Node<S: Store = MemoryStore> {
     /// Retained prekey secrets by public, so late session inits still resolve, including a bounded
     /// window of PAST epochs' secrets across a rotation (core-03).
     spk_secrets: HashMap<XPubKeyBytes, zeroize::Zeroizing<[u8; 32]>>,
+    /// Our currently published one-time prekey batch (DESIGN.md §25).
+    opk_batch: crypto::OneTimePreKeyBatch,
+    /// Next OPK id to mint, monotonic across replenishes so a stale advert's ids never
+    /// collide with a fresh batch's (which would make "which secret answers this?"
+    /// ambiguous for the window both are in flight).
+    opk_next_id: u32,
+    /// Retained OPK secrets by batch id.
+    ///
+    /// **Memory-resident by design, never persisted.** An OPK secret that survives to
+    /// disk is a weaker OPK: the entire gain over the SPK is that this secret stops
+    /// existing. Deriving them deterministically from the identity (as SPKs are) would
+    /// be worse still, since a compromise re-derives them and DH4 buys nothing. The
+    /// cost is that a restart drops pending first-contacts to a `SessionReset` and one
+    /// SPK-only retry, which is exactly what that control message is for.
+    opk_secrets: HashMap<u32, zeroize::Zeroizing<[u8; 32]>>,
+    /// First-use time per OPK id, driving the [`OPK_RETAIN_AFTER_USE_MS`] reap.
+    opk_used_at: HashMap<u32, u64>,
+    /// OPK ids we have already spent on a given peer, so a second session to the same
+    /// peer picks a different one instead of respending (which would silently collapse
+    /// back to the security of a single OPK).
+    opk_spent: HashSet<(PubKeyBytes, u32)>,
     /// Per-link fixed-window counter for inbound §39 private-bundle rate limiting (F-07):
     /// `link → (window_start_ms, count)`. Bounds an unsigned-bundle flood per peer.
     priv_ingest: HashMap<LinkId, (u64, u32)>,
@@ -1243,10 +1299,19 @@ impl<S: Store> Node<S> {
             prekey.public,
             zeroize::Zeroizing::new(prekey.secret_bytes()),
         );
+        // OPKs are random (never derived), so a fresh batch is minted per process.
+        let opk_batch =
+            crypto::OneTimePreKeyBatch::generate(&identity, &prekey.public, 0, OPK_BATCH_SIZE);
+        let opk_secrets: HashMap<u32, zeroize::Zeroizing<[u8; 32]>> = opk_batch
+            .secret_bytes()
+            .into_iter()
+            .map(|(id, sec)| (id, zeroize::Zeroizing::new(sec)))
+            .collect();
+        let opk_next_id = OPK_BATCH_SIZE as u32;
         let mut node = Self {
             identity,
             store,
-            router: SprayAndWait::new(),
+            router: EpidemicRouter::new(),
             directory: Directory::new(),
             now_ms: 0,
             clock_anchored: false,
@@ -1270,6 +1335,11 @@ impl<S: Store> Node<S> {
             prekey,
             prekey_epoch: 0,
             spk_secrets,
+            opk_batch,
+            opk_next_id,
+            opk_secrets,
+            opk_used_at: HashMap::new(),
+            opk_spent: HashSet::new(),
             recv_gradient: HashMap::new(),
             wanted_mailboxes: Vec::new(),
             sessions: HashMap::new(),
@@ -2409,9 +2479,10 @@ impl<S: Store> Node<S> {
             let inner = postcard::to_allocvec(&SessionInner { content_type, body })?;
             let msg = candidate.session.encrypt(&inner)?;
             let out = match candidate.init_material {
-                Some((ek_pub, spk_pub)) => Payload::SessionInit {
+                Some((ek_pub, spk_pub, opk_id)) => Payload::SessionInit {
                     ek_pub,
                     spk_pub,
+                    opk_id,
                     msg,
                 },
                 None => Payload::SessionMessage { msg },
@@ -2421,18 +2492,28 @@ impl<S: Store> Node<S> {
         // No session yet: open one if the peer has published a prekey we've seen.
         if let Some(bundle) = self.directory.prekey(dst) {
             let inner = postcard::to_allocvec(&SessionInner { content_type, body })?;
-            let (ek_pub, root) = crypto::x3dh_initiate(&self.identity, &bundle)?;
+            // Pick an OPK we have not already spent on THIS peer (DESIGN.md §25). None is
+            // a normal outcome (SPK-only publisher, or we exhausted their batch) and runs
+            // the classic 3-DH handshake rather than failing the send.
+            let spent = &self.opk_spent;
+            let opk = bundle.select_opk(&|id| spent.contains(&(*dst, id)));
+            let (ek_pub, root) = crypto::x3dh_initiate(&self.identity, &bundle, opk.as_ref())?;
+            if let Some(o) = &opk {
+                self.opk_spent.insert((*dst, o.id));
+            }
+            let opk_id = opk.map(|o| o.id);
             let mut session = Session::init_initiator(root, bundle.spk_pub);
             let msg = session.encrypt(&inner)?;
             let candidate = PeerSession {
                 session,
-                init_material: Some((ek_pub, bundle.spk_pub)),
+                init_material: Some((ek_pub, bundle.spk_pub, opk_id)),
                 established_by: Some(ek_pub),
             };
             return Ok(Some((
                 Payload::SessionInit {
                     ek_pub,
                     spk_pub: bundle.spk_pub,
+                    opk_id,
                     msg,
                 },
                 candidate,
@@ -2511,6 +2592,8 @@ impl<S: Store> Node<S> {
             AdvertKind::PreKey {
                 spk_pub: self.prekey.public,
                 spk_sig: self.prekey.sig.to_vec(),
+                opks: self.opk_batch.publics.clone(),
+                opk_sig: self.opk_batch.sig.to_vec(),
             },
             self.now_ms,
             PREKEY_TTL_MS,
@@ -2539,6 +2622,10 @@ impl<S: Store> Node<S> {
             .insert(fresh.public, zeroize::Zeroizing::new(fresh.secret_bytes()));
         self.prekey = fresh;
         self.prekey_epoch = cur;
+        // The OPK batch signature binds the SPK it was minted against, so a rotation
+        // invalidates it. Mint a fresh batch rather than republishing a batch that no
+        // longer verifies (which peers would strip, silently dropping us to 3-DH).
+        self.mint_opk_batch();
         // Rebuild the retained set from exactly the in-window epochs, dropping anything older so a
         // compromised past secret can't decrypt sessions indefinitely. Re-deriving is cheap and keeps
         // the map an exact function of the current epoch (no unbounded growth across many rotations).
@@ -2554,6 +2641,96 @@ impl<S: Store> Node<S> {
         self.spk_secrets = keep;
         // Peers must learn the new SPK to open fresh sessions to us.
         let _ = self.publish_prekey();
+    }
+
+    /// Mint a fresh one-time prekey batch against the current SPK and adopt it.
+    ///
+    /// Ids continue from [`Self::opk_next_id`] rather than restarting at 0: a peer may
+    /// still hold a cached advert from the previous batch, and reusing ids across
+    /// batches would make an incoming `opk_id` ambiguous for as long as both are in
+    /// flight. Secrets from the OLD batch are deliberately retained here, the reaper
+    /// ([`Self::reap_opks`]) ages them out, so an in-flight handshake against the
+    /// previous batch still resolves.
+    fn mint_opk_batch(&mut self) {
+        let batch = crypto::OneTimePreKeyBatch::generate(
+            &self.identity,
+            &self.prekey.public,
+            self.opk_next_id,
+            OPK_BATCH_SIZE,
+        );
+        for (id, sec) in batch.secret_bytes() {
+            self.opk_secrets.insert(id, zeroize::Zeroizing::new(sec));
+        }
+        self.opk_next_id = self.opk_next_id.wrapping_add(OPK_BATCH_SIZE as u32);
+        self.opk_batch = batch;
+    }
+
+    /// Wipe used OPK secrets past [`OPK_RETAIN_AFTER_USE_MS`], and replenish the
+    /// published batch once it runs low. This is where the forward-secrecy gain is
+    /// actually realized: until a secret is dropped, DH4 is no better than DH3.
+    fn reap_opks(&mut self) {
+        let cutoff = self.now_ms.saturating_sub(OPK_RETAIN_AFTER_USE_MS);
+        let expired: Vec<u32> = self
+            .opk_used_at
+            .iter()
+            .filter(|(_, used_at)| **used_at <= cutoff)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            // Zeroizing's Drop wipes the secret; removing the entry is what ends its life.
+            self.opk_secrets.remove(&id);
+            self.opk_used_at.remove(&id);
+        }
+        // Unused OPKs from the currently published batch are what senders can still pick.
+        let unused = self
+            .opk_batch
+            .publics
+            .iter()
+            .filter(|o| !self.opk_used_at.contains_key(&o.id))
+            .count();
+        if unused < OPK_REPLENISH_BELOW {
+            self.mint_opk_batch();
+            let _ = self.publish_prekey();
+        }
+    }
+
+    /// This node's currently published prekey bundle, including its signed one-time
+    /// prekey batch. This is exactly what a peer reconstructs from our advert.
+    pub fn prekey_bundle(&self) -> crypto::PreKeyBundle {
+        self.prekey
+            .bundle_with_opks(self.identity.address(), &self.opk_batch)
+    }
+
+    /// The current signed prekey public half.
+    pub fn prekey_public(&self) -> XPubKeyBytes {
+        self.prekey.public
+    }
+
+    /// The current signed prekey's identity signature.
+    pub fn prekey_sig(&self) -> [u8; 64] {
+        self.prekey.sig
+    }
+
+    /// Borrow the identity, for callers that need to sign an advert themselves.
+    pub fn identity_ref(&self) -> &Identity {
+        &self.identity
+    }
+
+    /// Do we still hold the secret for this one-time prekey id?
+    pub fn holds_opk(&self, id: u32) -> bool {
+        self.opk_secrets.contains_key(&id)
+    }
+
+    /// Observability: (published OPKs, unused OPKs, retained secrets). Used by tests
+    /// and the demo surfaces to show the batch actually turning over.
+    pub fn opk_stats(&self) -> (usize, usize, usize) {
+        let unused = self
+            .opk_batch
+            .publics
+            .iter()
+            .filter(|o| !self.opk_used_at.contains_key(&o.id))
+            .count();
+        (self.opk_batch.publics.len(), unused, self.opk_secrets.len())
     }
 
     /// §39 P4: publish (and gossip) this node's signed **receiver-beacon** so peers lay a
@@ -3306,6 +3483,7 @@ impl<S: Store> Node<S> {
             Payload::SessionInit {
                 ek_pub,
                 spk_pub,
+                opk_id,
                 msg,
             } => {
                 // Build (or rebuild) a candidate responder session off-map. A private envelope's
@@ -3323,7 +3501,34 @@ impl<S: Store> Node<S> {
                         .get(&spk_pub)
                         .ok_or(Error::Crypto("unknown prekey"))?
                         .clone();
-                    let root = crypto::x3dh_respond(&self.identity, &secret, &from, &ek_pub)?;
+                    // A referenced OPK we no longer hold is NOT recoverable: the 4-DH and
+                    // 3-DH roots differ by construction, so there is nothing to fall back
+                    // to. Surface it as its own error so the caller answers with a
+                    // SessionReset and the sender re-opens (SPK-only, since it will have
+                    // spent that id). This is the documented cost of memory-only OPK
+                    // secrets, and it costs a round trip, never a lost message.
+                    let opk_secret = match opk_id {
+                        Some(id) => Some(
+                            self.opk_secrets
+                                .get(&id)
+                                .ok_or(Error::Crypto("one-time prekey reaped"))?
+                                .clone(),
+                        ),
+                        None => None,
+                    };
+                    let root = crypto::x3dh_respond(
+                        &self.identity,
+                        &secret,
+                        opk_secret.as_deref(),
+                        &from,
+                        &ek_pub,
+                    )?;
+                    // Mark first use so the reaper can age this secret out. Recorded only
+                    // once the DH succeeded, so a garbage id cannot start the clock on a
+                    // key nobody legitimately used.
+                    if let Some(id) = opk_id {
+                        self.opk_used_at.entry(id).or_insert(self.now_ms);
+                    }
                     let session = Session::init_responder(root, *secret, spk_pub);
                     PeerSession {
                         session,
@@ -6922,6 +7127,9 @@ impl<S: Store> Node<S> {
         // core-03: rotate our signed prekey on epoch boundaries so a compromised SPK secret only
         // exposes a bounded recent window of sessions, then re-publish the new one.
         self.rotate_prekey_if_due();
+        // Ending a used OPK secret's life is where the forward-secrecy gain is realized,
+        // so this has to run on the clock, not only on rotation.
+        self.reap_opks();
         // §39 P4: keep our receiver-beacon fresh (short interval ≪ its TTL) so the gradient toward
         // us stays alive and re-points if we move. Passive (max-privacy) recipients skip this.
         if self.route_to_me
@@ -9139,6 +9347,8 @@ mod tests {
             AdvertKind::PreKey {
                 spk_pub: spk.public,
                 spk_sig: spk.sig.to_vec(),
+                opks: Vec::new(),
+                opk_sig: Vec::new(),
             },
             node.now_ms,
             60_000,
@@ -11119,6 +11329,199 @@ mod tests {
         );
     }
 
+    impl<S: Store> Node<S> {
+        /// Test seam: mark an OPK used at `at_ms` so the reaper can age it out without
+        /// having to drive a real handshake first.
+        fn force_opk_used(&mut self, id: u32, at_ms: u64) {
+            self.opk_used_at.insert(id, at_ms);
+        }
+
+        /// Test seam: run only the responder-side key agreement, so a reaped OPK's
+        /// refusal can be asserted directly rather than inferred from a dropped message.
+        fn respond_for_test(
+            &self,
+            sender: &PubKeyBytes,
+            spk_pub: XPubKeyBytes,
+            opk_id: Option<u32>,
+            ek_pub: &XPubKeyBytes,
+        ) -> Result<[u8; 32]> {
+            let spk = self
+                .spk_secrets
+                .get(&spk_pub)
+                .ok_or(Error::Crypto("unknown prekey"))?
+                .clone();
+            let opk = match opk_id {
+                Some(id) => Some(
+                    self.opk_secrets
+                        .get(&id)
+                        .ok_or(Error::Crypto("one-time prekey reaped"))?
+                        .clone(),
+                ),
+                None => None,
+            };
+            crypto::x3dh_respond(&self.identity, &spk, opk.as_deref(), sender, ek_pub)
+        }
+    }
+
+    #[test]
+    fn first_contact_consumes_a_one_time_prekey_end_to_end() {
+        // The whole point of §25 OPKs: an ASYNC first message (recipient never spoke to
+        // us) rides a 4-DH root whose extra secret the recipient can destroy, instead of
+        // resting only on the long-lived SPK.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        let (published, unused_before, _) = nodes[1].opk_stats();
+        assert_eq!(published, OPK_BATCH_SIZE, "node publishes a full batch");
+        assert_eq!(unused_before, OPK_BATCH_SIZE, "nothing spent yet");
+
+        // Node 0 has never met node 1's ratchet: this is cold first contact.
+        assert!(!nodes[0].has_session(&nodes[1].address()));
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"cold open".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+
+        let inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 1, "the first message arrived");
+        let got = nodes[1]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("first contact decrypts");
+        assert_eq!(got.body, b"cold open".to_vec());
+
+        let (_, unused_after, _) = nodes[1].opk_stats();
+        assert_eq!(
+            unused_after,
+            OPK_BATCH_SIZE - 1,
+            "first contact must actually spend an OPK, not quietly run 3-DH"
+        );
+    }
+
+    #[test]
+    fn spk_only_publisher_still_reachable_without_opks() {
+        // Interop floor: a peer that publishes no batch (or whose batch we stripped as
+        // unverifiable) must still be reachable over the classic 3-DH handshake.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+
+        // Publish node 1's prekey advert with the OPK batch stripped, as an SPK-only
+        // publisher (or a peer whose forged batch we dropped on ingest) would look.
+        let advert = Advert::publish(
+            nodes[1].identity_ref(),
+            AdvertKind::PreKey {
+                spk_pub: nodes[1].prekey_public(),
+                spk_sig: nodes[1].prekey_sig().to_vec(),
+                opks: Vec::new(),
+                opk_sig: Vec::new(),
+            },
+            0,
+            PREKEY_TTL_MS,
+            1,
+        )
+        .unwrap();
+        nodes[1].publish(advert);
+        net.pump(&mut nodes);
+
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"spk only".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+        let inbox = nodes[1].take_inbox();
+        assert_eq!(inbox.len(), 1);
+        let got = nodes[1]
+            .read_message(&inbox[0])
+            .unwrap()
+            .expect("3-DH first contact still works");
+        assert_eq!(got.body, b"spk only".to_vec());
+        let (_, unused, _) = nodes[1].opk_stats();
+        assert_eq!(
+            unused, OPK_BATCH_SIZE,
+            "no OPK was spent on an SPK-only open"
+        );
+    }
+
+    #[test]
+    fn a_sender_never_respends_an_opk_on_the_same_peer() {
+        // What `opk_spent` actually guarantees: THIS sender will not hand the same peer
+        // the same OPK twice. (Spread across DIFFERENT senders is probabilistic and is
+        // covered by crypto::tests::select_opk_spreads_across_the_batch_for_uncoordinated_senders,
+        // since uncoordinated senders cannot do better than random.)
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        let bundle = nodes[1].prekey_bundle();
+        let peer = nodes[1].address();
+        let mut spent: Vec<u32> = Vec::new();
+        for _ in 0..OPK_BATCH_SIZE {
+            let taken = spent.clone();
+            let opk = bundle
+                .select_opk(&|id| taken.contains(&id))
+                .expect("an unspent opk remains");
+            assert!(
+                !spent.contains(&opk.id),
+                "selection returned an already-spent id"
+            );
+            spent.push(opk.id);
+        }
+        assert_eq!(
+            spent.len(),
+            OPK_BATCH_SIZE,
+            "the whole batch is usable before reuse is forced"
+        );
+        // Exhausted: the sender falls back to 3-DH rather than respending.
+        let all = spent.clone();
+        assert!(
+            bundle.select_opk(&|id| all.contains(&id)).is_none(),
+            "an exhausted batch yields None, which is the 3-DH path"
+        );
+        let _ = peer;
+    }
+
+    #[test]
+    fn reaped_one_time_prekey_is_refused_rather_than_silently_downgraded() {
+        // A reaped OPK cannot fall back to 3-DH (the roots differ by construction). The
+        // node must refuse, which is what drives a SessionReset and an SPK-only retry.
+        // Refusing is the SAFE outcome; silently deriving a weaker root would not be.
+        let alice = Identity::generate();
+        let mut bob = Node::new(Identity::generate());
+        bob.tick(1);
+        let bundle = bob.prekey_bundle();
+        let opk = bundle.select_opk(&|_| false).expect("a published opk");
+        let (ek_pub, _root) = crypto::x3dh_initiate(&alice, &bundle, Some(&opk)).unwrap();
+
+        // Advance past the retention window with the OPK marked used, so it is reaped.
+        bob.force_opk_used(opk.id, 1);
+        bob.tick(1 + OPK_RETAIN_AFTER_USE_MS + 1);
+        let (_, _, retained) = bob.opk_stats();
+        assert!(
+            !bob.holds_opk(opk.id),
+            "the used secret must be gone after the retention window (retained={retained})"
+        );
+
+        let err = bob.respond_for_test(&alice.address(), bundle.spk_pub, Some(opk.id), &ek_pub);
+        assert!(
+            matches!(err, Err(Error::Crypto("one-time prekey reaped"))),
+            "a reaped OPK must be refused, got {err:?}"
+        );
+    }
+
     #[test]
     fn out_of_order_session_messages_decrypt_at_the_node_layer() {
         // Over a multi-copy DTN, two SessionMessages can be reassembled/processed out of
@@ -12605,6 +13008,7 @@ mod tests {
             inner: Box::new(Payload::SessionInit {
                 ek_pub: attacker.derive_prekey().public,
                 spk_pub: nodes[1].prekey.public,
+                opk_id: None,
                 msg: crate::session::RatchetMessage {
                     header: crate::session::Header {
                         dh: attacker.derive_prekey().public,
@@ -12897,6 +13301,8 @@ mod tests {
             AdvertKind::PreKey {
                 spk_pub: mspk.public,
                 spk_sig: mspk.sig.to_vec(),
+                opks: Vec::new(),
+                opk_sig: Vec::new(),
             },
             now,
             10_000_000,

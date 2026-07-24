@@ -5,7 +5,7 @@
 //! `BUNDLE_VERSION` bump for a change that moves no wire byte. This file is outside the manifest,
 //! so test coverage can grow freely.
 //!
-//! The deterministic corpus (`vectors/bundle-v10.json`) already pins `LinkPacket`, `LinkAuth`, and
+//! The deterministic corpus (`vectors/bundle-v11.json`) already pins `LinkPacket`, `LinkAuth`, and
 //! `Wire`. It does NOT construct `SessionInner`, `IdentityRecord`, the carrier chunk split, or the
 //! stream-id derivation, so those are pinned here with explicit expected bytes.
 

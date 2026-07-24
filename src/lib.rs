@@ -19,6 +19,7 @@ pub mod link;
 pub mod node;
 pub mod reach;
 pub mod relay;
+pub mod relay_pool;
 pub mod route;
 pub mod routing;
 pub mod session;
@@ -99,9 +100,10 @@ pub mod prelude {
         SERVICE_IDENTIFY,
     };
     pub use crate::relay::RelayScorer;
+    pub use crate::relay_pool::{EndpointSource, RelayEndpoint, RelayPool};
     pub use crate::route::RouteTable;
     pub use crate::routing::{
-        BundleMeta, ForwardDecision, GatewayBeacon, PeerId, Router, SprayAndWait,
+        BundleMeta, EpidemicRouter, ForwardDecision, GatewayBeacon, PeerId, Router,
     };
     pub use crate::store::{HaveSet, MemoryStore, Store};
     pub use crate::stream::{StreamBuffer, StreamReassembler};

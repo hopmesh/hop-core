@@ -100,6 +100,13 @@ pub enum AdvertKind {
     PreKey {
         spk_pub: XPubKeyBytes,
         spk_sig: Vec<u8>,
+        /// One-time prekeys (DESIGN.md §25). Gossiping a SIGNED batch is what lets a
+        /// serverless mesh offer OPKs at all: the batch needs to be verifiable offline,
+        /// not dispensed. Empty means the publisher offers SPK only, which stays valid.
+        opks: Vec<crypto::OneTimePreKey>,
+        /// Ed25519 over the batch preimage. Verified separately from `spk_sig` so a bad
+        /// batch degrades to an SPK-only bundle instead of dropping the advert.
+        opk_sig: Vec<u8>,
     },
     /// Revokes a previously published advert (a sold item, a closed post).
     Tombstone { revokes: AdvertId },
@@ -275,7 +282,20 @@ fn validate_kind_structure(kind: &AdvertKind) -> Result<()> {
                 && tags.len() <= MAX_TAGS
                 && tags.iter().all(|tag| tag.len() <= MAX_TAG_BYTES)
         }
-        AdvertKind::PreKey { spk_sig, .. } => spk_sig.len() == 64,
+        AdvertKind::PreKey {
+            spk_sig,
+            opks,
+            opk_sig,
+            ..
+        } => {
+            spk_sig.len() == 64
+                && opks.len() <= crypto::MAX_ONE_TIME_PREKEYS
+                // Bound the batch signature before any verify work, and keep the two
+                // fields consistent: a batch with no signature (or a signature with no
+                // batch) is malformed, not merely unverifiable.
+                && (opks.is_empty() == opk_sig.is_empty())
+                && (opk_sig.is_empty() || opk_sig.len() == 64)
+        }
         AdvertKind::Tombstone { .. } | AdvertKind::RecvBeacon { .. } => true,
         AdvertKind::HpsTopic { ct, .. } => ct.len() <= MAX_HPS_TOPIC_BYTES,
     };
@@ -547,7 +567,14 @@ impl Directory {
         }
     }
 
-    fn index_prekey(&mut self, advert: &Advert, spk_pub: XPubKeyBytes, spk_sig: &[u8]) {
+    fn index_prekey(
+        &mut self,
+        advert: &Advert,
+        spk_pub: XPubKeyBytes,
+        spk_sig: &[u8],
+        opks: &[crypto::OneTimePreKey],
+        opk_sig: &[u8],
+    ) {
         if self.limits.prekeys == 0 {
             return;
         }
@@ -565,10 +592,18 @@ impl Directory {
                 advert_id: advert.id,
                 created_at: advert.body.created_at,
                 expires_at: advert.expires_at(),
-                bundle: PreKeyBundle {
-                    address: publisher,
-                    spk_pub,
-                    spk_sig: spk_sig.to_vec(),
+                bundle: {
+                    let mut bundle = PreKeyBundle {
+                        address: publisher,
+                        spk_pub,
+                        spk_sig: spk_sig.to_vec(),
+                        opks: opks.to_vec(),
+                        opk_sig: opk_sig.to_vec(),
+                    };
+                    // Verify ONCE here, on ingest, rather than on every send: a forged
+                    // batch is dropped at the door and the peer stays reachable SPK-only.
+                    bundle.strip_unverified_opks();
+                    bundle
                 },
             },
         );
@@ -673,8 +708,14 @@ impl Directory {
 
         // Index prekey bundles by publisher (newest wins) for session bootstrap,
         // alongside storing the advert for re-gossip.
-        if let AdvertKind::PreKey { spk_pub, spk_sig } = &advert.body.kind {
-            self.index_prekey(&advert, *spk_pub, spk_sig);
+        if let AdvertKind::PreKey {
+            spk_pub,
+            spk_sig,
+            opks,
+            opk_sig,
+        } = &advert.body.kind
+        {
+            self.index_prekey(&advert, *spk_pub, spk_sig, opks, opk_sig);
         }
 
         // App scoping (DESIGN.md §17): full retention only for our own app or the open fabric
@@ -1024,6 +1065,8 @@ mod tests {
             AdvertKind::PreKey {
                 spk_pub: prekey.public,
                 spk_sig: prekey.sig.to_vec(),
+                opks: Vec::new(),
+                opk_sig: Vec::new(),
             },
             0,
             1_000,
@@ -1050,6 +1093,8 @@ mod tests {
             AdvertKind::PreKey {
                 spk_pub: prekey.public,
                 spk_sig: prekey.sig.to_vec(),
+                opks: Vec::new(),
+                opk_sig: Vec::new(),
             },
             0,
             1_000,
@@ -1136,6 +1181,8 @@ mod tests {
                 AdvertKind::PreKey {
                     spk_pub: prekey.public,
                     spk_sig: prekey.sig.to_vec(),
+                    opks: Vec::new(),
+                    opk_sig: Vec::new(),
                 },
                 0,
                 10,

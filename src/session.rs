@@ -314,10 +314,11 @@ mod tests {
         let bob_id = Identity::generate();
         let bob_spk = bob_id.generate_prekey();
         let bundle = bob_spk.bundle(bob_id.address());
-        let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle).unwrap();
+        let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle, None).unwrap();
         let root_b = crypto::x3dh_respond(
             &bob_id,
             &bob_spk.secret_bytes(),
+            None,
             &alice_id.address(),
             &ek_pub,
         )
@@ -337,10 +338,11 @@ mod tests {
         let bob_spk = bob_id.generate_prekey();
         let bundle = bob_spk.bundle(bob_id.address());
 
-        let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle).unwrap();
+        let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle, None).unwrap();
         let root_b = crypto::x3dh_respond(
             &bob_id,
             &bob_spk.secret_bytes(),
+            None,
             &alice_id.address(),
             &ek_pub,
         )
@@ -373,10 +375,11 @@ mod tests {
         let bob_id = Identity::generate();
         let bob_spk = bob_id.generate_prekey();
         let bundle = bob_spk.bundle(bob_id.address());
-        let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle).unwrap();
+        let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle, None).unwrap();
         let root_b = crypto::x3dh_respond(
             &bob_id,
             &bob_spk.secret_bytes(),
+            None,
             &alice_id.address(),
             &ek_pub,
         )
@@ -399,10 +402,11 @@ mod tests {
         let bob_id = Identity::generate();
         let bob_spk = bob_id.generate_prekey();
         let bundle = bob_spk.bundle(bob_id.address());
-        let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle).unwrap();
+        let (ek_pub, root_a) = crypto::x3dh_initiate(&alice_id, &bundle, None).unwrap();
         let root_b = crypto::x3dh_respond(
             &bob_id,
             &bob_spk.secret_bytes(),
+            None,
             &alice_id.address(),
             &ek_pub,
         )

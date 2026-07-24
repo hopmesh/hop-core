@@ -57,11 +57,16 @@ pub struct TraceHop {
 // v8 -> v9: adversarial remediation added a current-content-key MAC to HpsReachAck, changing that
 // payload layout. HPS publication signatures also now bind the app id, outer sender, topic tag, and
 // exact key epoch. v8 already shipped with carriage stamps, so the combined layout requires v9.
+// v10 -> v11: one-time prekeys (DESIGN.md §25). `Payload::SessionInit` gains `opk_id`, the
+// `PreKeyBundle`/`AdvertKind::PreKey` gain a signed OPK batch, and the X3DH KDF label moves to
+// "hop session x3dh v2" with a DH-count byte folded into the preimage (so the 3-DH and 4-DH roots
+// cannot collide). A v10 node and a v11 node derive different roots for the same handshake inputs
+// and cannot decode each other's SessionInit, so the version gate must keep them apart.
 // v9 -> v10: ADV18-08 coarsens the cleartext, id-bound `created_at` on §39 private bundles (and their
 // ACKs) to a 60s bucket so it is not a per-message sender timing fingerprint. This changes the wire
 // bytes (and thus the private wire id) of private bundles minted off a bucket boundary, so a v9 and a
 // v10 node compute different ids for the same logical send; the version gate must keep them apart.
-pub const BUNDLE_VERSION: u8 = 10;
+pub const BUNDLE_VERSION: u8 = 11;
 
 /// Maximum encoded size accepted by [`Bundle::from_bytes`]. Oversized application content is carried
 /// in bounded [`Payload::Carrier`] chunks, so a single decoded bundle never needs to allocate beyond
@@ -159,6 +164,15 @@ pub enum Payload {
     SessionInit {
         ek_pub: XPubKeyBytes,
         spk_pub: XPubKeyBytes,
+        /// The **one-time prekey** this handshake consumed, if any (DESIGN.md §25).
+        /// `Some(id)` means the root was derived with the 4-DH form and the responder
+        /// MUST use that OPK secret; the 3-DH root differs by construction, so falling
+        /// back is not possible and a reaped OPK is answered with
+        /// [`Payload::SessionReset`]. `None` is the classic SPK-only handshake and stays
+        /// fully supported (an SPK-only publisher, or a batch we exhausted).
+        ///
+        /// The id is batch-local and carries no identity: it is an index, not a name.
+        opk_id: Option<u32>,
         msg: crate::session::RatchetMessage,
     },
     /// A ratchet message in an established forward-secret session.
@@ -1116,6 +1130,7 @@ mod tests {
                 Payload::SessionInit {
                     ek_pub: [0u8; 32],
                     spk_pub: [0u8; 32],
+                    opk_id: None,
                     msg: ratchet.clone(),
                 },
             ),

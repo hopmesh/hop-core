@@ -61,19 +61,26 @@ pub trait Router {
     fn on_beacon(&mut self, beacon: &GatewayBeacon);
 }
 
-/// Binary spray-and-wait (B) plus gateway-gradient (A). DESIGN.md §6.
+/// Epidemic flood (B) plus gateway-gradient (A). DESIGN.md §6.
 ///
-/// The spray-and-wait copy budget lives in the bundle envelope (it travels with
-/// the bundle), so the router itself is stateless about copies; it only reads
-/// `meta.copies`. The custodian performs the actual `floor(n/2)` split on handoff
-/// via [`crate::bundle::Bundle::split_copies`].
+/// Forward to every peer until `hop_limit` runs out; the receiver dedups by
+/// [`BundleId`] and a §39 delivery **vaccine** purges the copies once the message
+/// actually lands. Copies are therefore bounded by delivery (after the fact) rather
+/// than by an issuance budget (in advance).
+///
+/// **Was `SprayAndWait`.** The binary spray-and-wait budget it was named for is no
+/// longer live: the vaccine reclaims copies more tightly than a budget can, and a
+/// decrementing counter on the *unsigned* envelope is a §39 correlation handle and a
+/// hop-distance oracle. [`crate::bundle::Bundle::split_copies`] and
+/// [`crate::store::Store::split_copies`] survive as a swappable-policy hook for
+/// `hop-sim`, and are not on any hot path.
 #[derive(Default)]
-pub struct SprayAndWait {
+pub struct EpidemicRouter {
     /// Best known hop distance to a gateway, by gateway address.
     gateways: HashMap<PubKeyBytes, GatewayBeacon>,
 }
 
-impl SprayAndWait {
+impl EpidemicRouter {
     pub fn new() -> Self {
         Self::default()
     }
@@ -84,7 +91,7 @@ impl SprayAndWait {
     }
 }
 
-impl Router for SprayAndWait {
+impl Router for EpidemicRouter {
     fn on_peer(&mut self, _peer: &PeerId, their_have: &HaveSet) -> Vec<BundleId> {
         // Offer everything they don't already hold; should_forward gates the rest.
         let _ = their_have;
@@ -132,14 +139,14 @@ mod tests {
 
     #[test]
     fn drops_at_zero_hop_limit() {
-        let r = SprayAndWait::new();
+        let r = EpidemicRouter::new();
         let d = r.should_forward(&meta(Destination::Broadcast, 0, 8), &[0u8; 32]);
         assert_eq!(d, ForwardDecision::Drop);
     }
 
     #[test]
     fn egress_forwards_toward_gateway() {
-        let mut r = SprayAndWait::new();
+        let mut r = EpidemicRouter::new();
         r.on_beacon(&GatewayBeacon {
             gateway: [1u8; 32],
             hops: 2,
@@ -152,7 +159,7 @@ mod tests {
 
     #[test]
     fn epidemic_forwards_to_everyone_until_hop_limit() {
-        let r = SprayAndWait::new();
+        let r = EpidemicRouter::new();
         let dst = [9u8; 32];
         let other = [0u8; 32];
 
@@ -175,7 +182,7 @@ mod tests {
 
     #[test]
     fn beacon_keeps_shortest_hop_count() {
-        let mut r = SprayAndWait::new();
+        let mut r = EpidemicRouter::new();
         r.on_beacon(&GatewayBeacon {
             gateway: [1u8; 32],
             hops: 4,
