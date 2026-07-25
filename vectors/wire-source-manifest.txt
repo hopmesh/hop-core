@@ -21,6 +21,14 @@
 # is a metering atom for the durable ledger and never rides the mesh envelope. A relay refusing a
 # stamp it used to admit is a policy change, not a format change, so it cannot move a wire byte;
 # the same precedent the node.rs retirement set, where a replay bound stayed out of the manifest)
+# retired: core/hop-core/src/store.rs -> core/hop-core/src/wire_have.rs (HaveSet moved: it was the
+# ONLY byte-deciding item in store.rs, riding `Wire::Have` custody beacons. Everything else in that
+# file is the persistence trait and its in-memory backend, which cannot move a wire byte: put/get/
+# remove/seen/have/prune, KV, eviction and expiry policy. Keeping store.rs listed made every ordinary
+# storage change a FALSE wire bump, which is exactly the failure the header above warns about, and it
+# fired the moment the dead Store::split_copies/set_copies methods were deleted. Same precedent as the
+# node.rs and access.rs retirements: the byte-deciding code moved to a hashed file, the rest stayed.)
+
 core/hop-core/src/bundle.rs
 core/hop-core/src/crypto.rs
 core/hop-core/src/discover.rs
@@ -28,7 +36,7 @@ core/hop-core/src/hps.rs
 core/hop-core/src/link.rs
 core/hop-core/src/reach.rs
 core/hop-core/src/session.rs
-core/hop-core/src/store.rs
 core/hop-core/src/wire_emit.rs
+core/hop-core/src/wire_have.rs
 core/hop-core/src/wire_stamp.rs
 core/hop-core/src/wire_vectors.rs

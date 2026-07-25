@@ -29,6 +29,8 @@ pub mod telemetry;
 pub mod util;
 /// Wire-byte determination owned by the node layer. Hashed by the wire-version guard.
 pub mod wire_emit;
+/// Wire-byte determination for the `Wire::Have` custody beacon. Hashed by the wire-version guard.
+pub mod wire_have;
 /// Wire-byte determination for §35 carriage stamps. Hashed by the wire-version guard.
 pub mod wire_stamp;
 
@@ -102,9 +104,7 @@ pub mod prelude {
     pub use crate::relay::RelayScorer;
     pub use crate::relay_pool::{EndpointSource, RelayEndpoint, RelayPool};
     pub use crate::route::RouteTable;
-    pub use crate::routing::{
-        BundleMeta, EpidemicRouter, ForwardDecision, GatewayBeacon, PeerId, Router,
-    };
+    pub use crate::routing::{BundleMeta, EpidemicRouter, ForwardDecision, PeerId, Router};
     pub use crate::store::{HaveSet, MemoryStore, Store};
     pub use crate::stream::{StreamBuffer, StreamReassembler};
     pub use crate::util::{compress, decompress};

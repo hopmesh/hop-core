@@ -4,7 +4,7 @@
 //! Dedup is what gives Hop exactly-once *processing* (§7): a destination ignores
 //! duplicate copies of a bundle it has already accepted. For that guarantee to
 //! hold, an id must be remembered for at least as long as a duplicate of it can
-//! still arrive — i.e. the bundle's lifetime. The `seen` set therefore carries a
+//! still arrive, i.e. the bundle's lifetime. The `seen` set therefore carries a
 //! **receiver-anchored expiry** (`now + lifetime` at first sight, robust to sender
 //! clock skew), and [`Store::prune`] drops entries past it so memory stays bounded
 //! without ever weakening the guarantee inside the window that matters.
@@ -12,8 +12,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-
-use serde::{Deserialize, Serialize};
 
 use crate::bundle::{Bundle, BundleId};
 
@@ -191,26 +189,24 @@ impl DurabilityHandle {
     }
 }
 
-/// What a node knows it currently holds — used by routing to avoid re-offering
-/// bundles a peer already has. Serializable so it can ride a `Wire::Have` custody beacon
-/// (DESIGN.md §35): a node tells a directly-connected peer what it holds so the peer suppresses
-/// re-offering those, cutting duplicate-ingress COGS.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HaveSet {
-    pub ids: Vec<BundleId>,
-}
+// `HaveSet` moved to `wire_emit.rs`, which is the file the wire-version guard hashes for
+// byte-deciding code. It was the ONLY thing in this file that shaped wire bytes, and keeping it
+// here meant every ordinary storage change (a trait method, an eviction rule) tripped the guard as
+// a false wire bump. Re-exported so `store::HaveSet` keeps working for every existing caller.
+pub use crate::wire_have::HaveSet;
 
 /// Store of in-flight bundles plus a time-bounded dedup set. Backed by memory
 /// ([`MemoryStore`]) or a database (`hop-store-sqlite`).
 ///
 /// `get` returns an owned [`Bundle`] (not a reference) so a database backend can
-/// implement it; the copy-budget mutations spray-and-wait needs are explicit
+/// implement it; the copy-budget mutation methods a spray policy would need were removed as dead
+/// surface (DESIGN.md §6), so what remains is explicit
 /// methods rather than `&mut` access into storage.
 pub trait Store {
     /// Record a bundle for forwarding, stamping its dedup expiry from `now_ms`.
     /// Returns false if it was a duplicate (still within its dedup window).
     fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool;
-    /// Re-hold a bundle we already `seen` but EVICTED from held — a TRUSTED re-injection from our own
+    /// Re-hold a bundle we already `seen` but EVICTED from held: a TRUSTED re-injection from our own
     /// durable storage (a mailbox pull or cross-partition handoff via [`crate::node::Node::ingest`],
     /// relay-A audit). Unlike [`Store::put`] it does NOT refuse on the surviving dedup entry: `remove`
     /// (eviction/delivery) drops the held copy but keeps `seen`, so a plain `put` of an evicted bundle
@@ -234,14 +230,9 @@ pub trait Store {
     fn have(&self) -> HaveSet;
     /// Drop held bundles and dedup entries whose window has closed at `now_ms`.
     fn prune(&mut self, now_ms: u64);
-    /// Binary spray-and-wait handoff on the stored bundle: halve its copy budget,
-    /// returning the number to give a peer (`floor(n/2)`). 0 if absent or at 1.
-    fn split_copies(&mut self, id: &BundleId) -> u16;
-    /// Set the stored bundle's copy budget (e.g. a retransmit reset). No-op if absent.
-    fn set_copies(&mut self, id: &BundleId, copies: u16);
     /// The receiver-anchored dedup expiry (epoch-ms) recorded for `id` when it was stored, if still
     /// tracked. stores-r2-01 anchors this to the RECEIVER's clock (clamped), so it is the
-    /// authoritative durable TTL for any re-mirror or handoff/spool of an already-held bundle —
+    /// authoritative durable TTL for any re-mirror or handoff/spool of an already-held bundle,
     /// instead of recomputing from the sender's advisory `created_at`, which can be 0 (the wire
     /// default) or skewed-behind and would rewrite the durable `expireAt` into the past
     /// (stores-r3-01). Default: `None` (a backend that doesn't track dedup expiry; caller falls
@@ -382,7 +373,7 @@ pub trait Store {
     }
 }
 
-/// Lets a node pick its store backend at runtime (`Node<Box<dyn Store>>`) — e.g. the
+/// Lets a node pick its store backend at runtime (`Node<Box<dyn Store>>`), e.g. the
 /// relay daemon choosing SQLite or Firestore from a flag.
 impl Store for Box<dyn Store> {
     fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool {
@@ -408,12 +399,6 @@ impl Store for Box<dyn Store> {
     }
     fn prune(&mut self, now_ms: u64) {
         (**self).prune(now_ms)
-    }
-    fn split_copies(&mut self, id: &BundleId) -> u16 {
-        (**self).split_copies(id)
-    }
-    fn set_copies(&mut self, id: &BundleId, copies: u16) {
-        (**self).set_copies(id, copies)
     }
     fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
         (**self).seen_expiry(id)
@@ -499,7 +484,7 @@ pub struct MemoryStore {
     /// id → dedup expiry (receiver clock). The master TTL index; `held` is a subset.
     seen: HashMap<BundleId, u64>,
     /// Durable key→bytes side store (sessions, prekey secrets). In-memory here, so it
-    /// survives only for the process lifetime — a persistent backend overrides this.
+    /// survives only for the process lifetime; a persistent backend overrides this.
     kv: BTreeMap<String, Vec<u8>>,
 }
 
@@ -526,8 +511,8 @@ impl MemoryStore {
 
     /// The receiver-anchored dedup expiry (epoch-ms) recorded for `id` at `put`/`put_with_expiry`
     /// time, if still tracked. A durable backend (stores-r2-01) reuses this as the authoritative
-    /// `expires_at` for any re-mirror of an already-held bundle (spray-and-wait split, retransmit
-    /// set_copies), instead of recomputing from the sender's advisory `created_at`, which can be
+    /// `expires_at` for any re-mirror of an already-held bundle (a custody handoff, retransmit
+    /// handoff), instead of recomputing from the sender's advisory `created_at`, which can be
     /// skewed-behind or 0 and would rewrite the durable TTL into the past.
     pub fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
         self.seen.get(id).copied()
@@ -613,16 +598,6 @@ impl Store for MemoryStore {
         for id in expired {
             self.seen.remove(&id);
             self.held.remove(&id);
-        }
-    }
-
-    fn split_copies(&mut self, id: &BundleId) -> u16 {
-        self.held.get_mut(id).map(|b| b.split_copies()).unwrap_or(0)
-    }
-
-    fn set_copies(&mut self, id: &BundleId, copies: u16) {
-        if let Some(b) = self.held.get_mut(id) {
-            b.env.copies = copies;
         }
     }
 
@@ -733,7 +708,7 @@ mod tests {
         let mut store = MemoryStore::new();
         assert!(store.put(b.clone(), 0));
 
-        store.prune(500); // within window — still deduping, still held
+        store.prune(500); // within window, still deduping, still held
         assert!(store.seen(&b.id()));
         assert!(store.contains(&b.id()));
         assert!(!store.put(b.clone(), 500));
@@ -842,10 +817,6 @@ mod tests {
                 HaveSet::default()
             }
             fn prune(&mut self, _n: u64) {}
-            fn split_copies(&mut self, _id: &BundleId) -> u16 {
-                0
-            }
-            fn set_copies(&mut self, _id: &BundleId, _c: u16) {}
             fn apply_kv_batch(
                 &mut self,
                 _mutations: &[KvMutation],
@@ -892,18 +863,6 @@ mod tests {
             boxed.seen_expiry(&b.id()),
             Some(3_600_000),
             "seen_expiry forwards"
-        );
-
-        assert_eq!(
-            boxed.split_copies(&b.id()),
-            4,
-            "split_copies forwards (8 copies -> give 4)"
-        );
-        boxed.set_copies(&b.id(), 1);
-        assert_eq!(
-            boxed.get(&b.id()).unwrap().env.copies,
-            1,
-            "set_copies forwards"
         );
 
         boxed.put_kv("session/alice", vec![9, 9]);
@@ -986,10 +945,6 @@ mod tests {
                 }
             }
             fn prune(&mut self, _now_ms: u64) {}
-            fn split_copies(&mut self, _id: &BundleId) -> u16 {
-                0
-            }
-            fn set_copies(&mut self, _id: &BundleId, _copies: u16) {}
             fn apply_kv_batch(
                 &mut self,
                 _mutations: &[KvMutation],
@@ -1048,32 +1003,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn split_copies_halves_the_budget_and_bottoms_out_at_zero_when_absent() {
-        // The spray-and-wait copy budget must halve on the STORED bundle (not some detached copy),
-        // reach the wait phase (give 0, keep the last copy) instead of underflowing, and an id we
-        // don't hold gives 0 rather than panicking.
-        let b = bundle(3_600_000); // default copies = 8
-        let mut store = MemoryStore::new();
-        assert!(store.put(b.clone(), 0));
-
-        assert_eq!(store.split_copies(&b.id()), 4, "8 copies -> give 4, keep 4");
-        assert_eq!(store.get(&b.id()).unwrap().env.copies, 4);
-
-        assert_eq!(store.split_copies(&b.id()), 2, "4 copies -> give 2, keep 2");
-        assert_eq!(store.split_copies(&b.id()), 1, "2 copies -> give 1, keep 1");
-        assert_eq!(
-            store.split_copies(&b.id()),
-            0,
-            "at 1 copy we're in the wait phase: give 0, keep the last copy"
-        );
-        assert_eq!(store.get(&b.id()).unwrap().env.copies, 1);
-
-        // An id we've never stored can't be split; this must not panic.
-        let missing = bundle(1_000);
-        assert_eq!(store.split_copies(&missing.id()), 0);
-    }
-
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(192))]
 
@@ -1093,8 +1022,7 @@ mod tests {
                     0 => { store.put(candidate, u64::from(now)); }
                     1 => { store.remove(&candidate.id()); }
                     2 => store.prune(u64::from(now)),
-                    3 => store.set_copies(&candidate.id(), value.max(1)),
-                    _ => { store.split_copies(&candidate.id()); }
+                    _ => {}
                 }
                 prop_assert!(store.seen.len() <= MAX_SEEN_ROWS);
                 prop_assert!(store.held.keys().all(|id| store.seen.contains_key(id)));

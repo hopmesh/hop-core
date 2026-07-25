@@ -61,15 +61,6 @@ impl AppKeys {
     /// A label-only app id with no secret key material, used by infra (the relay daemon) to
     /// stamp a recognizable [`AppId`] on trace hops without enabling `hps://` isolation (a relay
     /// carries every app's traffic regardless). Behaves like the fabric for isolation purposes.
-    pub fn label_only(id: AppId) -> Self {
-        Self {
-            secret: [0u8; 32],
-            id,
-            disc_key: None,
-            mac_key: None,
-        }
-    }
-
     /// True if this is the open fabric namespace (no app isolation).
     pub fn is_fabric(&self) -> bool {
         self.id == FABRIC_APP

@@ -40,8 +40,14 @@ use crate::crypto::PubKeyBytes;
 /// rather than growing. Comfortably above the ~415 a public directory carries today.
 pub const MAX_POOL_ENDPOINTS: usize = 512;
 
-/// Consecutive failures before an endpoint is considered failing and backed off.
-/// One failure is noise (a dropped link, a sleeping radio); two is a signal.
+/// Consecutive failures before an endpoint is BACKED OFF (made unavailable).
+///
+/// One failure is noise (a dropped link, a sleeping radio); two is a signal. Note the
+/// precise scope: a single failure does not make an endpoint unavailable, but it DOES
+/// drop it below a healthy peer in [`RelayEndpoint::score`], so a fresh alternative is
+/// preferred immediately while the once-failed endpoint stays dialable as a last
+/// resort. That is the intended behavior, and it is why the pool can fail over on the
+/// first failure without ever painting itself into having nothing to dial.
 pub const FAILURES_BEFORE_BACKOFF: u32 = 2;
 
 /// First backoff step once an endpoint is failing.

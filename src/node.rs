@@ -95,7 +95,6 @@ enum LinkState {
 /// Tracking for a locally-originated bundle awaiting an end-to-end ACK (§7).
 #[derive(Clone, Copy)]
 struct PendingTx {
-    copies: u16,
     created_at: u64,
     lifetime_ms: u32,
     next_retx_at: u64,
@@ -922,6 +921,10 @@ pub struct Node<S: Store = MemoryStore> {
     /// Retained prekey secrets by public, so late session inits still resolve, including a bounded
     /// window of PAST epochs' secrets across a rotation (core-03).
     spk_secrets: HashMap<XPubKeyBytes, zeroize::Zeroizing<[u8; 32]>>,
+    /// §19 relay pool: the candidate relay endpoints this node may dial, health-scored with
+    /// failover. The node itself never dials (that is a bearer's job); it owns the POLICY so
+    /// every platform shares one tested implementation instead of writing failover per driver.
+    relay_pool: crate::relay_pool::RelayPool,
     /// Our currently published one-time prekey batch (DESIGN.md §25).
     opk_batch: crypto::OneTimePreKeyBatch,
     /// Next OPK id to mint, monotonic across replenishes so a stale advert's ids never
@@ -1300,14 +1303,33 @@ impl<S: Store> Node<S> {
             zeroize::Zeroizing::new(prekey.secret_bytes()),
         );
         // OPKs are random (never derived), so a fresh batch is minted per process.
-        let opk_batch =
-            crypto::OneTimePreKeyBatch::generate(&identity, &prekey.public, 0, OPK_BATCH_SIZE);
+        //
+        // The id space starts at a RANDOM offset, not 0. Peers cache the prekey advert for
+        // PREKEY_TTL_MS (7 days), and OPK secrets are deliberately memory-only, so starting from 0
+        // every boot reissued ids 0..N with DIFFERENT secrets while stale adverts still advertised
+        // the old ones. A sender using the cached advert would then reference an id this node DOES
+        // hold, we would derive a mismatched 4-DH root, and the failure would surface as a generic
+        // AEAD error indistinguishable from a forgery, instead of the "unknown id -> ask for a
+        // reset" path that recovers in one round trip. A random 32-bit offset makes a post-restart
+        // collision negligible (an 8-id window in 2^32) and needs no persistence, which matters
+        // because ephemeral storage is a supported configuration.
+        let opk_first_id = {
+            let mut b = [0u8; 4];
+            getrandom::fill(&mut b).expect("OS CSPRNG");
+            u32::from_le_bytes(b)
+        };
+        let opk_batch = crypto::OneTimePreKeyBatch::generate(
+            &identity,
+            &prekey.public,
+            opk_first_id,
+            OPK_BATCH_SIZE,
+        );
         let opk_secrets: HashMap<u32, zeroize::Zeroizing<[u8; 32]>> = opk_batch
             .secret_bytes()
             .into_iter()
             .map(|(id, sec)| (id, zeroize::Zeroizing::new(sec)))
             .collect();
-        let opk_next_id = OPK_BATCH_SIZE as u32;
+        let opk_next_id = opk_first_id.wrapping_add(OPK_BATCH_SIZE as u32);
         let mut node = Self {
             identity,
             store,
@@ -1335,6 +1357,7 @@ impl<S: Store> Node<S> {
             prekey,
             prekey_epoch: 0,
             spk_secrets,
+            relay_pool: crate::relay_pool::RelayPool::new(),
             opk_batch,
             opk_next_id,
             opk_secrets,
@@ -1908,7 +1931,6 @@ impl<S: Store> Node<S> {
                     self.pending.insert(
                         id,
                         PendingTx {
-                            copies: b.env.copies,
                             created_at: b.inner.created_at,
                             lifetime_ms: b.inner.lifetime_ms,
                             next_retx_at: 0, // re-offer on the next tick
@@ -1987,10 +2009,6 @@ impl<S: Store> Node<S> {
 
     /// Decayed learned reachability toward `dst` (0.0 if no route is known). Higher
     /// means this node is a better path to `dst` right now.
-    pub fn route_utility(&self, dst: &PubKeyBytes) -> f64 {
-        self.routes.utility(dst, self.now_ms)
-    }
-
     /// Whether this node has learned any live route toward `dst`.
     pub fn knows_route(&self, dst: &PubKeyBytes) -> bool {
         self.routes.knows(dst, self.now_ms)
@@ -2153,7 +2171,6 @@ impl<S: Store> Node<S> {
         let id = bundle.id();
         let track = bundle.inner.flags.request_ack && !bundle.inner.flags.is_ack;
         let pend = PendingTx {
-            copies: bundle.env.copies,
             created_at: bundle.inner.created_at,
             lifetime_ms: bundle.inner.lifetime_ms,
             next_retx_at: self.now_ms.saturating_add(self.retx_interval_ms),
@@ -2645,10 +2662,11 @@ impl<S: Store> Node<S> {
 
     /// Mint a fresh one-time prekey batch against the current SPK and adopt it.
     ///
-    /// Ids continue from [`Self::opk_next_id`] rather than restarting at 0: a peer may
-    /// still hold a cached advert from the previous batch, and reusing ids across
-    /// batches would make an incoming `opk_id` ambiguous for as long as both are in
-    /// flight. Secrets from the OLD batch are deliberately retained here, the reaper
+    /// Ids continue from [`Self::opk_next_id`] rather than restarting: a peer may still hold a
+    /// cached advert from the previous batch, and reusing ids across batches would make an incoming
+    /// `opk_id` ambiguous for as long as both are in flight. The counter starts at a RANDOM offset
+    /// per process (see `with_store`) so this holds across a RESTART too, not just across
+    /// replenishes within one process. Secrets from the OLD batch are deliberately retained here, the reaper
     /// ([`Self::reap_opks`]) ages them out, so an in-flight handshake against the
     /// previous batch still resolves.
     fn mint_opk_batch(&mut self) {
@@ -2692,6 +2710,54 @@ impl<S: Store> Node<S> {
             self.mint_opk_batch();
             let _ = self.publish_prekey();
         }
+    }
+
+    // ---- §19 relay pool ------------------------------------------------------------------
+    //
+    // The bearer dials; the node decides WHERE. Keeping the choice here means the backoff,
+    // failover, and eviction rules are written and tested once in Rust rather than once per
+    // driver, which is the same reasoning that made the per-platform BLE dial-backoff drift a
+    // live bug (see bearers/CLAUDE.md).
+
+    /// Offer a relay endpoint to the pool. `configured` marks an operator/user choice, which
+    /// outranks and can never be demoted by a gossiped one. Returns false if the pool is full and
+    /// this endpoint did not outrank the worst entry.
+    pub fn relay_add(&mut self, url: &str, configured: bool) -> bool {
+        let source = if configured {
+            crate::relay_pool::EndpointSource::Configured
+        } else {
+            crate::relay_pool::EndpointSource::Bundled
+        };
+        self.relay_pool.add(url, None, source)
+    }
+
+    /// The relay the host should dial right now, or `None` if every candidate is backed off.
+    ///
+    /// `None` with a non-empty pool means WAIT, not "no reach": the caller should retry rather
+    /// than treat the relay bearer as permanently dead.
+    pub fn relay_next(&self) -> Option<String> {
+        self.relay_pool
+            .next_dial(self.now_ms)
+            .map(|e| e.url.clone())
+    }
+
+    /// Report the outcome of a dial so the pool can score it. A success clears the endpoint's
+    /// failure history entirely; failures back it off exponentially and always recover.
+    pub fn relay_report(&mut self, url: &str, ok: bool) {
+        if ok {
+            self.relay_pool.record_success(url, self.now_ms);
+        } else {
+            self.relay_pool.record_failure(url, self.now_ms);
+        }
+    }
+
+    /// (pooled endpoints, dialable right now). `(n, 0)` with `n > 0` is the "everything is backed
+    /// off" state a UI should surface as degraded rather than offline.
+    pub fn relay_pool_stats(&self) -> (usize, usize) {
+        (
+            self.relay_pool.len(),
+            self.relay_pool.available_count(self.now_ms),
+        )
     }
 
     /// This node's currently published prekey bundle, including its signed one-time
@@ -3496,24 +3562,33 @@ impl<S: Store> Node<S> {
                     Some(ps) => ps.established_by != Some(ek_pub),
                 };
                 let mut candidate = if fresh {
-                    let secret = self
-                        .spk_secrets
-                        .get(&spk_pub)
-                        .ok_or(Error::Crypto("unknown prekey"))?
-                        .clone();
-                    // A referenced OPK we no longer hold is NOT recoverable: the 4-DH and
-                    // 3-DH roots differ by construction, so there is nothing to fall back
-                    // to. Surface it as its own error so the caller answers with a
-                    // SessionReset and the sender re-opens (SPK-only, since it will have
-                    // spent that id). This is the documented cost of memory-only OPK
-                    // secrets, and it costs a round trip, never a lost message.
+                    // Missing key material is UNRECOVERABLE for this handshake, and the reset
+                    // has to be requested HERE. Returning via `?` short-circuited past the
+                    // decrypt-failure arm below that owns `request_session_reset`, so the
+                    // recovery this code claimed to provide never actually fired: the sender
+                    // just retransmitted the same undecryptable SessionInit until lifetime.
+                    let Some(secret) = self.spk_secrets.get(&spk_pub).cloned() else {
+                        if authenticated {
+                            self.request_session_reset(from);
+                        }
+                        return Err(Error::Crypto("unknown prekey"));
+                    };
+                    // A referenced OPK we no longer hold is not recoverable either: the 4-DH
+                    // and 3-DH roots differ by construction, so there is nothing to fall back
+                    // to. Two ways to get here: the owner reaped it after
+                    // OPK_RETAIN_AFTER_USE_MS, or the sender is using a pre-restart advert
+                    // (secrets are memory-only by design). Either way the sender must re-open,
+                    // which costs a round trip and never a lost message.
                     let opk_secret = match opk_id {
-                        Some(id) => Some(
-                            self.opk_secrets
-                                .get(&id)
-                                .ok_or(Error::Crypto("one-time prekey reaped"))?
-                                .clone(),
-                        ),
+                        Some(id) => match self.opk_secrets.get(&id).cloned() {
+                            Some(sec) => Some(sec),
+                            None => {
+                                if authenticated {
+                                    self.request_session_reset(from);
+                                }
+                                return Err(Error::Crypto("one-time prekey reaped"));
+                            }
+                        },
                         None => None,
                     };
                     let root = crypto::x3dh_respond(
@@ -3817,6 +3892,16 @@ impl<S: Store> Node<S> {
                         .issued_at
                         .saturating_add(rec.claim.ttl_secs as u64)
                         .saturating_mul(1000);
+                    // §19: a verified reach record is a signed "address X is reachable at
+                    // <endpoint>" claim, which is exactly a relay candidate. Learn it as
+                    // Discovered so it can never demote an operator's configured relay. The
+                    // signature is already checked above; this trusts it for a DIAL TARGET only,
+                    // never for admission (§35) and never for content (the bundle's own integrity).
+                    self.relay_pool.add(
+                        rec.claim.endpoint.clone(),
+                        Some(rec.claim.address),
+                        crate::relay_pool::EndpointSource::Discovered,
+                    );
                     (
                         Some(rec.claim.address),
                         abs.min(now_ms.saturating_add(MAX_HNS_TTL_MS)),
@@ -6000,7 +6085,6 @@ impl<S: Store> Node<S> {
                 self.pending.insert(
                     id,
                     PendingTx {
-                        copies: stored.env.copies,
                         created_at: stored.inner.created_at,
                         lifetime_ms: stored.inner.lifetime_ms,
                         next_retx_at: self.now_ms.saturating_add(self.retx_interval_ms),
@@ -7179,12 +7263,15 @@ impl<S: Store> Node<S> {
                 continue;
             }
             if now_ms >= p.next_retx_at {
-                // Refresh the copy budget and re-offer along every link.
+                // Re-offer along every link. (This used to also "refresh the copy budget" via
+                // Store::set_copies, a write nothing ever read back: routing is epidemic + vaccine
+                // and ignores `copies` entirely, see DESIGN.md §6. The write and the trait method
+                // it needed are gone; the re-offer, which is the part that actually retransmits,
+                // is unchanged.)
                 if !self.store.contains(&id) {
                     self.pending.remove(&id);
                     continue;
                 }
-                self.store.set_copies(&id, p.copies);
                 for state in self.links.values_mut() {
                     if let LinkState::Up(est) = state {
                         est.sent_bundles.remove(&id);
@@ -9441,12 +9528,6 @@ mod tests {
         fn prune(&mut self, now_ms: u64) {
             self.inner.prune(now_ms)
         }
-        fn split_copies(&mut self, id: &BundleId) -> u16 {
-            self.inner.split_copies(id)
-        }
-        fn set_copies(&mut self, id: &BundleId, copies: u16) {
-            self.inner.set_copies(id, copies)
-        }
         fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
             self.inner.seen_expiry(id)
         }
@@ -11330,6 +11411,13 @@ mod tests {
     }
 
     impl<S: Store> Node<S> {
+        /// Test seam: have we asked `peer` to reset its session? Observes `request_session_reset`
+        /// directly, rather than inferring it from held-bundle counts (which move for unrelated
+        /// reasons: retransmits, ACKs, eviction).
+        fn asked_peer_to_reset_for_test(&self, peer: &PubKeyBytes) -> bool {
+            self.last_reset_req.contains_key(peer)
+        }
+
         /// Test seam: mark an OPK used at `at_ms` so the reaper can age it out without
         /// having to drive a real handshake first.
         fn force_opk_used(&mut self, id: u32, at_ms: u64) {
@@ -11361,6 +11449,103 @@ mod tests {
             };
             crypto::x3dh_respond(&self.identity, &spk, opk.as_deref(), sender, ek_pub)
         }
+    }
+
+    #[test]
+    fn relay_pool_fails_over_and_recovers_through_the_node() {
+        // End-to-end through the Node API a driver actually calls: a configured relay is dialed,
+        // fails twice, yields to the next candidate, and comes back once its backoff lapses.
+        let mut n = Node::new(Identity::generate());
+        n.tick(1_000);
+        assert!(n.relay_add("wss://a/_hop", true));
+        assert!(n.relay_add("wss://b/_hop", true));
+        assert_eq!(n.relay_pool_stats(), (2, 2));
+
+        let first = n.relay_next().expect("a relay to dial");
+        n.relay_report(&first, true);
+        assert_eq!(
+            n.relay_next().as_deref(),
+            Some(first.as_str()),
+            "a working relay is kept"
+        );
+
+        // It dies. A single failure does NOT back it off (one failure is noise: a sleeping radio,
+        // a transient network), but it does drop it below a healthy peer in preference, which is
+        // the right call when an untried alternative exists.
+        n.relay_report(&first, false);
+        let second = n.relay_next().expect("failover target");
+        assert_ne!(
+            second, first,
+            "a healthy peer is preferred over a just-failed one"
+        );
+        assert_eq!(
+            n.relay_pool_stats(),
+            (2, 2),
+            "one failure must not make an endpoint UNAVAILABLE, only less preferred"
+        );
+
+        // A second consecutive failure is a signal: now it is actually backed off.
+        n.relay_report(&first, false);
+        assert_eq!(
+            n.relay_pool_stats(),
+            (2, 1),
+            "two consecutive failures back the endpoint off"
+        );
+
+        // Everything down is WAIT, not offline: the pool still knows where to retry.
+        n.relay_report(&second, false);
+        n.relay_report(&second, false);
+        assert!(n.relay_next().is_none());
+        let (total, avail) = n.relay_pool_stats();
+        assert_eq!((total, avail), (2, 0));
+
+        // Operators fix things, so recovery is automatic.
+        n.tick(1_000 + crate::relay_pool::BACKOFF_MAX_MS + 1);
+        assert!(
+            n.relay_next().is_some(),
+            "a backed-off relay returns on its own"
+        );
+    }
+
+    #[test]
+    fn a_verified_reach_record_becomes_a_relay_candidate() {
+        // §19: HNS resolution already verifies a signed "address X is at <endpoint>" record. That
+        // is a dial target, so the pool learns it for free rather than needing its own directory.
+        let mut n = Node::new(Identity::generate());
+        n.tick(10_000);
+        assert_eq!(n.relay_pool_stats().0, 0);
+
+        let relay = Identity::generate();
+        let rec = crate::reach::ReachRecord::sign(&relay, "wss://learned.example/_hop", 3600, 10);
+        n.provide_reach_record("learned.example", rec.to_bytes());
+
+        assert_eq!(
+            n.relay_pool_stats().0,
+            1,
+            "a verified record became a candidate"
+        );
+        assert_eq!(
+            n.relay_next().as_deref(),
+            Some("wss://learned.example/_hop")
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_reach_record_never_becomes_a_relay_candidate() {
+        // A forged record must not be able to inject a dial target by claiming someone's address.
+        let mut n = Node::new(Identity::generate());
+        n.tick(10_000);
+        let relay = Identity::generate();
+        let rec = crate::reach::ReachRecord::sign(&relay, "wss://evil.example/_hop", 3600, 10);
+        let mut bytes = rec.to_bytes();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff; // corrupt the signature
+        n.provide_reach_record("evil.example", bytes);
+        assert_eq!(
+            n.relay_pool_stats().0,
+            0,
+            "an unverifiable record must not seed the pool"
+        );
     }
 
     #[test]
@@ -11492,6 +11677,74 @@ mod tests {
             "an exhausted batch yields None, which is the 3-DH path"
         );
         let _ = peer;
+    }
+
+    #[test]
+    fn a_restart_does_not_reissue_the_same_opk_ids_with_different_secrets() {
+        // Peers cache the prekey advert for 7 days and OPK secrets are memory-only, so a boot that
+        // restarted the id space at 0 would advertise ids a stale advert already names, bound to
+        // DIFFERENT secrets. The responder would then find the id, derive a mismatched 4-DH root,
+        // and fail as if forged, instead of taking the recoverable unknown-id path.
+        let seed = Identity::generate().to_secret_bytes();
+        let a = Node::new(Identity::from_secret_bytes(&seed));
+        let b = Node::new(Identity::from_secret_bytes(&seed));
+        let ids_a: Vec<u32> = a.prekey_bundle().opks.iter().map(|o| o.id).collect();
+        let ids_b: Vec<u32> = b.prekey_bundle().opks.iter().map(|o| o.id).collect();
+        assert_eq!(ids_a.len(), OPK_BATCH_SIZE);
+        assert!(
+            ids_a.iter().all(|id| !ids_b.contains(id)),
+            "two boots of the SAME identity must not reuse opk ids ({ids_a:?} vs {ids_b:?})"
+        );
+    }
+
+    #[test]
+    fn a_stale_opk_reference_makes_the_responder_ask_for_a_reset() {
+        // n0 mints a SessionInit against n1's published advert. n1 then RESTARTS before ever seeing
+        // it: same identity (so its deterministic SPK still resolves) but a fresh, memory-only OPK
+        // batch. The in-flight SessionInit therefore names an opk id n1 does not have.
+        //
+        // Before this fix that was UNRECOVERABLE AND SILENT, twice over: n1 restarted its opk id
+        // space at 0, so it usually HELD an id with that number bound to a different secret and
+        // derived a mismatched 4-DH root (a failure indistinguishable from forgery); and the lookup
+        // returned via `?`, short-circuiting past the branch that owns request_session_reset, so no
+        // reset was ever sent and n0 just retransmitted until lifetime expiry.
+        let id1_secret = Identity::generate().to_secret_bytes();
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::from_identity_secret(&id1_secret),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        let stale_ids: Vec<u32> = nodes[1].prekey_bundle().opks.iter().map(|o| o.id).collect();
+        // Mint against the cached advert, but do NOT deliver it yet.
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"in flight".to_vec(), true)
+            .unwrap();
+
+        // n1 restarts. Fresh random id space, so the in-flight reference is genuinely absent.
+        nodes[1] = Node::from_identity_secret(&id1_secret);
+        let fresh_ids: Vec<u32> = nodes[1].prekey_bundle().opks.iter().map(|o| o.id).collect();
+        assert!(
+            fresh_ids.iter().all(|id| !stale_ids.contains(id)),
+            "the restarted node must not reissue the stale ids ({stale_ids:?} vs {fresh_ids:?})"
+        );
+        assert!(
+            !nodes[1].asked_peer_to_reset_for_test(&nodes[0].address()),
+            "a freshly restarted node has asked nobody to reset"
+        );
+
+        nodes[0].handle(BearerEvent::Disconnected(1));
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 2, 1, 2);
+        net.pump(&mut nodes);
+
+        assert!(
+            nodes[1].asked_peer_to_reset_for_test(&nodes[0].address()),
+            "a stale opk reference must make the responder ASK for a reset, not fail silently"
+        );
     }
 
     #[test]
@@ -18329,12 +18582,6 @@ mod tests {
         fn prune(&mut self, now_ms: u64) {
             self.inner.prune(now_ms)
         }
-        fn split_copies(&mut self, id: &BundleId) -> u16 {
-            self.inner.split_copies(id)
-        }
-        fn set_copies(&mut self, id: &BundleId, copies: u16) {
-            self.inner.set_copies(id, copies)
-        }
         fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
             self.inner.seen_expiry(id)
         }
@@ -18491,12 +18738,6 @@ mod tests {
             }
             fn prune(&mut self, now_ms: u64) {
                 self.inner.prune(now_ms)
-            }
-            fn split_copies(&mut self, id: &BundleId) -> u16 {
-                self.inner.split_copies(id)
-            }
-            fn set_copies(&mut self, id: &BundleId, copies: u16) {
-                self.inner.set_copies(id, copies)
             }
             fn apply_kv_batch(
                 &mut self,

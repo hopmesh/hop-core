@@ -21,7 +21,8 @@ Hop is a **delay-tolerant mesh**: end-to-end encrypted datagrams that hop device
 Wi-Fi, and the internet, until they reach the person you meant. Held, never dropped.
 
 `hop-core` is the whole protocol as one deterministic, `no-radio` Rust crate: the bundle codec and wire
-format, the Noise link handshake, spray-and-wait routing, the untraceable-by-default metadata path, the
+format, the Noise link handshake, epidemic routing with delivery-vaccine reclamation, the
+untraceable-by-default metadata path, the
 Double Ratchet, and the `Store` seam. Everything else binds through here. It runs identically in unit
 tests, in the browser via WebAssembly, and on-device through the C ABI, because the only thing it doesn't
 contain is the radio: a bearer hands it opaque bytes, and it does the rest.
@@ -86,9 +87,10 @@ request/response surface, and `hps_*` carry group channels.
   OS CSPRNG.
 - **`link`** the Noise-framed bearer contract: opaque bytes in, opaque bytes out, no protocol logic in
   the radio.
-- **`routing` / `route` / `relay`** spray-and-wait and the route-toward gradient that makes the
+- **`routing` / `route` / `relay`** epidemic forwarding bounded by `hop_limit` and the route-toward gradient that makes the
   untraceable path directed rather than a blind flood.
-- **`store`** the `Store` trait: put/get/dedup and the spray-and-wait copy budget. Pick a backend
+- **`store`** the `Store` trait: put/get/dedup. (The copy-budget mutation API was removed as dead
+  surface; `Envelope.copies` is reserved and unread, see DESIGN.md §6.) Pick a backend
   (SQLite, Firestore) or bring your own; an in-memory one ships in-crate.
 - **`app` / `hps` / `reach`** app-fabric keys, `hps://` pub/sub channels, and self-certifying reach
   records.
