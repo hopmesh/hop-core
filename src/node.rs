@@ -5,15 +5,17 @@
 //! bytes to send back over it. Per connection it:
 //! 1. runs a Noise XX handshake ([`crate::link`]), exchanging a signed binding so
 //!    each side learns the other's *hop address* (Ed25519), not just its link key;
-//! 2. once up, offers its stored bundles via binary spray-and-wait ([`crate::routing`])
+//! 2. once up, offers its stored bundles by epidemic forward ([`crate::routing`])
 //!    and gossips its directory of adverts ([`crate::discover`]);
 //! 3. on receiving a bundle addressed to itself, delivers it to the inbox;
 //!    otherwise stores it for onward relay.
 //!
 //! The loop is transport-agnostic and fully testable without a radio: feed it
-//! events, drain its outgoing bytes, read its inbox. v1 sends each message as one
-//! link packet; MTU fragmentation (`link::fragment`) wraps this when a bearer
-//! needs it, a TODO for the BLE shim.
+//! events, drain its outgoing bytes, read its inbox. A record too large for one
+//! link packet is split by [`crate::wire_emit::frame_record`] into ordered
+//! `LinkPacket::DataFrag`s and reassembled by `on_record_frag`. That ships, and it
+//! is the only framing path: `link::fragment` / `link::Reassembler` are a separate
+//! layer nothing reaches (see the deferred-deletion note in `bearers/CLAUDE.md`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -8952,7 +8954,7 @@ impl<S: Store> Node<S> {
         b.inner.priority as f64 * 100.0 + route
     }
 
-    /// Offer stored bundles to one link, applying binary spray-and-wait.
+    /// Offer stored bundles to one link, applying the epidemic forward policy (DESIGN.md §6).
     fn offer_bundles_to_link(&mut self, link: LinkId) {
         // Provenance privacy (§27): a DEVICE relay leaves its address OUT of the trace (stamps a
         // zeroed short-addr) so the recipient learns only the hop count + carrier type ("device"),
@@ -9014,7 +9016,7 @@ impl<S: Store> Node<S> {
         }
     }
 
-    /// Offer ONE already-loaded stored bundle to a single link, applying binary spray-and-wait,
+    /// Offer ONE already-loaded stored bundle to a single link, applying the epidemic forward,
     /// §39 gradient steering, and per-link dedup. Extracted from `offer_bundles_to_link` so a
     /// just-arrived bundle can be offered without a full-store rescan (F-09).
     fn offer_one_to_link(
