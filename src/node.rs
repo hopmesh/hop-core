@@ -2660,6 +2660,57 @@ impl<S: Store> Node<S> {
         let _ = self.publish_prekey();
     }
 
+    /// Heal a handshake that can never complete, using a peer's fresher prekey advert.
+    ///
+    /// ## Why this exists (the §39 asymmetry)
+    ///
+    /// A `SessionInit` that references a one-time prekey the recipient no longer holds is
+    /// UNRECOVERABLE: the 4-DH and 3-DH roots differ by construction, so there is nothing to fall
+    /// back to. On the traced path the recipient answers with a `SessionReset` and the sender
+    /// re-opens. On the **§39 private path, which is the default, it cannot**: a private bundle's
+    /// `src` is an unauthenticated claim until the AEAD succeeds, and when the referenced OPK is
+    /// missing the AEAD never runs, so replying would let anyone who knows a victim's address
+    /// elicit a control message in their name. Not replying is correct and has its own test.
+    ///
+    /// That left the sender with no signal at all. Its session stays in `sessions` with
+    /// `init_material` pinned to the dead `opk_id`, so `session_payload` keeps taking the
+    /// established-session branch and resending the identical doomed handshake until each bundle's
+    /// lifetime expires. `gc_idle_sessions` would not save it either: the window is
+    /// `SESSION_MAX_IDLE_MS` (30 days) and `touch_session` refreshes on activity, so an actively
+    /// used session may never age out. Silent message loss on the default path.
+    ///
+    /// The peer's fresher advert IS the signal, and it arrives over gossip. So when a peer
+    /// republishes prekeys and the OPK our unconfirmed handshake references is absent from the new
+    /// batch, that handshake is provably dead: drop the session so the next send re-opens against
+    /// the current advert.
+    ///
+    /// Deliberately narrow, to create no churn in the healthy case:
+    /// - only **unconfirmed** sessions (`init_material.is_some()`, i.e. the peer never replied), so
+    ///   nothing that ever carried a reply is touched;
+    /// - only handshakes that referenced an OPK at all (a 3-DH handshake rests on the SPK, which is
+    ///   deterministic per epoch, so a republish does not invalidate it);
+    /// - only when the referenced id is absent from the new batch, which is proof, not suspicion.
+    ///
+    /// Lives here rather than in `discover.rs` on purpose: that file is wire-manifest-listed, so
+    /// even this byte-neutral bookkeeping would force a `BUNDLE_VERSION` bump.
+    fn heal_session_against_fresh_prekey(&mut self, peer: PubKeyBytes) {
+        let Some(session) = self.sessions.get(&peer) else {
+            return;
+        };
+        // Confirmed sessions are none of our business: the peer replied, so the ratchet works.
+        let Some((_, _, Some(opk_id))) = session.init_material else {
+            return;
+        };
+        let Some(bundle) = self.directory.prekey(&peer) else {
+            return;
+        };
+        if !bundle.opks.iter().any(|o| o.id == opk_id) {
+            // Deleting drops the pinned init_material; the next send re-opens from the fresh
+            // advert. Queued content is not lost: it re-ratchets under the new session.
+            let _ = self.delete_session(&peer);
+        }
+    }
+
     /// Mint a fresh one-time prekey batch against the current SPK and adopt it.
     ///
     /// Ids continue from [`Self::opk_next_id`] rather than restarting: a peer may still hold a
@@ -8713,6 +8764,7 @@ impl<S: Store> Node<S> {
         // Service adverts flood the directory (subscribed → full retention, else the
         // bounded relay cache). Re-gossip only when newly accepted.
         let is_prekey = matches!(advert.body.kind, AdvertKind::PreKey { .. });
+        let prekey_publisher = advert.body.publisher;
         // §39 P4: a signed receiver-beacon lays/refreshes a gradient toward its mailbox via the
         // link we heard it on. Read its fields (and the publisher) before `ingest` consumes it.
         let beacon = match advert.body.kind {
@@ -8732,6 +8784,12 @@ impl<S: Store> Node<S> {
             self.offer_adverts_to_all();
             // A newly-learned prekey may unblock content we were holding to ratchet (§25).
             if is_prekey {
+                // A fresher prekey advert is the ONLY signal that can rescue a handshake pinned to
+                // a one-time prekey the peer no longer has (§39: on the private path the peer
+                // cannot tell us, since replying to an unauthenticated claimed src is a reflection
+                // vector). Check before flushing, so anything we flush re-opens against the new
+                // material instead of re-sending a doomed SessionInit.
+                self.heal_session_against_fresh_prekey(prekey_publisher);
                 self.flush_pending_content();
             }
             if let Some((mailbox, publisher, hops, created_at, ttl_ms, seq)) = beacon {
@@ -11411,6 +11469,14 @@ mod tests {
     }
 
     impl<S: Store> Node<S> {
+        /// Test seam: the one-time prekey id our unconfirmed handshake with `peer` is pinned to.
+        fn pinned_opk_for_test(&self, peer: &PubKeyBytes) -> Option<u32> {
+            match self.sessions.get(peer)?.init_material {
+                Some((_, _, opk)) => opk,
+                None => None,
+            }
+        }
+
         /// Test seam: have we asked `peer` to reset its session? Observes `request_session_reset`
         /// directly, rather than inferring it from held-bundle counts (which move for unrelated
         /// reasons: retransmits, ACKs, eviction).
@@ -11694,6 +11760,109 @@ mod tests {
         assert!(
             ids_a.iter().all(|id| !ids_b.contains(id)),
             "two boots of the SAME identity must not reuse opk ids ({ids_a:?} vs {ids_b:?})"
+        );
+    }
+
+    #[test]
+    fn a_fresher_prekey_advert_heals_a_doomed_private_handshake() {
+        // The §39 asymmetry, end to end. On the DEFAULT (private) path the recipient cannot answer a
+        // dead-OPK handshake with a SessionReset (its `src` is an unauthenticated claim, so replying
+        // would be a reflection vector), which left the sender resending an identical doomed
+        // SessionInit until lifetime expiry, with gc_idle_sessions 30 days away and refreshed by
+        // activity. The peer's fresher advert is the only signal that arrives, so it must heal it.
+        let id1_secret = Identity::generate().to_secret_bytes();
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::from_identity_secret(&id1_secret),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].tick(10_000);
+        nodes[1].tick(10_000);
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        // n0 opens against the advert it has, pinning one of n1's OPK ids.
+        nodes[0]
+            .send_message(nodes[1].address(), "t".into(), b"doomed".to_vec(), false)
+            .unwrap();
+        let pinned = nodes[0]
+            .pinned_opk_for_test(&nodes[1].address())
+            .expect("the handshake pinned an opk id");
+        assert!(
+            nodes[0].has_session(&nodes[1].address()),
+            "n0 holds an unconfirmed session"
+        );
+
+        // n1 restarts: same identity, fresh memory-only OPK batch with a new random id space, and
+        // republishes at a strictly later timestamp.
+        nodes[1] = Node::from_identity_secret(&id1_secret);
+        nodes[1].tick(20_000);
+        nodes[1].publish_prekey().unwrap();
+        assert!(
+            !nodes[1].prekey_bundle().opks.iter().any(|o| o.id == pinned),
+            "the restarted node no longer offers the pinned id"
+        );
+
+        nodes[0].handle(BearerEvent::Disconnected(1));
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 2, 1, 2);
+        net.pump(&mut nodes);
+        nodes[0].tick(30_000);
+
+        assert!(
+            !nodes[0].has_session(&nodes[1].address()),
+            "the doomed unconfirmed session must be dropped once the fresher advert proves the \
+             pinned OPK is gone; otherwise every send to this peer fails silently for 30 days"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_session_survives_a_peer_republishing_prekeys() {
+        // The heal must be narrow. A peer republishing prekeys is routine (rotation, replenish); it
+        // must never disturb a session that is actually working, or the fix would churn every
+        // healthy conversation on the mesh every epoch.
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        nodes[0].tick(10_000);
+        nodes[1].tick(10_000);
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+
+        // Establish BOTH directions so n0's session is confirmed (init_material cleared).
+        nodes[0]
+            .send_message_traced(nodes[1].address(), "t".into(), b"hi".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[1].take_inbox() {
+            let id = b.id();
+            nodes[1].read_message(&b).unwrap();
+            nodes[1].accept_inbox(&id).unwrap();
+        }
+        nodes[1]
+            .send_message_traced(nodes[0].address(), "t".into(), b"yo".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+        for b in nodes[0].take_inbox() {
+            let id = b.id();
+            nodes[0].read_message(&b).unwrap();
+            nodes[0].accept_inbox(&id).unwrap();
+        }
+        assert!(nodes[0].has_session(&nodes[1].address()));
+
+        // n1 republishes a brand-new batch at a later timestamp, as rotation does.
+        nodes[1].tick(20_000);
+        nodes[1].publish_prekey().unwrap();
+        net.pump(&mut nodes);
+        nodes[0].tick(30_000);
+
+        assert!(
+            nodes[0].has_session(&nodes[1].address()),
+            "a routine prekey republish must not disturb a working session"
         );
     }
 
