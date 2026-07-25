@@ -5,6 +5,8 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- fmt drift, orphaned doc comments, and Android tests that raced the network (dc44ef4)
+- two bugs in my own one-time-prekey work, plus three CI breaks (93859f8)
 - revive dead ingest, fail closed, bound stamps, measure bytes and carriage (1912c75)
 - integrate the storage dimension onto current main (aedcfb2)
 - bump corpus + all wire-version consumers to v10 (e68d804)
@@ -34,6 +36,8 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- make §6 match the shipped router, rename the fossil (49f2f53)
+- regenerate from conventional commits (a355901)
 - branded, marketable READMEs for every sub-repo (9c2a477)
 - stop mentioning DNSSEC (no longer part of the design) (179a278)
 - decouple hop-core's vocabulary from the sim (comments only) (#119) (d153989)
@@ -62,6 +66,12 @@ git-cliff. Do not edit by hand.
 - observe bundle-per-link transfers for the swarm viz (325a0ae)
 
 ### Other
+- delete unwired trait surface and correct 12 stale claims (4e4272f)
+- clean the em-dashes retiring store.rs from the wire manifest exposed (59fa5f2)
+- wire the relay pool end to end, and stop the wire guard false-firing (35946e0)
+- delete the dead copy-budget API and stop the simulator lying (9ab3138)
+- relay pool with health scoring and failover (92f2eea)
+- one-time prekeys for async first contact (wire v11) (d6ebce3)
 - rework the console deploy onto the new GitHub-is-change-management pipeline (b53b9d0)
 - narrow the manifest off access.rs to the carriage-stamp layout (e3d032d)
 - narrow the manifest to code that decides wire bytes (b58fed8)
