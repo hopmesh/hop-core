@@ -36,6 +36,9 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- node.rs called shipped fragmentation a TODO, and pointed at the dead layer (45f9b6f)
+- stop describing a routing algorithm the code no longer runs (5433b6e)
+- regenerate from conventional commits (1572ae2)
 - make §6 match the shipped router, rename the fossil (49f2f53)
 - regenerate from conventional commits (a355901)
 - branded, marketable READMEs for every sub-repo (9c2a477)
@@ -66,6 +69,8 @@ git-cliff. Do not edit by hand.
 - observe bundle-per-link transfers for the swarm viz (325a0ae)
 
 ### Other
+- move the BLE socket write off the node's core thread (R-02) (41fd3fb)
+- heal a doomed handshake on the private path, where no reset can be sent (5133f4d)
 - delete unwired trait surface and correct 12 stale claims (4e4272f)
 - clean the em-dashes retiring store.rs from the wire manifest exposed (59fa5f2)
 - wire the relay pool end to end, and stop the wire guard false-firing (35946e0)
