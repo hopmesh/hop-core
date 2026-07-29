@@ -36,6 +36,7 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- regenerate from conventional commits (330c8c6)
 - regenerate from conventional commits (096180b)
 - regenerate from conventional commits (102ae67)
 - node.rs called shipped fragmentation a TODO, and pointed at the dead layer (45f9b6f)
@@ -71,6 +72,8 @@ git-cliff. Do not edit by hand.
 - observe bundle-per-link transfers for the swarm viz (325a0ae)
 
 ### Other
+- rate-limit inbound receiver-beacons per link (c1c0c49)
+- stop the receiver-beacon publishing address-to-mailbox in cleartext (5948b7c)
 - move the BLE socket write off the node's core thread (R-02) (41fd3fb)
 - heal a doomed handshake on the private path, where no reset can be sent (5133f4d)
 - delete unwired trait surface and correct 12 stale claims (4e4272f)
