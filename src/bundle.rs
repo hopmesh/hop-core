@@ -66,7 +66,7 @@ pub struct TraceHop {
 // ACKs) to a 60s bucket so it is not a per-message sender timing fingerprint. This changes the wire
 // bytes (and thus the private wire id) of private bundles minted off a bucket boundary, so a v9 and a
 // v10 node compute different ids for the same logical send; the version gate must keep them apart.
-pub const BUNDLE_VERSION: u8 = 12;
+pub const BUNDLE_VERSION: u8 = 13;
 
 /// Maximum encoded size accepted by [`Bundle::from_bytes`]. Oversized application content is carried
 /// in bounded [`Payload::Carrier`] chunks, so a single decoded bundle never needs to allocate beyond

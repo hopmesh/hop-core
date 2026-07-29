@@ -70,7 +70,7 @@ pub(crate) struct LinkAuth {
 ///
 /// WIRE DISCIPLINE: append-only, same as the bundle enums. `Have` was appended as the §35
 /// custody beacon (a node tells this peer what it already holds so the peer stops re-offering it);
-/// added within the v8 wire bump.
+/// added within the v8 wire bump. `RecvBeacon` was appended within the v13 bump.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Wire {
     Bundle(crate::bundle::Bundle),
@@ -80,6 +80,38 @@ pub(crate) enum Wire {
     /// peer's own truthful claim about its own store (no forgery/censorship surface, unlike a
     /// flooded beacon). Cuts duplicate-ingress COGS.
     Have(crate::store::HaveSet),
+    /// §39 P4 receiver-beacon, link-local and UNSIGNED. Replaces the flooded, identity-signed
+    /// `AdvertKind::RecvBeacon`, which published "address P owns mailbox tag T" in cleartext to
+    /// every node within three hops (an advert body carries the publisher's real address, and the
+    /// beacon carried the FULL 16-byte mailbox tag). Any relay you connect to was one hop away, so
+    /// it was handed the address-to-mailbox map directly, which collapsed the mailbox anonymity set
+    /// to nothing.
+    ///
+    /// What survives is the only part routing ever consumed: the [`crate::crypto::MailboxRoute`]
+    /// prefix that `record_gradient` immediately projected to anyway. No address, no full tag.
+    ///
+    /// UNSIGNED is deliberate, on the exact precedent `Have` sets above. The signature used to
+    /// exist for hijack-resistance, but under prefix routing a bucket is shared by an anonymity set
+    /// BY DESIGN (`MAILBOX_ROUTE_PREFIX_BYTES` = 1, so 256 buckets for the whole network), so
+    /// "claiming a bucket" is not a coherent theft: a false claimant receives sealed bundles it
+    /// cannot recognize and drops them, exactly as a genuine colliding member of the set does.
+    /// The limit of that argument, stated because the absolute version is wrong: a claim only ADDS
+    /// a next-hop while the bucket is under `MAX_GRADIENT_LINKS_PER_BUCKET`; at saturation the
+    /// least-recently-seen link is evicted. A genuine recipient is protected there by the eviction
+    /// ORDER rather than by the absence of eviction, since it re-beacons on a short interval and so
+    /// stays among the most-recently-seen. The residual threat is therefore gradient-pollution DoS
+    /// by a persistently-beaconing neighbour, which link authentication plus the per-link bucket cap
+    /// and the rate limit bound. The Ed25519 signature was in any case authenticating the WRONG party: an
+    /// originator three hops away that the forwarder cannot punish, instead of the neighbour it can
+    /// rate-limit and drop.
+    ///
+    /// `distance` is hops travelled from the recipient when this record arrives: the recipient
+    /// emits 0, and each forwarder re-emits at +1 (split-horizon, capped) so the gradient reaches
+    /// past a direct neighbour without a flood.
+    RecvBeacon {
+        route: crate::crypto::MailboxRoute,
+        distance: u8,
+    },
 }
 
 /// Postcard encodes this two-variant enum with a one-byte discriminant (`Bundle = 0`, `Advert = 1`).

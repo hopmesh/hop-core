@@ -159,11 +159,30 @@ pub const PREKEY_TTL_MS: u32 = 604_800_000;
 /// §39 P4 receiver-beacon: how long a laid gradient entry lives without a refresh. Kept SHORT
 /// (relative to [`PREKEY_TTL_MS`]) so a moved/silent recipient stops attracting bundles within
 /// one TTL, no permanent black-hole. Refresh interval must be well under this.
+///
+/// This is a RECEIVER-CLOCKED lease: the node that records the entry stamps it `now + this`. The
+/// beacon no longer carries `created_at`/`ttl_ms`/`seq`, so a peer cannot buy itself a far-future
+/// expiry or a supersession advantage by lying about its clock. (The old flooded advert let it: a
+/// beacon's own signed `created_at + ttl_ms` set the lease, which is why bucket eviction had to be
+/// hardened against Sybils parking slots with fresher expiries.)
 pub const RECV_BEACON_TTL_MS: u32 = 90_000;
 /// How often a "route-to-me" recipient re-emits its beacon to keep the gradient fresh. Well
 /// under [`RECV_BEACON_TTL_MS`] so a single missed beacon self-heals; the gradient tracks a
-/// mobile recipient at this cadence.
+/// mobile recipient at this cadence. Also the floor on how often a forwarder re-emits an UNCHANGED
+/// bucket (see `on_recv_beacon`).
 pub const RECV_BEACON_REFRESH_MS: u64 = 30_000;
+/// How far a receiver-beacon travels from its recipient, in link traversals. The recipient emits
+/// `distance = 0`; a node that records a beacon at distance `d` re-emits it at `d + 1`, and a
+/// beacon arriving at or past this cap is dropped without being recorded or re-emitted. That is
+/// what terminates the distance-vector loop (split-horizon alone does not, in a mesh with cycles).
+/// Past the cap a private bundle falls back to blind-flood, which is the §39 privacy floor anyway.
+pub const MAX_RECV_BEACON_DISTANCE: u8 = 3;
+/// Per-link fixed-window rate limit for inbound receiver-beacons. A legitimate peer emits its own
+/// two epoch prefixes on its refresh interval, plus at most one keep-alive per bucket it forwards
+/// (bounded by [`MAX_GRADIENT_BUCKETS_PER_LINK`]), so a real burst tops out around 64 in a window.
+/// Double that leaves headroom while still ending a line-rate flood.
+const RECV_BEACON_WINDOW_MS: u64 = 1_000;
+const MAX_RECV_BEACONS_PER_WINDOW: u32 = 128;
 /// §39 mailbox-tag rotation period (F-06). The pull pseudonym `H(address ‖ epoch)` rotates each
 /// epoch so a global observer can't correlate a recipient's mailbox across epochs. A day is long
 /// enough that a spooled bundle (pulled within minutes/hours) almost always drains inside one epoch.
@@ -301,9 +320,26 @@ const MAX_ADVERTS_PER_LINK_WINDOW: u32 = 64;
 const MAX_ADVERTS_GLOBAL_WINDOW: u32 = 512;
 const MAX_PEER_SENT: usize = 1_024;
 const PEER_SENT_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
-/// Cap on the soft-state gradient table (bounds a Sybil flooding fake mailbox-tags; signed
-/// beacons stop *hijack*, this stops *bloat*). On overflow the nearest-to-expiry entry is evicted.
+/// Global cap on the soft-state gradient table. Note this can never bind while
+/// [`crypto::MAILBOX_ROUTE_PREFIX_BYTES`] is 1: only 256 distinct route keys exist, so the table
+/// tops out two orders of magnitude below this. It is kept as a backstop for a future wider prefix,
+/// NOT as the anti-flood control. The control that actually binds is
+/// [`MAX_GRADIENT_BUCKETS_PER_LINK`], because the resource an attacker can consume is buckets *on
+/// its own link*, and nothing capped that before.
 pub const MAX_RECV_GRADIENT: usize = 4_096;
+
+/// Cap on how many route-prefix buckets ONE link may occupy in the gradient, with least-recently-
+/// seen eviction of that link's own entries.
+///
+/// This is the bound that makes an unsigned beacon safe. A hostile neighbour can mint beacons for
+/// any prefix it likes (there is no signature to stop it, and under prefix routing there is nothing
+/// coherent to forge anyway: a bucket is shared by an anonymity set by design). What it must not be
+/// able to do is claim EVERY bucket and pull the node's whole private-forwarding decision onto its
+/// own link. At 64 of the 256 buckets a single link can capture at most a quarter of the routing
+/// space, and eviction is scoped to that link's own entries so one link's grinding never displaces
+/// another link's genuine route. The cost of being capped is graceful: an unrouted prefix falls
+/// back to blind flood, which is where §39 started.
+pub const MAX_GRADIENT_BUCKETS_PER_LINK: usize = 64;
 
 /// core-protocol-r3-02: cap on remembered vaccine tokens whose target hadn't arrived yet (see
 /// `seen_vaccine_tokens`). Bounds the memory a distinct-token vaccine flood can pin; on overflow the
@@ -341,23 +377,20 @@ struct TxInfo {
 }
 
 /// §39 P4 (+ sec-priv-04): one soft-state next-hop under a mailbox **route prefix**, "a recipient in
-/// this prefix's anonymity set is reachable via `inbound`." Recorded from a signed
-/// [`AdvertKind::RecvBeacon`]; per inbound link the closest (fewest-hop), freshest (highest `seq`)
-/// beacon wins. Pruned at `expires_at`.
+/// this prefix's anonymity set is reachable via `inbound`." Recorded from an unsigned, link-local
+/// [`Wire::RecvBeacon`]; per inbound link the latest beacon wins. Pruned at `expires_at`.
 #[derive(Clone, Copy, Debug)]
 struct GradientLink {
-    /// Distance to the recipient in advert-hops (lower = closer; breaks ties when re-pointing).
+    /// Distance to the recipient in link traversals (lower = closer). Carried so a forwarder can
+    /// re-emit at `hops + 1` and so the distance cap terminates the loop.
     hops: u8,
-    /// `beacon.created_at + ttl_ms`, dropped once the clock passes this (no refresh ⇒ no route).
+    /// RECEIVER-CLOCKED lease: `our clock when we accepted the beacon + RECV_BEACON_TTL_MS`. Dropped
+    /// once our clock passes it (no refresh ⇒ no route). The peer supplies no freshness input at
+    /// all now, so it cannot park a slot with a far-future expiry.
     expires_at: u64,
-    /// The beacon's per-publisher `seq`; a strictly-higher seq supersedes on the same link.
-    seq: u64,
-    /// security-privacy-r2-04: OUR clock when we last accepted a beacon on this link. Per-bucket
-    /// overflow evicts the LEAST-RECENTLY-SEEN link (not the nearest-to-expiry one). A legitimate
-    /// recipient re-beacons on a short interval (`RECV_BEACON_REFRESH_MS`), so its link is always
-    /// recently-seen and survives; a prefix-grinding Sybil that parks a slot with a far-future TTL but
-    /// stops refreshing becomes stale-seen and is evicted first. That removes the old attack where a
-    /// Sybil fleet of fresher-expiry beacons on a victim's prefix could crowd out the victim's own link.
+    /// OUR clock when we last accepted a beacon on this link. Per-bucket overflow evicts the
+    /// LEAST-RECENTLY-SEEN link (security-privacy-r2-04), so a recipient that re-beacons on its
+    /// short interval is never crowded out by a link that claimed a slot once and went quiet.
     last_seen: u64,
 }
 
@@ -374,6 +407,12 @@ struct GradientEntry {
     /// [`MAX_GRADIENT_LINKS_PER_BUCKET`]; on overflow the LEAST-RECENTLY-SEEN link is evicted
     /// (security-privacy-r2-04), so a re-beaconing recipient is never crowded out by parked Sybils.
     links: Vec<(LinkId, GradientLink)>,
+    /// Our clock when we last re-emitted this bucket onward. A beacon that changes nothing produces
+    /// NO re-emission, so steady state is silent per arrival; but the downstream lease is soft state
+    /// that would otherwise decay to nothing within one TTL, so an unchanged bucket is still carried
+    /// onward once per [`RECV_BEACON_REFRESH_MS`]. That is the minimum keep-alive, matching the
+    /// cadence the recipient itself beacons at.
+    last_emitted_ms: u64,
 }
 
 /// Bound on distinct next-hops kept per route-prefix bucket (sec-priv-04). Small: real collisions are
@@ -886,6 +925,13 @@ pub struct Node<S: Store = MemoryStore> {
     last_regossip_ms: u64,
     /// Last time we emitted our §39 P4 receiver-beacon (re-emitted on [`RECV_BEACON_REFRESH_MS`]).
     last_recv_beacon_ms: u64,
+    /// Have we ever emitted a receiver-beacon? The beacon is a LINK-LOCAL record now, so a fresh
+    /// link starts with no knowledge of us and must be told at link-up rather than inheriting it
+    /// from the directory (the old flooded advert rode the link-up advert re-offer for free). This
+    /// gates that: a node that has never beaconed stays silent on a new link, so "passive recipient"
+    /// and "never asked to be routed to" remain genuinely quiet rather than leaking a prefix on
+    /// every connection.
+    has_beaconed: bool,
     /// "Route-to-me" mode: emit a receiver-beacon so private bundles route to us via the gradient.
     /// Default on (the common case, be reachable); a max-privacy passive recipient sets it off and
     /// only recognizes what floods past, advertising no linkable mailbox handle (DESIGN.md §39).
@@ -951,15 +997,22 @@ pub struct Node<S: Store = MemoryStore> {
     /// Per-link fixed-window counter for inbound §39 private-bundle rate limiting (F-07):
     /// `link → (window_start_ms, count)`. Bounds an unsigned-bundle flood per peer.
     priv_ingest: HashMap<LinkId, (u64, u32)>,
+    /// Per-link fixed-window counter for inbound §39 receiver-beacons: `link → (start_ms, count)`.
+    /// A beacon that changes a bucket costs a re-emission on every OTHER link plus a bundle-offer
+    /// pass, so one inbound record can become N outbound ones. Without a limit a hostile link could
+    /// drive that at line rate by alternating the distance it claims (which is a change every time).
+    /// The bucket cap bounds the TABLE; this bounds the WORK.
+    beacon_ingest: HashMap<LinkId, (u64, u32)>,
     /// Signature-verification admission, bounded per link and globally so fresh Sybil identities
     /// cannot multiply expensive advert work without bound.
     advert_ingest: HashMap<LinkId, (u64, u32)>,
     advert_ingest_global: (u64, u32),
-    /// §39 P4 soft-state routing gradient: mailbox-tag → the next hop *toward* that recipient.
-    /// Laid by recipients' signed [`AdvertKind::RecvBeacon`]s as they flood a few hops; a node
-    /// then forwards a matching **private** bundle down `inbound` instead of blind-flooding. Soft
-    /// state, pruned by `expires_at` in [`Node::tick`], superseded by a fresher/closer beacon,
-    /// capped at [`MAX_RECV_GRADIENT`]. Empty ⇒ flood fallback (the privacy floor / cold start).
+    /// §39 P4 soft-state routing gradient: mailbox route PREFIX → the next hop *toward* a recipient
+    /// in that prefix's anonymity set. Laid by link-local, unsigned [`Wire::RecvBeacon`] records as
+    /// they walk out from a recipient under a distance cap; a node then forwards a matching
+    /// **private** bundle down those links instead of blind-flooding. Soft state, pruned by
+    /// `expires_at` in [`Node::tick`], capped per link by [`MAX_GRADIENT_BUCKETS_PER_LINK`] and
+    /// globally by [`MAX_RECV_GRADIENT`]. Empty ⇒ flood fallback (the privacy floor / cold start).
     recv_gradient: HashMap<Tag, GradientEntry>,
     /// §39 P5: mailbox-tags whose recipient just (re)beaconed here, i.e. a want-beacon. The host
     /// drains these via [`take_wanted_mailboxes`] and reloads that mailbox's durable blind spool, so
@@ -1341,6 +1394,7 @@ impl<S: Store> Node<S> {
             clock_anchored: false,
             last_regossip_ms: 0,
             last_recv_beacon_ms: 0,
+            has_beaconed: false,
             route_to_me: true,
             links: HashMap::new(),
             peer_sent: HashMap::new(),
@@ -1445,6 +1499,7 @@ impl<S: Store> Node<S> {
             hps_acked: HashMap::new(),
             hps_replays: HashMap::new(),
             priv_ingest: HashMap::new(),
+            beacon_ingest: HashMap::new(),
             advert_ingest: HashMap::new(),
             advert_ingest_global: (0, 0),
             rehydrate_report: RehydrateReport::default(),
@@ -2852,12 +2907,6 @@ impl<S: Store> Node<S> {
         (self.opk_batch.publics.len(), unused, self.opk_secrets.len())
     }
 
-    /// §39 P4: publish (and gossip) this node's signed **receiver-beacon** so peers lay a
-    /// gradient toward our mailbox-tag and route private bundles to us instead of blind-flooding.
-    /// Call this when in "route-to-me" mode (a recipient that wants to be reachable deep in the
-    /// mesh / across a relay→BLE bridge); a passive recipient skips it for max privacy and just
-    /// recognizes whatever floods past. Re-published on a short interval from [`Node::tick`] so the
-    /// gradient stays fresh + tracks a mobile recipient. Returns the advert id.
     /// Select the "route-to-me" mode described on [`Node::publish_recv_beacon`]: `true` (the default)
     /// keeps the receiver-beacon fresh so peers lay a gradient toward this node's mailbox bucket;
     /// `false` is the passive, maximum-privacy recipient that emits no beacon and simply recognizes
@@ -2875,35 +2924,50 @@ impl<S: Store> Node<S> {
         self.route_to_me = on;
     }
 
-    pub fn publish_recv_beacon(&mut self) -> Result<AdvertId> {
-        // F-06: beacon the current mailbox epoch AND the past window, so a private bundle addressed
-        // or spooled under a just-rotated tag (sender a bit behind, or spooled before the boundary)
-        // is still routed and pulled. The current-epoch beacon's id is returned.
+    /// §39 P4: tell our directly-connected peers the mailbox ROUTE PREFIX to steer private bundles
+    /// toward, so they lay a gradient to us instead of blind-flooding. Call this when in
+    /// "route-to-me" mode (a recipient that wants to be reachable deep in the mesh / across a
+    /// relay-to-BLE bridge); a passive recipient skips it for max privacy and just recognizes
+    /// whatever floods past. Re-emitted on a short interval from [`Node::tick`] so the gradient
+    /// stays fresh and tracks a mobile recipient.
+    ///
+    /// What leaves the machine is one [`Wire::RecvBeacon`] per live link: the 1-byte routing prefix
+    /// and a distance, inside the link's Noise session. NOT our address, NOT the 16-byte mailbox
+    /// tag, and nothing signed or flooded. The previous implementation published an identity-signed
+    /// advert whose body carried our real address in cleartext next to the full tag, and let it
+    /// propagate three hops; every relay we connected to was one hop away and so was simply handed
+    /// "this address owns this mailbox". Nothing downstream ever consumed the full tag: the
+    /// ownership check it enabled is moot under prefix routing (see [`Wire::RecvBeacon`]), and the
+    /// gradient projected the tag to this same prefix immediately.
+    pub fn publish_recv_beacon(&mut self) {
+        self.has_beaconed = true;
+        let links: Vec<LinkId> = self.links.keys().copied().collect();
+        for link in links {
+            self.publish_recv_beacon_on(link);
+        }
+    }
+
+    /// Our own receiver-beacon on ONE link. F-06: beacon the current mailbox epoch AND the past
+    /// window, so a private bundle addressed or spooled under a just-rotated tag (sender a bit
+    /// behind, or spooled before the boundary) is still routed and pulled. Distinct epochs usually
+    /// land in distinct prefix buckets, but not always at a 1-byte prefix, hence the dedup.
+    fn publish_recv_beacon_on(&mut self, link: LinkId) {
         let addr = self.identity.address();
         let cur = mailbox_epoch(self.now_ms);
-        let mut first_id = None;
+        let mut routes: Vec<crypto::MailboxRoute> = Vec::new();
         for back in 0..=MAILBOX_EPOCH_WINDOW {
             let epoch = cur.saturating_sub(back);
-            self.advert_seq += 1;
-            let advert = Advert::publish(
-                &self.identity,
-                AdvertKind::RecvBeacon {
-                    mailbox: crypto::mailbox_tag(&addr, epoch),
-                },
-                self.now_ms,
-                RECV_BEACON_TTL_MS,
-                self.advert_seq,
-            )?;
-            let id = advert.id;
-            self.publish(advert);
-            if first_id.is_none() {
-                first_id = Some(id);
+            let route = crypto::mailbox_route(&crypto::mailbox_tag(&addr, epoch));
+            if !routes.contains(&route) {
+                routes.push(route);
             }
             if epoch == 0 {
                 break; // no older epochs exist
             }
         }
-        first_id.ok_or(Error::Crypto("no beacon emitted"))
+        for route in routes {
+            self.send_record(link, &Wire::RecvBeacon { route, distance: 0 });
+        }
     }
 
     /// Whether we hold a forward-secret session with `addr`, i.e. messages to/from
@@ -7326,9 +7390,8 @@ impl<S: Store> Node<S> {
             && now_ms.saturating_sub(self.last_recv_beacon_ms) >= RECV_BEACON_REFRESH_MS
         {
             self.last_recv_beacon_ms = now_ms;
-            // F-06: the mailbox is now bound to our address + epoch (not the prekey), so the beacon is
-            // self-verifying at the relay, no prekey coordination needed. Emits current + window epochs.
-            let _ = self.publish_recv_beacon();
+            // Emits current + window epochs, as the route PREFIX only. Nothing identifying leaves.
+            self.publish_recv_beacon();
             self.beaconed_tick = true; // observability: emitted a recv-beacon this tick (see drain_beaconed)
         }
         // Retry any content still waiting on a prekey (it gossips, §25).
@@ -7583,6 +7646,7 @@ impl<S: Store> Node<S> {
                 }
                 self.priv_ingest.remove(&link); // F-07: drop the rate-limit counter for a dead link
                 self.advert_ingest.remove(&link);
+                self.beacon_ingest.remove(&link);
             }
             BearerEvent::Data(link, bytes) => self.on_data(link, bytes),
         }
@@ -7730,6 +7794,13 @@ impl<S: Store> Node<S> {
                 ids.truncate(MAX_HAVE_ADVERTISE);
                 self.send_record(link, &Wire::Have(crate::store::HaveSet { ids }));
             }
+            // §39 P4: beacon our mailbox route prefix on this fresh link immediately. The old
+            // flooded beacon rode the advert re-offer above and so reached a new peer at link-up for
+            // free; a link-local record has to be sent explicitly, or a reconnecting peer would
+            // blind-flood everything addressed to us until our next 30s refresh.
+            if self.route_to_me && self.has_beaconed {
+                self.publish_recv_beacon_on(link);
+            }
             // Adverts (prekeys + presence) FIRST, then bulk bundles: a peer needs our prekey to
             // open a forward-secret session to us, so it must not sit behind a burst of relay-bundle
             // offers on a rate-limited BLE link (that head-of-line blocking delayed "Securing").
@@ -7776,6 +7847,7 @@ impl<S: Store> Node<S> {
             }
             Ok(Wire::Advert(a)) => self.on_advert(link, peer, a),
             Ok(Wire::Have(hs)) => self.on_have(link, hs),
+            Ok(Wire::RecvBeacon { route, distance }) => self.on_recv_beacon(link, route, distance),
             Err(_) => {}
         }
     }
@@ -7833,6 +7905,9 @@ impl<S: Store> Node<S> {
                 }
                 Ok(Wire::Advert(a)) => self.on_advert(link, peer, a),
                 Ok(Wire::Have(hs)) => self.on_have(link, hs),
+                Ok(Wire::RecvBeacon { route, distance }) => {
+                    self.on_recv_beacon(link, route, distance)
+                }
                 Err(_) => {}
             }
         }
@@ -8827,19 +8902,8 @@ impl<S: Store> Node<S> {
         // bounded relay cache). Re-gossip only when newly accepted.
         let is_prekey = matches!(advert.body.kind, AdvertKind::PreKey { .. });
         let prekey_publisher = advert.body.publisher;
-        // §39 P4: a signed receiver-beacon lays/refreshes a gradient toward its mailbox via the
-        // link we heard it on. Read its fields (and the publisher) before `ingest` consumes it.
-        let beacon = match advert.body.kind {
-            AdvertKind::RecvBeacon { mailbox, .. } => Some((
-                mailbox,
-                advert.body.publisher,
-                advert.hops,
-                advert.body.created_at,
-                advert.body.ttl_ms,
-                advert.body.seq,
-            )),
-            _ => None,
-        };
+        // (The §39 receiver-beacon used to be decoded out of the advert here. It is no longer an
+        // advert at all: see `Node::on_recv_beacon`.)
         let accepted = self.directory.ingest(advert, self.now_ms).unwrap_or(false);
         self.forget_evicted_adverts();
         if accepted {
@@ -8854,78 +8918,102 @@ impl<S: Store> Node<S> {
                 self.heal_session_against_fresh_prekey(prekey_publisher);
                 self.flush_pending_content();
             }
-            if let Some((mailbox, publisher, hops, created_at, ttl_ms, seq)) = beacon {
-                // F-05 + F-06: bind the beacon to its owner before laying a gradient. The mailbox tag
-                // is `H(address ‖ epoch)`, and a beacon is identity-signed by that address, so a node
-                // can only beacon a mailbox it can compute for ITS OWN address, an attacker can't
-                // forge a victim's mailbox because it can't sign an advert as the victim (`directory
-                // .ingest` already verified the signature, so `publisher` is authentic here). Accept
-                // the current epoch and the recent window, so a just-rotated tag still routes.
-                let cur = mailbox_epoch(self.now_ms);
-                let owns_mailbox = (0..=MAILBOX_EPOCH_WINDOW).any(|back| {
-                    crypto::mailbox_tag(&publisher, cur.saturating_sub(back)) == mailbox
-                });
-                if owns_mailbox {
-                    // sec-priv-04: the beacon carried (and we authenticated against) the FULL tag, but
-                    // the gradient/want-beacon keys on the routing PREFIX so an address-knower who sees
-                    // this gradient only learns an anonymity-set membership, not the exact recipient.
-                    self.record_gradient(
-                        route_key(&mailbox),
-                        from_link,
-                        hops,
-                        created_at,
-                        ttl_ms,
-                        seq,
-                    );
-                }
-            }
         }
     }
 
-    /// §39 P4 (+ sec-priv-04): record/refresh a routing next-hop from a verified receiver-beacon, a
-    /// recipient in `mailbox`'s prefix anonymity set is reachable via `from_link`. Per link the freshest
-    /// (higher `seq`, then fewer hops) beacon wins; a moved recipient re-points its own link, and a
-    /// DISTINCT colliding recipient on another link adds a second next-hop (both are then served, so a
-    /// collision can't starve either). After recording, immediately re-offer any already-HELD private
-    /// bundles down the new link; without this, a bundle parked before the gradient existed waits
-    /// forever (the relay already deduped it on the bridge link at link-up).
-    fn record_gradient(
-        &mut self,
-        // sec-priv-04: this is the ROUTING KEY (a `route_key`-projected mailbox prefix), NOT the full
-        // tag. The caller authenticated the full tag against the beacon publisher before projecting.
-        mailbox: Tag,
-        from_link: LinkId,
-        hops: u8,
-        created_at: u64,
-        ttl_ms: u32,
-        seq: u64,
-    ) {
-        let expires_at = created_at.saturating_add(ttl_ms as u64);
-        if expires_at <= self.now_ms {
-            return; // already stale on arrival
+    /// §39 P4: an unsigned, link-local receiver-beacon arrived on `from_link`. Lay/refresh the
+    /// gradient for its route prefix and, only if that CHANGED something, carry it one hop onward.
+    ///
+    /// There is no signature and no publisher to authenticate here, by design (see
+    /// [`Wire::RecvBeacon`]): the claim is scoped to the authenticated Noise link it arrived on, and
+    /// what it claims is a shared anonymity-set bucket, not a private name. Three things bound it:
+    /// the distance cap terminates the distance-vector loop, split-horizon stops the trivial
+    /// two-node ping-pong, and [`MAX_GRADIENT_BUCKETS_PER_LINK`] stops one link owning the table.
+    fn on_recv_beacon(&mut self, from_link: LinkId, route: crypto::MailboxRoute, distance: u8) {
+        if distance >= MAX_RECV_BEACON_DISTANCE {
+            return; // at/past the radius: neither recorded nor carried onward
         }
+        if !self.allow_beacon_ingest(from_link) {
+            return;
+        }
+        let key = route_key_from_prefix(&route);
+        let changed = self.record_gradient(key, from_link, distance);
+        // Soft state downstream would decay within one TTL if we only ever spoke on change, so an
+        // unchanged bucket is still carried onward once per refresh interval. That keeps steady
+        // state silent per ARRIVAL (the property that stops a beacon storm amplifying) without
+        // letting a two-hop gradient quietly rot back to a one-hop one.
+        let due = self.recv_gradient.get(&key).is_some_and(|e| {
+            self.now_ms.saturating_sub(e.last_emitted_ms) >= RECV_BEACON_REFRESH_MS
+        });
+        if !changed && !due {
+            return;
+        }
+        if let Some(entry) = self.recv_gradient.get_mut(&key) {
+            entry.last_emitted_ms = self.now_ms;
+        }
+        let onward = distance.saturating_add(1);
+        if onward >= MAX_RECV_BEACON_DISTANCE {
+            return;
+        }
+        // Split-horizon: never advertise a route back down the link we learned it from, which would
+        // otherwise let two nodes convince each other of a route to nowhere.
+        let links: Vec<LinkId> = self
+            .links
+            .keys()
+            .copied()
+            .filter(|l| *l != from_link)
+            .collect();
+        for link in links {
+            self.send_record(
+                link,
+                &Wire::RecvBeacon {
+                    route,
+                    distance: onward,
+                },
+            );
+        }
+    }
+
+    /// §39 P4 (+ sec-priv-04): record/refresh a routing next-hop from a receiver-beacon, "a recipient
+    /// in `mailbox`'s prefix anonymity set is reachable via `from_link`". A moved recipient re-points
+    /// its own link, and a DISTINCT colliding recipient on another link adds a second next-hop (both
+    /// are then served, so a collision can't starve either). After recording a change, immediately
+    /// re-offer any already-HELD private bundles down the link; without this, a bundle parked before
+    /// the gradient existed waits forever (the relay already deduped it on the bridge link at link-up).
+    ///
+    /// Returns whether the bucket actually changed (a new next-hop, or a different distance on an
+    /// existing one). A bare keep-alive returns false: it refreshes the lease but must not re-queue
+    /// the want-beacon, re-offer bundles, or trigger a re-emission.
+    ///
+    /// Freshness is entirely OURS. The old signature took the beacon's `created_at`, `ttl_ms` and
+    /// `seq` and let them set the lease and decide supersession, which handed a peer three levers to
+    /// pull: a far-future expiry to park a slot, and an ever-rising `seq` to win every contest. All
+    /// three are gone; the lease is `now + RECV_BEACON_TTL_MS` on our own clock and the newest
+    /// beacon on a link simply wins that link's slot.
+    fn record_gradient(&mut self, mailbox: Tag, from_link: LinkId, hops: u8) -> bool {
         let fresh = GradientLink {
             hops,
-            expires_at,
-            seq,
+            expires_at: self.now_ms.saturating_add(RECV_BEACON_TTL_MS as u64),
             last_seen: self.now_ms,
         };
-        // Would this beacon actually change the bucket? (Fresher than the same link's current entry, or
-        // a brand-new link.) If not, skip so a bare refresh doesn't re-queue the want-beacon / re-offer.
-        let changes = match self.recv_gradient.get(&mailbox) {
+        let changed = match self.recv_gradient.get(&mailbox) {
             Some(e) => match e.links.iter().find(|(l, _)| *l == from_link) {
-                Some((_, cur)) => seq > cur.seq || (seq == cur.seq && hops < cur.hops),
+                Some((_, cur)) => cur.hops != hops,
                 None => true,
             },
             None => true,
         };
-        if !changes {
-            return;
+        let is_new_bucket_for_link = !self
+            .recv_gradient
+            .get(&mailbox)
+            .is_some_and(|e| e.links.iter().any(|(l, _)| *l == from_link));
+        if is_new_bucket_for_link {
+            self.evict_for_link_bucket_cap(from_link);
         }
         if self.recv_gradient.len() >= MAX_RECV_GRADIENT
             && !self.recv_gradient.contains_key(&mailbox)
         {
-            // Bound the table (Sybil): evict the bucket whose soonest-expiring link is nearest to expiry.
+            // Backstop only (unreachable at a 1-byte prefix): evict the bucket nearest to expiry.
             if let Some(victim) = self
                 .recv_gradient
                 .iter()
@@ -8939,14 +9027,13 @@ impl<S: Store> Node<S> {
         match entry.links.iter_mut().find(|(l, _)| *l == from_link) {
             Some((_, cur)) => *cur = fresh, // freshen this next-hop in place
             None => {
-                // A new next-hop in the anonymity set. Bound the per-bucket fan-out (Sybil): if full,
-                // evict the LEAST-RECENTLY-SEEN existing link before adding this one (security-privacy-
-                // r2-04). Using recency, not nearest-to-expiry, means a prefix-grinding Sybil cannot crowd
-                // out a legitimately re-beaconing recipient: that recipient refreshes on a short interval,
-                // so its link is always among the most-recently-seen, while a Sybil that merely parks a
-                // slot with a far-future TTL goes stale-seen and is the one evicted. The newcomer we are
-                // adding is by definition the most-recently-seen (last_seen == now), so this never evicts
-                // a link fresher than the one we admit.
+                // A new next-hop in the anonymity set. Bound the per-bucket fan-out: if full, evict
+                // the LEAST-RECENTLY-SEEN existing link before adding this one (security-privacy-
+                // r2-04). Using recency means a prefix-grinding neighbour cannot crowd out a
+                // legitimately re-beaconing recipient: that recipient refreshes on a short interval,
+                // so its link is always among the most-recently-seen, while a link that claimed a
+                // slot once and went quiet goes stale-seen and is the one evicted. The newcomer is
+                // by definition the most-recently-seen, so this never evicts a fresher link.
                 if entry.links.len() >= MAX_GRADIENT_LINKS_PER_BUCKET {
                     if let Some(idx) = entry
                         .links
@@ -8961,9 +9048,12 @@ impl<S: Store> Node<S> {
                 entry.links.push((from_link, fresh));
             }
         }
+        if !changed {
+            return false;
+        }
         // §39 P5: a newly-accepted beacon IS a want-beacon; surface the mailbox so the host reloads
         // its durable blind spool (an offline-deposited bundle is pulled the moment we hear from the
-        // recipient). Bounded so a beacon storm can't grow this unboundedly; a dropped tag just waits
+        // recipient). Bounded so a beacon storm can't grow this unboundedly; a dropped tag just waits.
         // Dedup against the WHOLE queue, not just its tail. Tail-only dedup let two buckets
         // alternating (A, B, A, B, ...) fill this to MAX_RECV_GRADIENT entries holding two distinct
         // values, and the host does one durable spool listing PER ENTRY
@@ -8980,6 +9070,60 @@ impl<S: Store> Node<S> {
         // The fix for the live "held=95 never drains" bug: a freshly-laid gradient is a NEW
         // trigger to push parked private bundles toward the recipient, not just at link-up.
         self.offer_bundles_to_link(from_link);
+        true
+    }
+
+    /// Fixed-window per-link rate limit for inbound receiver-beacons. Returns false (drop) once this
+    /// link has exceeded [`MAX_RECV_BEACONS_PER_WINDOW`] in the current window. `LOCAL_LINK` is our
+    /// own re-injection path and is never limited, matching `allow_private_ingest`.
+    fn allow_beacon_ingest(&mut self, from_link: LinkId) -> bool {
+        if from_link == LOCAL_LINK {
+            return true;
+        }
+        let now = self.now_ms;
+        let (start, count) = self.beacon_ingest.entry(from_link).or_insert((now, 0));
+        if now.saturating_sub(*start) >= RECV_BEACON_WINDOW_MS {
+            *start = now;
+            *count = 0;
+        }
+        *count += 1;
+        *count <= MAX_RECV_BEACONS_PER_WINDOW
+    }
+
+    /// Enforce [`MAX_GRADIENT_BUCKETS_PER_LINK`] before `from_link` claims one more bucket: while it
+    /// is at the cap, drop its own least-recently-seen entry (and any bucket that leaves empty).
+    ///
+    /// Eviction is scoped to this link's entries on purpose. A global "evict something" would let a
+    /// hostile neighbour spend its own quota to delete OTHER links' genuine routes, converting a
+    /// bounded nuisance into a targeted black-hole. Scanning every bucket is cheap: the table holds
+    /// at most `256 ^ MAILBOX_ROUTE_PREFIX_BYTES` keys and today that is 256.
+    fn evict_for_link_bucket_cap(&mut self, from_link: LinkId) {
+        loop {
+            let mut occupied: Vec<(Tag, u64)> = self
+                .recv_gradient
+                .iter()
+                .filter_map(|(key, entry)| {
+                    entry
+                        .links
+                        .iter()
+                        .find(|(l, _)| *l == from_link)
+                        .map(|(_, gl)| (*key, gl.last_seen))
+                })
+                .collect();
+            if occupied.len() < MAX_GRADIENT_BUCKETS_PER_LINK {
+                return;
+            }
+            occupied.sort_by_key(|(key, last_seen)| (*last_seen, *key));
+            let Some((victim, _)) = occupied.first().copied() else {
+                return;
+            };
+            if let Some(entry) = self.recv_gradient.get_mut(&victim) {
+                entry.links.retain(|(l, _)| *l != from_link);
+                if entry.links.is_empty() {
+                    self.recv_gradient.remove(&victim);
+                }
+            }
+        }
     }
 
     // --- outbound offers ------------------------------------------------------
@@ -13744,7 +13888,7 @@ mod tests {
         // WITHOUT being flooded to the decoy D: directed delivery, not blind flood.
         let (mut nodes, mut net) = gradient_topology();
 
-        nodes[2].publish_recv_beacon().unwrap(); // B in "route-to-me" mode
+        nodes[2].publish_recv_beacon(); // B in "route-to-me" mode
         net.pump(&mut nodes);
 
         // R laid a gradient toward B's mailbox, pointing at the R-B link (R's link 2).
@@ -13795,7 +13939,7 @@ mod tests {
             n.tick(MAILBOX_EPOCH_MS); // all clocks in epoch 1
         }
         let baddr = nodes[2].address();
-        nodes[2].publish_recv_beacon().unwrap();
+        nodes[2].publish_recv_beacon();
         net.pump(&mut nodes);
 
         // sec-priv-04: gradient keys on the tag's routing prefix (route_key).
@@ -13814,53 +13958,260 @@ mod tests {
     }
 
     #[test]
-    fn beacon_cannot_hijack_another_nodes_mailbox() {
-        // F-05: a beacon signed by a NON-owner must not lay a gradient for a victim's mailbox.
-        // The mailbox tag is H(SPK) and the SPK is public, so Mallory can name B's mailbox, but
-        // the gradient only installs if the mailbox matches the *publisher's own* prekey.
+    fn a_bucket_claim_from_a_non_recipient_cannot_black_hole_the_real_one() {
+        // This replaces `beacon_cannot_hijack_another_nodes_mailbox`, which asserted that an
+        // identity signature stopped a "hijack". Under prefix routing there is nothing coherent to
+        // steal: MAILBOX_ROUTE_PREFIX_BYTES = 1, so a bucket is shared by an anonymity set BY
+        // DESIGN and a claimant that is not the recipient is indistinguishable from a genuine
+        // colliding member of the set. What actually has to hold is the DELIVERY property: a
+        // claimant joining the victim's bucket must not divert the victim's traffic, and the copy it
+        // receives must be useless to it.
+        //
+        // SCOPE, because the test name is stronger than what one hostile claim can prove: this
+        // exercises the UNSATURATED case, where a claim adds a next-hop beside the genuine one. It
+        // does NOT prove the saturated case. `MAX_GRADIENT_LINKS_PER_BUCKET` is 8 and
+        // `record_gradient` evicts the least-recently-seen link on overflow, so a neighbour willing
+        // to keep beaconing can displace a link. What stops that displacing the RECIPIENT is the
+        // recency order (it re-beacons on a short interval), which is a different property with its
+        // own coverage in the rate-limit and bucket-cap tests.
+        //
+        // D (the decoy, on R's link 3) claims B's bucket. R must then serve BOTH links, so B still
+        // gets the message, and D holds a sealed copy it cannot recognize or open.
         let (mut nodes, mut net) = gradient_topology();
-        let bmail = crypto::mailbox_tag(&nodes[2].address(), 0); // B's mailbox
-        let now = nodes[1].now_ms;
+        let bmail = route_key(&crypto::mailbox_tag(&nodes[2].address(), 0));
 
-        // Mallory is a participant R knows (R has her legit prekey), but she is not B.
-        let mallory = Identity::generate();
-        let mspk = mallory.derive_prekey();
-        let pk = Advert::publish(
-            &mallory,
-            AdvertKind::PreKey {
-                spk_pub: mspk.public,
-                spk_sig: mspk.sig.to_vec(),
-                opks: Vec::new(),
-                opk_sig: Vec::new(),
-            },
-            now,
-            10_000_000,
-            1,
-        )
-        .unwrap();
-        nodes[1].on_advert(3, mallory.address(), pk);
+        nodes[2].publish_recv_beacon(); // the genuine recipient
+        net.pump(&mut nodes);
+        // The claim: D's link asserts the same prefix bucket. Injected at the record layer because
+        // this is exactly what a hostile neighbour can emit; there is no signature to forge.
+        nodes[1].on_recv_beacon(3, crypto::mailbox_route(&bmail), 0);
 
-        // Mallory forges a receiver-beacon claiming B's mailbox, signed with her own identity.
-        let forged = Advert::publish(
-            &mallory,
-            AdvertKind::RecvBeacon { mailbox: bmail },
-            now,
-            10_000_000,
-            2,
-        )
-        .unwrap();
-        nodes[1].on_advert(3, mallory.address(), forged);
+        let links: Vec<LinkId> = nodes[1].recv_gradient[&bmail]
+            .links
+            .iter()
+            .map(|(l, _)| *l)
+            .collect();
         assert!(
-            !nodes[1].recv_gradient.contains_key(&route_key(&bmail)),
-            "a beacon signed by a non-owner must NOT lay a gradient for the victim's mailbox"
+            links.contains(&2) && links.contains(&3),
+            "a bucket claim ADDS a next-hop, it never replaces the genuine one: {links:?}"
         );
 
-        // Control: B's own beacon still lays the gradient (the fix doesn't break legit beacons).
-        nodes[2].publish_recv_beacon().unwrap();
+        let bob = nodes[2].address();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"still-arrives".to_vec(), false)
+            .unwrap();
         net.pump(&mut nodes);
+
+        assert_eq!(
+            nodes[2].take_inbox().len(),
+            1,
+            "the genuine recipient still receives: the claim cannot black-hole the bucket"
+        );
         assert!(
-            nodes[1].recv_gradient.contains_key(&route_key(&bmail)),
-            "B's own beacon (mailbox matches B's prekey) still lays the gradient"
+            nodes[3].take_inbox().is_empty(),
+            "the false claimant gets a sealed copy it cannot recognize, so nothing is delivered to it"
+        );
+        let held = nodes[3]
+            .store
+            .get(&id)
+            .expect("the false claimant did receive a copy down its claimed link");
+        assert!(
+            nodes[3].open(&held).is_err(),
+            "and it cannot open that copy either: the seal, not the routing, is what protects it"
+        );
+    }
+
+    #[test]
+    fn a_receiver_beacon_puts_neither_an_address_nor_a_full_mailbox_tag_on_the_wire() {
+        // THE property this whole change exists for. The old beacon was an advert, so every copy
+        // carried `AdvertBody.publisher` (the recipient's real Ed25519 address, cleartext) next to
+        // the FULL 16-byte mailbox tag, identity-signed, three hops deep. Any relay you connected to
+        // was one hop away and was handed the address-to-mailbox map outright.
+        //
+        // Asserted on the real framed record bytes, not on the struct: decrypt what the beaconing
+        // node actually queued for the wire, using the peer's own link session, and search the
+        // plaintext for both secrets. (Decrypting here desyncs R's ratchet, which is fine: this test
+        // ends at the assertion.)
+        let (mut nodes, mut net) = gradient_topology();
+        net.pump(&mut nodes); // quiesce, so what we drain below is the beacon and nothing else
+        let _ = nodes[2].drain_outgoing();
+
+        let addr = nodes[2].address();
+        let full_tag = crypto::mailbox_tag(&addr, 0);
+        nodes[2].publish_recv_beacon();
+        let queued = nodes[2].drain_outgoing();
+        assert!(
+            !queued.is_empty(),
+            "the beacon really did put bytes on the wire"
+        );
+
+        for (link, bytes) in queued {
+            assert_eq!(link, 2, "B's only link is the one to R");
+            let Some(LinkPacket::Data(ct)) = decode_link_packet(&bytes) else {
+                panic!("a beacon fits one unfragmented link record");
+            };
+            let Some(LinkState::Up(est)) = nodes[1].links.get_mut(&2) else {
+                panic!("R holds the peer end of the link");
+            };
+            let plaintext = est.session.decrypt(&ct).expect("R can decrypt it");
+            match postcard::from_bytes::<Wire>(&plaintext) {
+                Ok(Wire::RecvBeacon { distance, .. }) => assert_eq!(distance, 0),
+                _ => panic!("a beaconing node emits only RecvBeacon records here"),
+            }
+            assert!(
+                !plaintext.windows(addr.len()).any(|w| w == addr),
+                "the beacon must not carry the recipient's address"
+            );
+            assert!(
+                !plaintext.windows(crypto::TAG_LEN).any(|w| w == full_tag),
+                "the beacon must not carry the full mailbox tag, only its routing prefix"
+            );
+            assert!(
+                plaintext.len() < 8,
+                "and it is a handful of bytes, not an advert: {} bytes",
+                plaintext.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_beacon_walks_past_the_direct_neighbour_and_stops_at_the_distance_cap() {
+        // The gradient has to reach further than one hop (that is what makes a relay-bridged
+        // recipient routable at all), and it has to STOP, or an unsigned record in a mesh with
+        // cycles is a broadcast storm. A line B - n1 - n2 - n3 - n4: distances 0, 1, 2 are recorded
+        // and n4, which would be distance 3, is never told.
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 B, the recipient
+            Node::new(Identity::generate()), // 1
+            Node::new(Identity::generate()), // 2
+            Node::new(Identity::generate()), // 3
+            Node::new(Identity::generate()), // 4
+        ];
+        let mut net = Wire2::new();
+        for i in 0..4 {
+            net.connect(&mut nodes, i, (i + 1) as LinkId, i + 1, (i + 10) as LinkId);
+        }
+        let bucket = route_key(&crypto::mailbox_tag(&nodes[0].address(), 0));
+
+        nodes[0].publish_recv_beacon();
+        net.pump(&mut nodes);
+
+        let hops_at = |n: &Node| {
+            n.recv_gradient
+                .get(&bucket)
+                .and_then(|e| e.links.iter().map(|(_, l)| l.hops).min())
+        };
+        assert_eq!(hops_at(&nodes[1]), Some(0), "the direct neighbour");
+        assert_eq!(hops_at(&nodes[2]), Some(1), "one re-emission out");
+        assert_eq!(hops_at(&nodes[3]), Some(2), "two re-emissions out");
+        assert_eq!(
+            hops_at(&nodes[4]),
+            None,
+            "distance {MAX_RECV_BEACON_DISTANCE} is the wall: the loop terminates"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_bucket_is_not_re_emitted_until_the_keep_alive_is_due() {
+        // Steady state has to be silent, or every refresh from every recipient would ripple through
+        // the mesh. But the downstream lease is soft state, so an unchanged bucket still has to be
+        // carried onward once per refresh interval or a multi-hop gradient quietly rots back to a
+        // one-hop one. Both halves are asserted here.
+        let (mut nodes, mut net) = gradient_topology();
+        net.pump(&mut nodes);
+        let _ = nodes[1].drain_outgoing();
+        let route = crypto::mailbox_route(&crypto::mailbox_tag(&nodes[2].address(), 0));
+
+        nodes[1].on_recv_beacon(2, route, 0);
+        assert!(
+            !nodes[1].drain_outgoing().is_empty(),
+            "a NEW bucket is carried onward to the other links"
+        );
+
+        nodes[1].on_recv_beacon(2, route, 0);
+        assert!(
+            nodes[1].drain_outgoing().is_empty(),
+            "an identical beacon changes nothing, so it is not re-emitted"
+        );
+
+        nodes[1].set_time(RECV_BEACON_REFRESH_MS);
+        nodes[1].on_recv_beacon(2, route, 0);
+        assert!(
+            !nodes[1].drain_outgoing().is_empty(),
+            "once the keep-alive is due the unchanged bucket goes out again"
+        );
+    }
+
+    #[test]
+    fn a_beacon_flood_on_one_link_is_rate_limited() {
+        // A beacon that changes a bucket costs a re-emission on every other link plus a bundle-offer
+        // pass, so one inbound record becomes N outbound ones. A hostile link can make every record
+        // count as a change (just alternate the distance it claims), so the amplification has to be
+        // rate-limited, not merely deduped.
+        let (mut nodes, mut net) = gradient_topology();
+        net.pump(&mut nodes);
+        let route = crypto::mailbox_route(&crypto::mailbox_tag(&nodes[2].address(), 0));
+
+        let attempts = MAX_RECV_BEACONS_PER_WINDOW * 4;
+        let mut emitted = 0usize;
+        for i in 0..attempts {
+            let _ = nodes[1].drain_outgoing();
+            // Alternating distance means `changed` is true on every single one, so nothing but the
+            // rate limit can stop the amplification.
+            nodes[1].on_recv_beacon(3, route, (i % 2) as u8);
+            emitted += nodes[1].drain_outgoing().len();
+        }
+        // R has three links, so an admitted beacon on link 3 re-emits on the two others.
+        assert!(
+            emitted <= MAX_RECV_BEACONS_PER_WINDOW as usize * 2,
+            "amplification is bounded by the window cap, got {emitted} records from {attempts} beacons"
+        );
+        assert!(
+            emitted > 0,
+            "and the limit is a cap, not a mute: admitted beacons still propagate"
+        );
+    }
+
+    #[test]
+    fn one_link_cannot_occupy_unbounded_gradient_buckets() {
+        // Nothing capped this before: MAX_RECV_GRADIENT is 4096 while only 256 route keys can exist
+        // at a 1-byte prefix, so the global cap could never bind and a single hostile neighbour could
+        // claim EVERY bucket and pull the node's whole private-forwarding decision onto its own link.
+        // Now one link is bounded to MAX_GRADIENT_BUCKETS_PER_LINK, evicting its OWN least-recently-
+        // seen entries, and a genuine route learned from a different link is untouched by the grind.
+        let mut relay = Node::new(Identity::generate());
+        relay.set_time(1_000);
+        let genuine_link: LinkId = 7;
+        let hostile_link: LinkId = 42;
+
+        let mut victim_route = [0u8; crypto::MAILBOX_ROUTE_PREFIX_BYTES];
+        victim_route[0] = 0xfe;
+        let victim_bucket = route_key_from_prefix(&victim_route);
+        relay.record_gradient(victim_bucket, genuine_link, 0);
+
+        // The grind: claim far more buckets than the cap, each one a distinct prefix.
+        for i in 0..200u16 {
+            let mut route = [0u8; crypto::MAILBOX_ROUTE_PREFIX_BYTES];
+            route[0] = i as u8;
+            relay.set_time(1_000 + i as u64);
+            relay.record_gradient(route_key_from_prefix(&route), hostile_link, 0);
+        }
+
+        let occupied = relay
+            .recv_gradient
+            .values()
+            .filter(|e| e.links.iter().any(|(l, _)| *l == hostile_link))
+            .count();
+        assert_eq!(
+            occupied, MAX_GRADIENT_BUCKETS_PER_LINK,
+            "one link is held to its bucket quota no matter how many prefixes it claims"
+        );
+        assert!(
+            relay
+                .recv_gradient
+                .get(&victim_bucket)
+                .is_some_and(|e| e.links.iter().any(|(l, _)| *l == genuine_link)),
+            "eviction is scoped to the grinding link's own entries, so a genuine route survives"
         );
     }
 
@@ -14218,7 +14569,7 @@ mod tests {
         // Soft state: once B stops beaconing, its gradient entry expires (no permanent black-hole).
         // A subsequent private send then falls back to flood rather than dead-ending on a stale path.
         let (mut nodes, mut net) = gradient_topology();
-        nodes[2].publish_recv_beacon().unwrap();
+        nodes[2].publish_recv_beacon();
         net.pump(&mut nodes);
         let bmail = route_key(&crypto::mailbox_tag(&nodes[2].address(), 0));
         assert!(nodes[1].recv_gradient.contains_key(&bmail), "gradient laid");
@@ -14351,7 +14702,7 @@ mod tests {
         net.connect(&mut nodes, 0, 1, 1, 1); // relay <-> bob
         nodes[1].publish_prekey().unwrap();
         net.pump(&mut nodes); // relay learns bob's prekey
-        nodes[1].publish_recv_beacon().unwrap();
+        nodes[1].publish_recv_beacon();
         net.pump(&mut nodes);
 
         // The relay laid a gradient toward bob AND surfaced his mailbox as a want-beacon (pull trigger).
@@ -14495,8 +14846,8 @@ mod tests {
         // Both recipients go "route-to-me". Because their tags share a prefix, R holds exactly ONE
         // gradient bucket for the pair; an observer of R's gradient sees the prefix, not which of the
         // two (or any other colliding address) is behind it.
-        nodes[2].publish_recv_beacon().unwrap();
-        nodes[3].publish_recv_beacon().unwrap();
+        nodes[2].publish_recv_beacon();
+        nodes[3].publish_recv_beacon();
         net.pump(&mut nodes);
         let bucket = route_key(&t1);
         assert!(
@@ -14550,25 +14901,25 @@ mod tests {
 
     #[test]
     fn a_re_beaconing_recipient_is_not_evicted_from_its_bucket_by_parked_sybils() {
-        // security-privacy-r2-04: a Sybil can grind identities colliding on a victim's 2-byte prefix and
-        // beacon them from distinct links to fill the per-bucket fan-out. The OLD eviction (nearest-to-
-        // expiry) let a fleet of fresher-expiry Sybil beacons crowd out the victim's own link. The fix
-        // evicts the LEAST-RECENTLY-SEEN link instead: a recipient that re-beacons on its short interval
-        // stays recently-seen and survives, while parked Sybils (stale last_seen) are evicted first.
+        // security-privacy-r2-04: a Sybil can beacon a victim's prefix from distinct links to fill the
+        // per-bucket fan-out. The OLD eviction (nearest-to-expiry) let a fleet of beacons carrying a
+        // fresher self-declared expiry crowd out the victim's own link. Two things now stop that: the
+        // lease is receiver-clocked, so a peer cannot declare an expiry at all, and eviction picks the
+        // LEAST-RECENTLY-SEEN link, so a recipient that re-beacons on its short interval survives while
+        // links that claimed a slot once and went quiet are evicted first.
         let mut relay = Node::new(Identity::generate());
         let bucket = route_key(&crypto::mailbox_tag(&Identity::generate().address(), 0));
         let victim_link: LinkId = 999;
-        let ttl = 60_000u32;
 
         // The victim beacons FIRST (t=0), claiming its slot.
         relay.set_time(0);
-        relay.record_gradient(bucket, victim_link, 1, 0, ttl, 1);
+        relay.record_gradient(bucket, victim_link, 1);
 
-        // A Sybil fleet parks the remaining 7 slots at t=1000 with FAR-FUTURE expiry (a longer TTL):
-        // under nearest-to-expiry eviction these fresher-expiry links would outrank the victim's.
+        // A Sybil fleet parks the remaining slots at t=1000. (Under the old scheme each of these
+        // carried its own far-future TTL and so outranked the victim under nearest-to-expiry eviction.)
         relay.set_time(1_000);
         for i in 0..(MAX_GRADIENT_LINKS_PER_BUCKET - 1) {
-            relay.record_gradient(bucket, 1_000 + i as LinkId, 3, 1_000, ttl * 10, 1);
+            relay.record_gradient(bucket, 1_000 + i as LinkId, 3);
         }
         assert_eq!(
             relay.recv_gradient[&bucket].links.len(),
@@ -14578,11 +14929,11 @@ mod tests {
 
         // The victim RE-BEACONS on its short interval (t=2000): it is now the MOST-recently-seen link.
         relay.set_time(2_000);
-        relay.record_gradient(bucket, victim_link, 1, 2_000, ttl, 2);
+        relay.record_gradient(bucket, victim_link, 1);
 
         // One MORE Sybil arrives on a fresh link (t=3000), overflowing the bucket → an eviction fires.
         relay.set_time(3_000);
-        relay.record_gradient(bucket, 2_000 as LinkId, 3, 3_000, ttl * 10, 1);
+        relay.record_gradient(bucket, 2_000 as LinkId, 3);
 
         // The victim's link MUST survive; the evicted one is a stale-seen parked Sybil, not the victim.
         assert!(
@@ -14683,7 +15034,7 @@ mod tests {
 
         // Only the ACTIVE colliding recipient B1 beacons. R lays a gradient for the shared prefix bucket
         // with exactly B1's link; B2, being passive, is NOT in it.
-        nodes[2].publish_recv_beacon().unwrap();
+        nodes[2].publish_recv_beacon();
         net.pump(&mut nodes);
         assert!(
             nodes[1].recv_gradient.contains_key(&b2_route),
@@ -14729,7 +15080,7 @@ mod tests {
         net2.connect(&mut nodes2, 0, 5, 1, 5); // R(node 0, link 5) <-> B2(node 1, link 5)
         nodes2[1].publish_prekey().unwrap();
         net2.pump(&mut nodes2);
-        nodes2[1].publish_recv_beacon().unwrap();
+        nodes2[1].publish_recv_beacon();
         net2.pump(&mut nodes2);
         // Host reloads the durable spool for the wanted mailbox and re-ingests it (§39 P5).
         assert!(
@@ -14776,7 +15127,7 @@ mod tests {
         nodes[2].publish_prekey().unwrap();
         net.pump(&mut nodes);
         inject_prekey(&mut nodes[0], &b2);
-        nodes[2].publish_recv_beacon().unwrap(); // only the active decoy beacons
+        nodes[2].publish_recv_beacon(); // only the active decoy beacons
         net.pump(&mut nodes);
 
         nodes[0]
@@ -14806,7 +15157,7 @@ mod tests {
         net2.connect(&mut nodes2, 0, 5, 1, 5);
         nodes2[1].publish_prekey().unwrap();
         net2.pump(&mut nodes2);
-        nodes2[1].publish_recv_beacon().unwrap();
+        nodes2[1].publish_recv_beacon();
         net2.pump(&mut nodes2);
         assert!(
             nodes2[0].take_wanted_mailboxes().contains(&b2_route),

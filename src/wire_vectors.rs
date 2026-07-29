@@ -21,7 +21,7 @@ use crate::session::{Header, RatchetMessage};
 use crate::store::HaveSet;
 
 pub const CORPUS_SCHEMA: u32 = 1;
-pub const CORPUS_FILE: &str = "vectors/bundle-v12.json";
+pub const CORPUS_FILE: &str = "vectors/bundle-v13.json";
 
 const CREATED_AT: u64 = 1_725_000_123_456;
 const LIFETIME_MS: u32 = 604_800_000;
@@ -392,6 +392,14 @@ fn wire_record_vectors(
         Wire::Have(HaveSet {
             ids: vec![*reference_id, bytes32(0xc0)],
         }),
+        // The §39 receiver-beacon, which in wire v13 stopped being a flooded, identity-signed
+        // advert and became this link-local, unsigned, prefix-only record. Derived through
+        // `mailbox_route` rather than written as a literal so the vector tracks
+        // MAILBOX_ROUTE_PREFIX_BYTES instead of pinning today's width by accident.
+        Wire::RecvBeacon {
+            route: crate::crypto::mailbox_route(&bytes16(0x33)),
+            distance: 2,
+        },
     ]
     .into_iter()
     .map(|wire| encoded("wire", wire_record_name(&wire), &wire))
@@ -403,6 +411,7 @@ fn wire_record_name(wire: &Wire) -> &'static str {
         Wire::Bundle(_) => "Bundle",
         Wire::Advert(_) => "Advert",
         Wire::Have(_) => "Have",
+        Wire::RecvBeacon { .. } => "RecvBeacon",
     }
 }
 
@@ -1219,9 +1228,8 @@ fn advert_vectors(sender: &Identity) -> Vec<EncodingVector> {
             nonce: bytes12(0x22),
             ct: vec![0x00, 0x80, 0xfe, 0xff],
         },
-        AdvertKind::RecvBeacon {
-            mailbox: bytes16(0x33),
-        },
+        // No RecvBeacon advert vector: the §39 receiver-beacon left AdvertKind entirely in wire v13.
+        // It is pinned as a `Wire::RecvBeacon` link record instead (see `wire_record_vectors`).
     ];
     kinds
         .into_iter()
@@ -1254,7 +1262,6 @@ fn advert_kind_name(kind: &AdvertKind) -> &'static str {
         AdvertKind::PreKey { .. } => "PreKey",
         AdvertKind::Tombstone { .. } => "Tombstone",
         AdvertKind::HpsTopic { .. } => "HpsTopic",
-        AdvertKind::RecvBeacon { .. } => "RecvBeacon",
     }
 }
 
@@ -1354,7 +1361,7 @@ mod tests {
     #[test]
     fn corpus_covers_every_current_wire_enum_variant() {
         let corpus = corpus();
-        assert_eq!(corpus.bundle_version, 12);
+        assert_eq!(corpus.bundle_version, 13);
         let destinations: BTreeSet<_> = corpus
             .destinations
             .iter()
@@ -1365,7 +1372,7 @@ mod tests {
             BTreeSet::from(["Device", "AckTo", "Broadcast", "Vaccine"]),
             "destination_name is exhaustive, and every named variant needs a vector"
         );
-        assert_eq!(corpus.adverts.len(), 5);
+        assert_eq!(corpus.adverts.len(), 4);
         assert_eq!(
             corpus
                 .link_packets
@@ -1381,7 +1388,7 @@ mod tests {
                 .iter()
                 .map(|vector| vector.variant.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["Bundle", "Advert", "Have"]),
+            BTreeSet::from(["Bundle", "Advert", "Have", "RecvBeacon"]),
             "wire_record_name is exhaustive, and every named variant needs a vector"
         );
         assert_eq!(

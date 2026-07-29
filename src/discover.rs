@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{self, Identity, PreKeyBundle, PubKeyBytes, Tag, XPubKeyBytes};
+use crate::crypto::{self, Identity, PreKeyBundle, PubKeyBytes, XPubKeyBytes};
 use crate::error::{Error, Result};
 use crate::util;
 use crate::{AppId, FABRIC_APP};
@@ -40,9 +40,6 @@ const TOPIC_CONTROL: &str = "_control";
 const TOPIC_KEYS: &str = "_keys";
 /// Reserved topic for `hps://` discoverable channel/service announcements (DESIGN.md §32).
 const TOPIC_HPS: &str = "_hps";
-/// §39 P4 receiver-beacons (routing gradient). Always-retained like the other control topics so
-/// a beacon propagates a few hops to lay the gradient; short TTL keeps it soft-state.
-const TOPIC_BEACON: &str = "_beacon";
 
 /// Default bound on the best-effort relay cache (number of adverts).
 pub const DEFAULT_RELAY_CACHE_CAP: usize = 256;
@@ -67,14 +64,6 @@ const MAX_SUMMARY_BYTES: usize = 2 * 1_024;
 const MAX_TAGS: usize = 32;
 const MAX_TAG_BYTES: usize = 64;
 const MAX_HPS_TOPIC_BYTES: usize = 7 * 1_024;
-
-/// Hop cap on a §39 receiver-beacon (core-02). A beacon lays the routing gradient for the few nodes
-/// near the recipient, but past this many hops it is neither re-gossiped nor stored, so a recipient's
-/// cleartext-carrying beacon does NOT flood the whole connected component every refresh, honoring the
-/// "propagates a few hops" claim above rather than laying the recipient's reachability network-wide.
-/// A node still records the gradient for a beacon it hears within this radius; it just stops carrying
-/// it onward. Beyond the cap, a private bundle falls back to blind-flood (the §39 privacy floor).
-pub const MAX_RECV_BEACON_HOPS: u8 = 3;
 
 /// Stable id of an advert: `BLAKE3(canonical body)`.
 pub type AdvertId = [u8; 32];
@@ -115,17 +104,14 @@ pub enum AdvertKind {
     /// key, so only same-app nodes can read it — a foreign app can carry/relay it but can't
     /// enumerate the topic. Never carries the content key.
     HpsTopic { nonce: [u8; 12], ct: Vec<u8> },
-    /// §39 P4 receiver-beacon: the publisher (a recipient in "route-to-me" mode) advertises its
-    /// **mailbox-tag** so nodes lay a soft-state gradient toward it. As this floods a few hops, every
-    /// node records "this mailbox is reachable via the link I heard it on", then forwards a matching
-    /// **private** bundle down that gradient instead of blind-flooding (DESIGN.md §39). The mailbox
-    /// tag is `H(address ‖ epoch)` and rotates per epoch (F-06). The advert's publisher signature
-    /// alone does NOT stop a hijack; hijack is prevented at ingest (`Node::on_advert`, F-05) by
-    /// requiring `mailbox == mailbox_tag(publisher's own signed address, current/recent epoch)`,
-    /// which the relay recomputes from the beacon's own signed address (unforgeable for another).
-    /// (A k-bit anonymity-set prefix was carried in v1 but never honored; it was removed rather than
-    /// advertise a non-functional privacy control — reintroduce with a real prefix-routing design.)
-    RecvBeacon { mailbox: Tag },
+    // NOTE: there is deliberately no receiver-beacon kind here any more. A `RecvBeacon { mailbox:
+    // Tag }` advert used to flood three hops carrying the recipient's FULL mailbox tag inside a body
+    // whose `publisher` field is its real address in cleartext, identity-signed: "address P owns
+    // mailbox tag T", handed to every relay it connects to. That was the loudest metadata leak in
+    // the protocol and it defeated the mailbox anonymity set entirely. The receiver-beacon is now a
+    // link-local, unsigned, prefix-only `Wire::RecvBeacon` record (see `crate::wire_emit::Wire`),
+    // which carries the routing prefix the gradient actually consumed and nothing else. An advert
+    // is the wrong shape for it: adverts are FLOODED and identity-signed by construction.
 }
 
 /// The signed body of an advert. The publisher signature covers this exactly.
@@ -162,7 +148,11 @@ pub struct Advert {
 
 /// Current advert wire version.
 // v2: RecvBeacon mailbox semantics changed to H(address ‖ epoch) with a rotation window (F-06).
-pub const ADVERT_VERSION: u8 = 2;
+// v3: RecvBeacon REMOVED from AdvertKind (it moved to the link-local, unsigned, prefix-only
+// `Wire::RecvBeacon`). Bumped alongside BUNDLE_VERSION so an old peer's beacon advert is rejected
+// with a loud `UnsupportedVersion` at `Advert::verify` rather than mis-decoded: the removed variant
+// was the last discriminant, so its bytes would otherwise just fail to decode somewhere less clear.
+pub const ADVERT_VERSION: u8 = 3;
 
 impl Advert {
     /// Publish (build + sign) a new advert in the shared fabric namespace.
@@ -263,7 +253,6 @@ impl Advert {
             AdvertKind::PreKey { .. } => TOPIC_KEYS,
             AdvertKind::Tombstone { .. } => TOPIC_CONTROL,
             AdvertKind::HpsTopic { .. } => TOPIC_HPS,
-            AdvertKind::RecvBeacon { .. } => TOPIC_BEACON,
         }
     }
 }
@@ -296,7 +285,7 @@ fn validate_kind_structure(kind: &AdvertKind) -> Result<()> {
                 && (opks.is_empty() == opk_sig.is_empty())
                 && (opk_sig.is_empty() || opk_sig.len() == 64)
         }
-        AdvertKind::Tombstone { .. } | AdvertKind::RecvBeacon { .. } => true,
+        AdvertKind::Tombstone { .. } => true,
         AdvertKind::HpsTopic { ct, .. } => ct.len() <= MAX_HPS_TOPIC_BYTES,
     };
     if valid {
@@ -492,7 +481,6 @@ impl Directory {
         topic == TOPIC_CONTROL
             || topic == TOPIC_KEYS
             || topic == TOPIC_HPS
-            || topic == TOPIC_BEACON
             || self.subscriptions.contains(topic)
     }
 
@@ -636,17 +624,9 @@ impl Directory {
         if advert.is_expired(now_ms) {
             return Ok(false);
         }
-        // core-02: cap how far a receiver-beacon travels. Within the cap it lays the local gradient
-        // and re-gossips one more hop; past the cap we record it as seen (so a later copy is deduped)
-        // but neither store nor re-gossip it, and signal "not accepted" so the node doesn't carry it
-        // onward. This stops the recipient's cleartext-carrying beacon flooding the whole component.
-        if matches!(advert.body.kind, AdvertKind::RecvBeacon { .. })
-            && advert.hops > MAX_RECV_BEACON_HOPS
-        {
-            self.remember_seen(advert.id, advert.expires_at());
-            return Ok(false);
-        }
-
+        // (core-02's receiver-beacon hop cap used to live here. It bounded the RADIUS of a leak
+        // rather than removing it; the beacon no longer travels as a flooded advert at all, so the
+        // whole branch is gone with the variant.)
         if self
             .seen
             .get(&advert.id)
@@ -1149,9 +1129,7 @@ mod tests {
 
         let capped = Advert::publish(
             &publisher,
-            AdvertKind::RecvBeacon {
-                mailbox: [0u8; crypto::TAG_LEN],
-            },
+            AdvertKind::Tombstone { revokes: [7u8; 32] },
             0,
             u32::MAX,
             3,
@@ -1223,43 +1201,43 @@ mod tests {
     }
 
     #[test]
-    fn recv_beacon_past_hop_cap_is_not_regossiped() {
-        // core-02: a receiver-beacon lays the gradient within a few hops but must stop being
-        // re-gossiped/stored past the cap, so a recipient's cleartext-carrying beacon does not
-        // flood the whole connected component.
-        let recipient = Identity::generate();
-        let mut beacon = Advert::publish(
-            &recipient,
-            AdvertKind::RecvBeacon {
-                mailbox: crypto::mailbox_tag(&recipient.address(), 7),
+    fn no_advert_kind_can_carry_a_mailbox_tag() {
+        // The §39 receiver-beacon used to ride an advert, which is the wrong shape for it twice
+        // over: an advert FLOODS, and its body carries the publisher's real address in cleartext.
+        // That published "address P owns mailbox tag T" to every node within three hops. This
+        // asserts the structural property that made it possible is gone: no advert kind carries a
+        // `crypto::Tag` any more, so no beaconing node can leak one through the directory at all.
+        // (`recv_beacon_past_hop_cap_is_not_regossiped` lived here; it capped the leak's RADIUS.)
+        let publisher = Identity::generate();
+        let mailbox = crypto::mailbox_tag(&publisher.address(), 7);
+        let spk = publisher.derive_prekey();
+        let kinds = vec![
+            AdvertKind::Service {
+                service: "market".into(),
+                title: "t".into(),
+                summary: "s".into(),
+                tags: vec!["x".into()],
             },
-            0,
-            90_000,
-            1,
-        )
-        .unwrap();
-
-        // Within the cap: accepted (worth re-gossiping) and carried.
-        beacon.hops = MAX_RECV_BEACON_HOPS;
-        let mut near = Directory::new();
-        assert!(
-            near.ingest(beacon.clone(), 1).unwrap(),
-            "a beacon within the cap is accepted + re-gossiped"
-        );
-
-        // Past the cap: recorded as seen for dedup, but NOT accepted (not re-gossiped/stored).
-        let mut far = Directory::new();
-        beacon.hops = MAX_RECV_BEACON_HOPS + 1;
-        assert!(
-            !far.ingest(beacon.clone(), 1).unwrap(),
-            "a beacon past the cap is not re-gossiped"
-        );
-        assert!(
-            far.seen(&beacon.id),
-            "still deduped so a later copy is dropped"
-        );
-        // Nothing was stored for onward gossip.
-        assert!(far.gossip_offer(&HashSet::new()).is_empty());
+            AdvertKind::PreKey {
+                spk_pub: spk.public,
+                spk_sig: spk.sig.to_vec(),
+                opks: Vec::new(),
+                opk_sig: Vec::new(),
+            },
+            AdvertKind::Tombstone { revokes: [1u8; 32] },
+            AdvertKind::HpsTopic {
+                nonce: [2u8; 12],
+                ct: vec![3, 4, 5],
+            },
+        ];
+        for kind in kinds {
+            let advert = Advert::publish(&publisher, kind, 0, 60_000, 1).unwrap();
+            let bytes = postcard::to_allocvec(&advert).unwrap();
+            assert!(
+                !bytes.windows(crypto::TAG_LEN).any(|w| w == mailbox),
+                "an advert must never carry a mailbox tag on the wire"
+            );
+        }
     }
 
     fn listing(seller: &Identity, title: &str, seq: u64) -> Advert {
