@@ -21,7 +21,7 @@ use crate::session::{Header, RatchetMessage};
 use crate::store::HaveSet;
 
 pub const CORPUS_SCHEMA: u32 = 1;
-pub const CORPUS_FILE: &str = "vectors/bundle-v11.json";
+pub const CORPUS_FILE: &str = "vectors/bundle-v12.json";
 
 const CREATED_AT: u64 = 1_725_000_123_456;
 const LIFETIME_MS: u32 = 604_800_000;
@@ -108,7 +108,7 @@ struct SealFixture {
 struct PrivateSpec {
     name: &'static str,
     inner: Payload,
-    mailbox: Option<[u8; 2]>,
+    mailbox: Option<crate::crypto::MailboxRoute>,
     flags: BundleFlags,
     fixture_index: u8,
 }
@@ -828,7 +828,7 @@ fn private_specs(fixed_id: BundleId) -> Vec<PrivateSpec> {
                 opk_id: None,
                 msg: session_message(0x34, 31, 37, vec![0xb1, 0xb2, 0xb3]),
             },
-            mailbox: Some([0xa5, 0x5a]),
+            mailbox: Some([0xa5]),
             flags: BundleFlags {
                 request_ack: true,
                 ..Default::default()
@@ -840,7 +840,7 @@ fn private_specs(fixed_id: BundleId) -> Vec<PrivateSpec> {
             inner: Payload::SessionMessage {
                 msg: session_message(0x31, 23, 29, vec![0xa1, 0xa2, 0xa3, 0xa4]),
             },
-            mailbox: Some([0xa5, 0x5a]),
+            mailbox: Some([0xa5]),
             flags: BundleFlags {
                 request_ack: true,
                 ..Default::default()
@@ -856,7 +856,7 @@ fn private_specs(fixed_id: BundleId) -> Vec<PrivateSpec> {
                 delivery_ms: 12_345,
                 proof: Some(bytes32(0xe1)),
             },
-            mailbox: Some([0x5a, 0xa5]),
+            mailbox: Some([0x5a]),
             flags: BundleFlags::default(),
             fixture_index: 0xf1,
         },
@@ -1131,7 +1131,7 @@ fn nested_layouts(reference_id: &BundleId) -> Vec<EncodingVector> {
         &PrivateHeader {
             tag: bytes16(0x41),
             ephemeral: bytes32(0x51),
-            mailbox: Some([0xa5, 0x5a]),
+            mailbox: Some([0xa5]),
         },
     ));
     out.push(encoded(
@@ -1354,7 +1354,7 @@ mod tests {
     #[test]
     fn corpus_covers_every_current_wire_enum_variant() {
         let corpus = corpus();
-        assert_eq!(corpus.bundle_version, 11);
+        assert_eq!(corpus.bundle_version, 12);
         let destinations: BTreeSet<_> = corpus
             .destinations
             .iter()

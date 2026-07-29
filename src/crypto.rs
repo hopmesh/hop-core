@@ -635,6 +635,34 @@ pub fn recognition_tag_from_shared(shared: &[u8; 32], bundle_id: &[u8; 32]) -> T
     tag16("hop recog tag v1", &km)
 }
 
+/// The per-bundle **hop-count blind** for a §39 private bundle (sec-priv-r4-01).
+///
+/// `env.hops` is advisory (routing is bounded by the separate `hop_limit` countdown), but it is
+/// cleartext and starts at 0, so the FIRST node to receive a freshly-originated bundle reads
+/// `hops == 0` and knows its link peer is the origin. Links are mutually authenticated Noise XX, so
+/// that peer is an identified address: a relay could attribute every bundle it received directly to
+/// its sender, no matter that `src` is zeroed.
+///
+/// Blinding it: the sender stamps `hops = offset` instead of 0 and relays increment as before, so an
+/// observer sees `offset + travelled` for an unknown offset and cannot infer proximity to the origin.
+/// The offset is DERIVED from the recognition secret rather than carried, so it costs no wire bytes
+/// and works for every payload variant: the recipient already computes `shared` to test the tag, so
+/// it can recompute the offset and subtract to recover the exact true hop count.
+///
+/// Bounded to [`MAX_HOP_BLIND`] so `offset + travelled` cannot wrap a `u8` (forwarding uses
+/// `saturating_add`, so a wrap would silently freeze the advisory count rather than panic).
+pub fn hop_blind_from_shared(shared: &[u8; 32], bundle_id: &[u8; 32]) -> u8 {
+    let mut km = [0u8; 64];
+    km[..32].copy_from_slice(shared);
+    km[32..].copy_from_slice(bundle_id);
+    let t = tag16("hop hop-blind v1", &km);
+    t[0] % (MAX_HOP_BLIND + 1)
+}
+
+/// Upper bound on the [`hop_blind_from_shared`] offset. Leaves generous headroom under `u8::MAX` for
+/// the real travelled count, so the blinded value never saturates in practice.
+pub const MAX_HOP_BLIND: u8 = 100;
+
 /// Recipient side: the raw ephemeral·SPK DH `shared` secret (the recognition token) it reveals in a
 /// §39 delivery vaccine. Same DH as [`recognition_tag_recipient`], returned instead of hashed.
 pub fn recognition_shared(spk_secret: &[u8; 32], ephemeral_pub: &XPubKeyBytes) -> [u8; 32] {
@@ -656,12 +684,28 @@ pub fn recognition_tag_sender(
     recipient_spk_pub: &XPubKeyBytes,
     bundle_id: &[u8; 32],
 ) -> (XPubKeyBytes, Tag) {
+    let (eph_pub, tag, _shared) = recognition_sender_material(recipient_spk_pub, bundle_id);
+    (eph_pub, tag)
+}
+
+/// As [`recognition_tag_sender`], but also returns the `shared` DH secret.
+///
+/// The sender needs `shared` for anything else keyed on the recognition secret, currently the
+/// hop-count blind ([`hop_blind_from_shared`]). It must NOT be derived from the tag instead: the tag
+/// is cleartext on the wire, so an observer could recompute anything derived from it and undo the
+/// blinding. `shared` is known only to the sender and the holder of the prekey secret.
+pub fn recognition_sender_material(
+    recipient_spk_pub: &XPubKeyBytes,
+    bundle_id: &[u8; 32],
+) -> (XPubKeyBytes, Tag, [u8; 32]) {
     let ephemeral = StaticSecret::random_from_rng(&mut dalek_rng());
     let eph_pub = XPublicKey::from(&ephemeral).to_bytes();
     let shared = ephemeral.diffie_hellman(&XPublicKey::from(*recipient_spk_pub));
+    let shared = *shared.as_bytes();
     (
         eph_pub,
-        recognition_tag_from_shared(shared.as_bytes(), bundle_id),
+        recognition_tag_from_shared(&shared, bundle_id),
+        shared,
     )
 }
 
@@ -729,7 +773,29 @@ pub fn mailbox_tag(address: &PubKeyBytes, epoch: u64) -> Tag {
 /// address-knower. Widening `k` adaptively as N grows (so ~N/2^k stays ≥ a target set size) is the real
 /// fix and is tracked as future work; it is a wire-affecting change (the header carries this prefix, so
 /// its width is part of the format) and so is deliberately out of scope for this in-core hardening pass.
-pub const MAILBOX_ROUTE_PREFIX_BYTES: usize = 2;
+pub const MAILBOX_ROUTE_PREFIX_BYTES: usize = 1;
+
+// WHY 1 BYTE, AND WHEN TO CHANGE IT (sec-priv-04 follow-up, wire v12).
+//
+// This is the single dial controlling the recipient anonymity set, and it was set to a value that
+// could not deliver on its own promise. Buckets = 256^w, and the set a recipient hides in is
+// population/buckets:
+//
+//     w=2 (65_536 buckets)   N=1k -> 0.02    N=100k -> 1.5     N=10M -> 153
+//     w=1 (256 buckets)      N=1k -> 4       N=100k -> 390     N=10M -> 39_062
+//
+// At w=2 the "anonymity set" was a unique identifier for every realistic near-term population: an
+// adversary holding a target's (public) address computes H(address || epoch)[..2] and watches that
+// bucket, and no one else is in it. The guarantee was asymptotic while the claim was present tense.
+//
+// The cost of w=1 is spool volume: a node pulls 1/256 of private traffic rather than 1/65_536. In a
+// small network that is a small absolute number, which is exactly the regime where the anonymity
+// matters most; the two curves move in opposite directions with N, which is why this is a dial and
+// not a constant of nature.
+//
+// WIDEN TO 2 when population makes 1/256 of private traffic the dominant cost for a node, i.e. when
+// N/256 is comfortably above the set size you want to promise (order 10^6 users). Doing so is a wire
+// change: it alters the emitted `PrivateHeader.mailbox` width, so it rides a BUNDLE_VERSION bump.
 
 /// The routing/spool/want-beacon key for a mailbox-tag: its [`MAILBOX_ROUTE_PREFIX_BYTES`]-byte prefix
 /// (sec-priv-04). All gradient, blind-spool, and want-beacon buckets key on this, never on the full
@@ -1152,6 +1218,38 @@ mod tests {
             mailbox_tag(&bob.address(), 0),
             mailbox_tag(&alice.address(), 0)
         );
+    }
+
+    #[test]
+    fn hop_blind_is_secret_bounded_and_per_bundle() {
+        // sec-priv-r4-01. Three properties, each one a way the blind could fail to protect anything.
+        let bob = Identity::generate();
+        let spk = bob.generate_prekey();
+        let id_a = [7u8; 32];
+        let id_b = [8u8; 32];
+        let (_eph, _tag, shared) = recognition_sender_material(&spk.public, &id_a);
+
+        // 1. BOUNDED, so `blind + travelled` cannot wrap a u8 and freeze the advisory count.
+        for i in 0..64u8 {
+            let mut sh = shared;
+            sh[0] = i;
+            assert!(hop_blind_from_shared(&sh, &id_a) <= MAX_HOP_BLIND);
+        }
+
+        // 2. AGREED, or the recipient could not subtract it back off.
+        assert_eq!(
+            hop_blind_from_shared(&shared, &id_a),
+            hop_blind_from_shared(&shared, &id_a),
+        );
+
+        // 3. PER-BUNDLE, so two bundles from one sender do not share an offset an observer could
+        //    difference away to recover true distances.
+        let differs = (0..32u8).any(|i| {
+            let mut sh = shared;
+            sh[1] = i;
+            hop_blind_from_shared(&sh, &id_a) != hop_blind_from_shared(&sh, &id_b)
+        });
+        assert!(differs, "the blind must vary with the bundle id");
     }
 
     #[test]

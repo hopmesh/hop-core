@@ -66,7 +66,7 @@ pub struct TraceHop {
 // ACKs) to a 60s bucket so it is not a per-message sender timing fingerprint. This changes the wire
 // bytes (and thus the private wire id) of private bundles minted off a bucket boundary, so a v9 and a
 // v10 node compute different ids for the same logical send; the version gate must keep them apart.
-pub const BUNDLE_VERSION: u8 = 11;
+pub const BUNDLE_VERSION: u8 = 12;
 
 /// Maximum encoded size accepted by [`Bundle::from_bytes`]. Oversized application content is carried
 /// in bounded [`Payload::Carrier`] chunks, so a single decoded bundle never needs to allocate beyond
@@ -523,7 +523,8 @@ impl Bundle {
         // there is no id⇄tag circularity. r14-01: the wire id then binds the WHOLE inner (header + every
         // scalar field), so assemble the inner with a zeroed id and stamp the real id over it.
         let content_id = compute_private_content_id(&sealed);
-        let (ephemeral, tag) = crypto::recognition_tag_sender(recipient_spk_pub, &content_id);
+        let (ephemeral, tag, shared) =
+            crypto::recognition_sender_material(recipient_spk_pub, &content_id);
         let header = PrivateHeader {
             tag,
             ephemeral,
@@ -548,7 +549,11 @@ impl Bundle {
             hop_limit: opts.hop_limit,
             custody: None,
             copies: opts.copies.max(1),
-            hops: 0,
+            // sec-priv-r4-01: start the advisory hop count at a per-bundle BLIND instead of 0, so the
+            // first node to see this bundle cannot read `hops == 0` and conclude its (Noise-identified)
+            // link peer is the origin. Derived from the recognition secret, so it costs no wire bytes
+            // and the recipient recovers the true count by subtracting; see `hop_blind_from_shared`.
+            hops: crypto::hop_blind_from_shared(&shared, &content_id),
             trace: Vec::new(),
             access: None,
         };

@@ -2858,6 +2858,23 @@ impl<S: Store> Node<S> {
     /// mesh / across a relay→BLE bridge); a passive recipient skips it for max privacy and just
     /// recognizes whatever floods past. Re-published on a short interval from [`Node::tick`] so the
     /// gradient stays fresh + tracks a mobile recipient. Returns the advert id.
+    /// Select the "route-to-me" mode described on [`Node::publish_recv_beacon`]: `true` (the default)
+    /// keeps the receiver-beacon fresh so peers lay a gradient toward this node's mailbox bucket;
+    /// `false` is the passive, maximum-privacy recipient that emits no beacon and simply recognizes
+    /// whatever floods past.
+    ///
+    /// Both that method and [`Node::tick`] have always documented the passive mode, but the flag had
+    /// no setter anywhere in the tree: it was initialized `true` and only ever read, so the documented
+    /// privacy control could not actually be selected. A documented control that cannot be reached is
+    /// worse than an absent one, because it reads as a shipped feature.
+    ///
+    /// Turning it off costs reachability, not correctness: without a gradient a private bundle falls
+    /// back to blind flooding (the §39 privacy floor), so delivery deep in the mesh or across a
+    /// relay-to-BLE bridge becomes best-effort.
+    pub fn set_route_to_me(&mut self, on: bool) {
+        self.route_to_me = on;
+    }
+
     pub fn publish_recv_beacon(&mut self) -> Result<AdvertId> {
         // F-06: beacon the current mailbox epoch AND the past window, so a private bundle addressed
         // or spooled under a just-rotated tag (sender a bit behind, or spooled before the boundary)
@@ -2918,6 +2935,29 @@ impl<S: Store> Node<S> {
             .values()
             .find(|secret| bundle.recognized_by(secret))
             .map(|secret| crypto::recognition_shared(secret, &ph.ephemeral))
+    }
+
+    /// The TRUE distance this bundle travelled, undoing the sec-priv-r4-01 hop blind.
+    ///
+    /// A private bundle leaves the sender with `hops` set to a secret per-bundle offset rather than 0,
+    /// so no relay can read proximity to the origin off the wire. Only the recipient holds the prekey
+    /// secret, so only the recipient can recover the offset and subtract it. Everyone else (a relay
+    /// listing its queue, a forwarder) legitimately sees the blinded value and has no use for the real
+    /// one. Traced bundles are unblinded and pass straight through.
+    ///
+    /// Saturating: a truncated or hostile bundle whose `hops` is below its own blind yields 0 rather
+    /// than wrapping to ~255 and rendering as an absurd path length.
+    fn true_hops(&self, bundle: &Bundle) -> u8 {
+        let Some(content_id) = bundle.private_content_id() else {
+            return bundle.env.hops; // traced: never blinded
+        };
+        match self.vaccine_token_for(bundle) {
+            Some(token) => bundle
+                .env
+                .hops
+                .saturating_sub(crypto::hop_blind_from_shared(&token, &content_id)),
+            None => bundle.env.hops, // not ours to unblind
+        }
     }
 
     /// sec-priv-07: recover which held private bundle a token-only delivery vaccine clears. The
@@ -3448,7 +3488,8 @@ impl<S: Store> Node<S> {
             from: message.from,
             content_type: message.content_type.clone(),
             body: message.body.clone(),
-            hops: bundle.env.hops,
+            // sec-priv-r4-01: the recipient is the one party that can unblind the hop count.
+            hops: self.true_hops(bundle),
             created_at: bundle.inner.created_at,
             trace: bundle.trace().to_vec(),
             received_at: self.now_ms,
@@ -3917,6 +3958,18 @@ impl<S: Store> Node<S> {
     /// newly accepted here), clearing the queue. The host reloads each mailbox's durable blind spool
     /// and re-ingests the held private bundles, which P4's freshly-laid gradient then steers to the
     /// recipient. The node does no durable I/O itself; it only surfaces the tags (cf. DNS lookups).
+    /// Test seam: enqueue a wanted mailbox exactly as the beacon-ingest path does, so the dedup
+    /// policy can be exercised without standing up links and adverts.
+    #[cfg(test)]
+    pub(crate) fn note_wanted_mailbox_for_test(&mut self, mailbox: Tag) {
+        if !self.wanted_mailboxes.contains(&mailbox) {
+            if self.wanted_mailboxes.len() >= MAX_RECV_GRADIENT {
+                self.wanted_mailboxes.remove(0);
+            }
+            self.wanted_mailboxes.push(mailbox);
+        }
+    }
+
     pub fn take_wanted_mailboxes(&mut self) -> Vec<Tag> {
         std::mem::take(&mut self.wanted_mailboxes)
     }
@@ -7358,9 +7411,16 @@ impl<S: Store> Node<S> {
     pub fn take_inbox(&mut self) -> Vec<Bundle> {
         let queued = std::mem::take(&mut self.inbox);
         let mut accepted = Vec::with_capacity(queued.len());
-        for bundle in queued {
+        for mut bundle in queued {
             let id = bundle.id();
             if !self.pending_app_deliveries.contains_key(&id) || self.complete_app_delivery(&id) {
+                // sec-priv-r4-01: unblind the advisory hop count on the way OUT to the application.
+                // This is the boundary that matters: `take_inbox` returns whole `Bundle`s and the C ABI
+                // hands them to every SDK, so an app reads `env.hops` directly. Correcting only the
+                // richer `InboxItem` would have shipped a blinded "63 hops" to the UI. The blind has
+                // done its job by now (the bundle is ours and delivered), so the true value is safe
+                // here and nowhere earlier.
+                bundle.env.hops = self.true_hops(&bundle);
                 accepted.push(bundle);
             } else {
                 self.inbox.push(bundle);
@@ -8904,8 +8964,14 @@ impl<S: Store> Node<S> {
         // §39 P5: a newly-accepted beacon IS a want-beacon; surface the mailbox so the host reloads
         // its durable blind spool (an offline-deposited bundle is pulled the moment we hear from the
         // recipient). Bounded so a beacon storm can't grow this unboundedly; a dropped tag just waits
-        // for the next periodic re-beacon. (Deduped against the tail to avoid a refresh re-queuing it.)
-        if self.wanted_mailboxes.last() != Some(&mailbox) {
+        // Dedup against the WHOLE queue, not just its tail. Tail-only dedup let two buckets
+        // alternating (A, B, A, B, ...) fill this to MAX_RECV_GRADIENT entries holding two distinct
+        // values, and the host does one durable spool listing PER ENTRY
+        // (`hop-relayd` mailbox::process_mailbox), so a cheap gossip pattern amplified into thousands
+        // of storage reads. At MAILBOX_ROUTE_PREFIX_BYTES = 1 only 256 distinct route keys can ever
+        // exist, so a linear `contains` over a queue that can no longer exceed 256 is trivially bounded
+        // and the cap below becomes unreachable rather than load-bearing.
+        if !self.wanted_mailboxes.contains(&mailbox) {
             if self.wanted_mailboxes.len() >= MAX_RECV_GRADIENT {
                 self.wanted_mailboxes.remove(0);
             }
@@ -13207,6 +13273,45 @@ mod tests {
     // --- §39 untraceable (private) messaging ----------------------------------
 
     #[test]
+    fn a_freshly_sent_private_bundle_does_not_announce_hops_zero() {
+        // sec-priv-r4-01, the attack this closes. Links are mutually authenticated Noise XX, so the
+        // first node to receive a bundle knows its link peer's address. If a freshly-originated
+        // private bundle arrived reading `hops == 0`, that relay could attribute it to that peer with
+        // certainty, and the zeroed `src` would have bought nothing.
+        let bob = Identity::generate();
+        let spk = bob.generate_prekey();
+
+        // Send enough bundles that "always 0" cannot hide behind one lucky draw.
+        let mut saw_nonzero = 0;
+        for i in 0..24u8 {
+            let b = Bundle::create_private(
+                &bob.address(),
+                &spk.public,
+                &Payload::PeerMessage {
+                    content_type: "text/plain".into(),
+                    body: vec![i],
+                },
+                None,
+                BundleOpts::default(),
+            )
+            .expect("private bundle");
+            assert!(
+                b.env.hops <= crypto::MAX_HOP_BLIND,
+                "the blind must stay bounded so forwarding cannot saturate the counter"
+            );
+            if b.env.hops != 0 {
+                saw_nonzero += 1;
+            }
+        }
+        // The blind is uniform over 0..=MAX, so a zero is legal but must be rare; 24 draws all landing
+        // on 0 has probability ~(1/101)^24. Anything close to "always 0" means the blind is not wired in.
+        assert!(
+            saw_nonzero >= 20,
+            "private bundles must leave the sender with a blinded hop count, saw {saw_nonzero}/24 non-zero"
+        );
+    }
+
+    #[test]
     fn private_message_floods_anonymously_and_only_the_recipient_recognizes_it() {
         // §39: Alice → Bob with nobody in between able to see who it's for. A relay (Carol)
         // carries it but can't tell it's Bob's; Bob recognizes it ("is this mine?") and reads
@@ -14142,6 +14247,51 @@ mod tests {
         assert!(
             nodes[3].store.contains(&id),
             "fell back to flood (decoy got a copy)"
+        );
+    }
+
+    #[test]
+    fn alternating_beacons_cannot_amplify_the_wanted_queue() {
+        // The queue is drained by the HOST, which does one durable spool listing per entry
+        // (hop-relayd mailbox::process_mailbox). Tail-only dedup meant two buckets arriving
+        // alternately (A, B, A, B, ...) each passed the `last() != mailbox` check, so a cheap gossip
+        // pattern grew the queue to MAX_RECV_GRADIENT entries carrying two distinct values and
+        // multiplied the host's storage reads by ~2000x. Dedup is now against the whole queue.
+        let mut n = Node::new(Identity::generate());
+        let a = route_key(&crypto::mailbox_tag(&[1u8; 32], 0));
+        let b = route_key(&crypto::mailbox_tag(&[2u8; 32], 0));
+        for _ in 0..500 {
+            n.note_wanted_mailbox_for_test(a);
+            n.note_wanted_mailbox_for_test(b);
+        }
+        let drained = n.take_wanted_mailboxes();
+        assert_eq!(
+            drained.len(),
+            2,
+            "1000 alternating beacons must collapse to the 2 distinct buckets, got {}",
+            drained.len()
+        );
+        assert!(drained.contains(&a) && drained.contains(&b));
+    }
+
+    #[test]
+    fn the_documented_passive_privacy_mode_can_actually_be_selected() {
+        // `publish_recv_beacon` and `tick` both document a passive "max privacy" recipient that emits
+        // no beacon. The flag existed, was initialized true, and was only ever READ: there was no
+        // setter in the tree, so the documented control could not be selected at all.
+        let mut n = Node::new(Identity::generate());
+        n.set_route_to_me(false);
+        n.tick(RECV_BEACON_REFRESH_MS * 4);
+        assert!(
+            !n.drain_beaconed(),
+            "a passive recipient must not emit a receiver-beacon"
+        );
+
+        let mut loud = Node::new(Identity::generate());
+        loud.tick(RECV_BEACON_REFRESH_MS * 4);
+        assert!(
+            loud.drain_beaconed(),
+            "the default (route-to-me) node still beacons, so the test proves the flag and not silence"
         );
     }
 

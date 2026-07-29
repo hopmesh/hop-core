@@ -5,7 +5,7 @@
 //! `BUNDLE_VERSION` bump for a change that moves no wire byte. This file is outside the manifest,
 //! so test coverage can grow freely.
 //!
-//! The deterministic corpus (`vectors/bundle-v11.json`) pins the stamped envelope end to end via
+//! The deterministic corpus (`vectors/bundle-v<N>.json`) pins the stamped envelope end to end via
 //! `wire_vectors::deterministic_stamp`. What it does NOT do is separate the pieces, so a reader
 //! cannot tell from the corpus alone which constant moved when it drifts. These pin each input
 //! independently: the signed preimage, the hint derivation, and the struct encoding.
