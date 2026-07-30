@@ -395,8 +395,9 @@ struct GradientLink {
 }
 
 /// sec-priv-04: routing keys on the tag PREFIX (an anonymity set), so a single bucket may cover
-/// SEVERAL distinct recipients reachable via DIFFERENT next hops. A prefix collision is rare (a 2-byte
-/// prefix ⇒ ~1/65536 per peer pair) but must not starve a colliding recipient, so the bucket holds a
+/// SEVERAL distinct recipients reachable via DIFFERENT next hops. A prefix collision is uncommon (a
+/// 1-byte prefix, `MAILBOX_ROUTE_PREFIX_BYTES` since wire v12, ⇒ ~1/256 per peer pair) but must not
+/// starve a colliding recipient, so the bucket holds a
 /// bounded set of next-hop links and a matching private bundle is forwarded down ALL live links in it
 /// (never to a link that did not beacon this prefix, the decoy stays excluded, so directed routing
 /// still holds). The far end that isn't the intended recipient simply fails the per-message
@@ -2435,7 +2436,7 @@ impl<S: Store> Node<S> {
         // §39 P4: stamp the recipient's mailbox ROUTING PREFIX so a node holding a gradient toward it can
         // route this bundle there (instead of blind-flooding), without any cleartext dst. The sender
         // already has `spk_pub`, so it computes the SAME tag the recipient beacons. core-protocol-r2-02:
-        // we put only the 2-byte PREFIX on the wire, never the full deterministic tag.
+        // we put only the `MAILBOX_ROUTE_PREFIX_BYTES` PREFIX on the wire, never the full deterministic tag.
         let bundle = Bundle::create_private(
             &dst,
             &spk_pub,
@@ -3094,8 +3095,9 @@ impl<S: Store> Node<S> {
 
     /// core-protocol-r2-04: verify a private delivery-ACK's recipient-only CDH proof against the ORIGINAL
     /// bundle we still hold. `proof` is the recognition token `recognition_shared(recipient_spk_secret,
-    /// original.ephemeral)`; it is valid iff `recognition_tag_from_shared(proof, for_bundle_id)` equals
-    /// the original bundle's own `private.tag`. Only a holder of the recipient's SPK secret can compute a
+    /// original.ephemeral)`; `for_bundle_id` only LOOKS the original up, and the proof is valid iff
+    /// `recognition_tag_from_shared(proof, original_content_id)` equals that bundle's own `private.tag`
+    /// (r13-01: the tag keys on the content id, never the wire id). Only a holder of the recipient's SPK secret can compute a
     /// token that satisfies this (identical to the vaccine's forgery-resistance), so an ACK forged by an
     /// address-knower who lacks that secret fails here. Returns false if the proof is absent, the original
     /// is no longer held (nothing to authenticate a mutation against), or the tag doesn't match.
@@ -7027,7 +7029,7 @@ impl<S: Store> Node<S> {
     /// §39 P5: private bundles we should DURABLY spool by mailbox-tag, so an offline / cross-partition
     /// recipient (whom P4's live gradient can't reach right now) collects it via a later want-beacon pull.
     /// A bundle qualifies iff it's private and carries a mailbox-tag. core-protocol-r2-01: we intentionally
-    /// spool even when a live gradient exists for the route, because the gradient keys on a 2-byte PREFIX
+    /// spool even when a live gradient exists for the route, because the gradient keys on a short PREFIX
     /// and a live next-hop may be a prefix-COLLIDING different recipient, suppressing the spool then
     /// black-holes the true (passive) recipient. When the recipient later beacons, the host reloads the
     /// spool and P4 steers the reloaded copy down the freshly-laid gradient. The relay never opens the
@@ -7060,7 +7062,7 @@ impl<S: Store> Node<S> {
             // the relay's spool key is an anonymity set an address-knower can't resolve to one recipient.
             let route = route_key_from_prefix(&prefix);
             // core-protocol-r2-01: DO NOT suppress the spool just because a live gradient exists for this
-            // route. The gradient keys on the 2-byte PREFIX, so a live next-hop may be a DIFFERENT
+            // route. The gradient keys on the `MAILBOX_ROUTE_PREFIX_BYTES` PREFIX, so a live next-hop may be a DIFFERENT
             // recipient that merely collides on the prefix with this bundle's intended recipient. The old
             // "live ⇒ don't spool" rule black-holed the passive/offline colliding recipient: the forward
             // gate steered the copy only down the colliding recipient's link (which drops it on the
@@ -14719,7 +14721,7 @@ mod tests {
             "wanted drains once"
         );
         // core-protocol-r2-01: the bundle STAYS spoolable even with a live gradient. The gradient keys
-        // on a 2-byte prefix, so a live next-hop may be a prefix-COLLIDING different recipient, the old
+        // on a 1-byte prefix (wire v12), so a live next-hop may be a prefix-COLLIDING different recipient, the old
         // "spool XOR route" rule black-holed the true (passive) recipient in that case. We now keep the
         // durable spool as a safety net; a redundant delivery to the genuine recipient is deduped by id.
         assert!(
@@ -14793,7 +14795,7 @@ mod tests {
     }
 
     /// Find two distinct identities whose current mailbox-tags collide on the routing prefix, the
-    /// anonymity set an address-knower cannot resolve. A birthday search over a 2-byte prefix finds a
+    /// anonymity set an address-knower cannot resolve. A birthday search over the routing prefix finds a
     /// pair quickly; bounded so the test can never hang.
     fn colliding_recipients(epoch: u64) -> (Identity, Identity) {
         use std::collections::HashMap;
@@ -14956,7 +14958,7 @@ mod tests {
         // deterministic function of a broadly-known address. If it rode verbatim in the cleartext
         // header, a bundle-capturing address-knower could recompute the target's tag and UNIQUELY
         // re-link the recipient off the header, defeating the sec-priv-04 anonymity-set claim. Assert
-        // the header (and the whole serialized wire) carries only the 2-byte routing PREFIX, so the full
+        // the header (and the whole serialized wire) carries only the short routing PREFIX, so the full
         // deterministic tag never appears on the wire.
         let bob = Identity::generate();
         let full_tag = crypto::mailbox_tag(&bob.address(), mailbox_epoch(0));
@@ -14973,7 +14975,7 @@ mod tests {
             .get(&mid)
             .expect("sender holds its private bundle");
 
-        // The header field is exactly the prefix, and, being only 2 bytes, cannot be the full tag.
+        // The header field is exactly the prefix, and, being only `MAILBOX_ROUTE_PREFIX_BYTES` wide, cannot be the full tag.
         let hdr_mailbox = pb.inner.private.as_ref().unwrap().mailbox;
         assert_eq!(
             hdr_mailbox,
@@ -14987,7 +14989,7 @@ mod tests {
         let wire = pb.to_bytes().unwrap();
         assert!(
             !wire.windows(crypto::TAG_LEN).any(|w| w == full_tag),
-            "the full address-derived mailbox tag must not appear on the wire (only its 2-byte prefix)"
+            "the full address-derived mailbox tag must not appear on the wire (only its routing prefix)"
         );
 
         // Routing still works: the prefix in the header keys the same gradient bucket a beacon lays.
@@ -15001,7 +15003,7 @@ mod tests {
     #[test]
     fn a_passive_colliding_recipient_is_not_black_holed_by_an_active_one() {
         // core-protocol-r2-01 (REGRESSION): B2 is a PASSIVE (max-privacy) recipient that never beacons.
-        // B1 collides with B2 on the 2-byte route prefix and IS beaconing. Before the fix, a relay
+        // B1 collides with B2 on the route prefix and IS beaconing. Before the fix, a relay
         // steered B2's private bundle ONLY down B1's (colliding) link, where B1 fails the per-message
         // recognition tag and drops it, AND the spool gate refused to spool it because a "live gradient"
         // existed for the (shared) route. Result: B2's message reached B2 via NEITHER the live route NOR
