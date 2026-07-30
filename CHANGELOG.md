@@ -36,6 +36,9 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- restate the gradient cap in its real unit, correct the 1-byte prefix figures, record two open residuals (a99af07)
+- correct claims stated more strongly than the code supports (CLAIM-001..009) (f3fbfbf)
+- regenerate from conventional commits (b96e019)
 - regenerate from conventional commits (330c8c6)
 - regenerate from conventional commits (096180b)
 - regenerate from conventional commits (102ae67)
@@ -72,6 +75,12 @@ git-cliff. Do not edit by hand.
 - observe bundle-per-link transfers for the swarm viz (325a0ae)
 
 ### Other
+- bump our crates in every standalone/vendored Cargo.lock (aad3ff7)
+- scope two vaccine-budget claims to what they actually bound (bb5302b)
+- give the deferred vaccine drain its own pass budget so a flood cannot starve it (8d15430)
+- stop the vaccine deferral queue dropping genuine vaccines, bound the gradient quota hot path (975cdc7)
+- bind the gradient quota to the peer, stop vaccines occupying custody, fix three §39 defects (ca7c9dd)
+- repoint link_framing_reassembly at the framing that actually runs (97fa9fb)
 - rate-limit inbound receiver-beacons per link (c1c0c49)
 - stop the receiver-beacon publishing address-to-mailbox in cleartext (5948b7c)
 - move the BLE socket write off the node's core thread (R-02) (41fd3fb)
@@ -108,5 +117,6 @@ git-cliff. Do not edit by hand.
 - remove Destination::InternetEgress (mesh-visible internet-bound leak) (5dd64d3)
 
 ### Testing
+- replace a tautological custody assertion and correct two more overclaiming comments (890cba1)
 - close store.rs and hps.rs coverage gaps to 100 percent (#81) (0f9ad2d)
 
