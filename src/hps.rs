@@ -1,11 +1,11 @@
-//! `hps://` pub/sub primitives — services & channels (DESIGN.md §32).
+//! `hps://` pub/sub primitives: services & channels (DESIGN.md §32).
 //!
 //! `hps://` is publish/subscribe, distinct from request/response `hops://`. A topic lives at a
 //! path on any node. Two cryptographic concerns are kept separate:
 //!
-//! - **Confidentiality** — a symmetric **content key**, handed to members at subscribe time;
+//! - **Confidentiality**: a symmetric **content key**, handed to members at subscribe time;
 //!   anyone holding it can decrypt (read) and, for a channel, encrypt (write).
-//! - **Authenticity** — every published message is **signed by its sender**. For a *channel*
+//! - **Authenticity**: every published message is **signed by its sender**. For a *channel*
 //!   each member signs with their own device identity (so readers see a verified sender). For a
 //!   *service* only the owner's **signing key** produces a valid broadcast, so a leaked content
 //!   key lets someone read but never forge a broadcast.
@@ -23,7 +23,7 @@ use crate::AppId;
 
 /// A well-known keypair every node holds, used only to seal/open the *envelope* of a broadcast
 /// bundle (DESIGN.md §32). Its secret is public (derived from a constant), so any node can open
-/// a broadcast — confidentiality of the actual message is the content key inside, not this. A
+/// a broadcast. Confidentiality of the actual message is the content key inside, not this. A
 /// broadcast can't be addressed to one recipient, so we seal to this shared key instead.
 pub fn broadcast_identity() -> Identity {
     let seed = blake3::hash(b"hop.hps.broadcast.v1");
@@ -57,14 +57,14 @@ pub enum AccessMode {
 /// Whether a topic announces itself for discovery (DESIGN.md §32).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Visibility {
-    /// Reachable only by known `address+path` or an invite — never advertised.
+    /// Reachable only by known `address+path` or an invite, never advertised.
     Private,
     /// Host broadcasts an (app-encrypted) discovery advert so same-app peers can browse it.
     Discoverable,
 }
 
 /// The decrypted descriptor inside a discoverable topic's advert (DESIGN.md §32). Encrypted
-/// under the publisher app's discovery key — never carries the content key.
+/// under the publisher app's discovery key, and never carries the content key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicMeta {
     pub path: String,
@@ -78,13 +78,13 @@ pub struct TopicMeta {
 }
 
 /// The persisted configuration for a topic registered at a path. Holds the secret material, so
-/// it lives only in the host node's store — never sent on the wire as-is.
+/// it lives only in the host node's store and is never sent on the wire as-is.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     pub kind: ServiceKind,
     /// Symmetric key for confidentiality (handed to members on subscribe).
     pub content_key: ContentKey,
-    /// ed25519 seed of the service signing key — `Some` for a `Service` (only the owner can
+    /// ed25519 seed of the service signing key: `Some` for a `Service` (only the owner can
     /// broadcast), `None` for a `Channel` (members sign with their own identities).
     pub signing_seed: Option<[u8; 32]>,
     /// Who may obtain the keys (DESIGN.md §32).
@@ -130,7 +130,7 @@ impl ServiceConfig {
         }
     }
 
-    /// Mint a fresh content key (and, for a Service, a fresh signing key) and bump the epoch —
+    /// Mint a fresh content key (and, for a Service, a fresh signing key) and bump the epoch,
     /// the core of selective-rotation revocation (DESIGN.md §32). Retained members are re-keyed;
     /// removed ones simply never receive the new key.
     pub fn rotate(&mut self) {

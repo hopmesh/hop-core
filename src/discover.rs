@@ -1,13 +1,13 @@
 //! Relayed discovery and topic pub/sub: a gossiped, signed directory of peers and
-//! services. See DESIGN.md §15–§16.
+//! services. See DESIGN.md §15 and §16.
 //!
-//! Bundles (see [`crate::bundle`]) are *addressed* — you must already know the
+//! Bundles (see [`crate::bundle`]) are *addressed*: you must already know the
 //! destination. Discovery answers the prior question: how do you learn a peer or
 //! service exists and obtain its keys? A **service is a topic**: a publisher
 //! broadcasts signed [`Advert`] records on it, consumers **subscribe** to receive
 //! them, and every device relays best-effort regardless of whether it subscribes.
 //! Records flood the mesh epidemically and land in each node's [`Directory`]. You
-//! see a record the moment you meet any node carrying it — that is the
+//! see a record the moment you meet any node carrying it, which is the
 //! transitivity the product wants ("discoverable as soon as I've seen another
 //! device that has seen it").
 //!
@@ -17,7 +17,7 @@
 //! it doesn't care about. This is what makes "all devices relay at best attempt"
 //! affordable.
 //!
-//! Adverts are **public** to the mesh (no recipient, unsealed) — appropriate for a
+//! Adverts are **public** to the mesh (no recipient, unsealed), appropriate for a
 //! public job board or marketplace. Private peer discovery (rendezvous via a
 //! shared secret) is future work; see DESIGN.md §10, §15.
 //!
@@ -68,14 +68,14 @@ const MAX_HPS_TOPIC_BYTES: usize = 7 * 1_024;
 /// Stable id of an advert: `BLAKE3(canonical body)`.
 pub type AdvertId = [u8; 32];
 
-/// What an advert announces. The protocol only knows **services** — apps build
+/// What an advert announces. The protocol only knows **services**; apps build
 /// presence/contacts on top (e.g. a "presence" service carrying a display name);
 /// common names are not a core concept (DESIGN.md §4, §23).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdvertKind {
     /// A discoverable service/listing (a presence record, job board entry, …).
     Service {
-        /// Namespace, e.g. "market" or "jobs" — what consumers filter on.
+        /// Namespace, e.g. "market" or "jobs", what consumers filter on.
         service: String,
         title: String,
         summary: String,
@@ -101,7 +101,7 @@ pub enum AdvertKind {
     Tombstone { revokes: AdvertId },
     /// A discoverable `hps://` channel/service announcement (DESIGN.md §32). The descriptor
     /// (path, kind, title, access mode, …) is **encrypted** under the publisher app's discovery
-    /// key, so only same-app nodes can read it — a foreign app can carry/relay it but can't
+    /// key, so only same-app nodes can read it. A foreign app can carry/relay it but can't
     /// enumerate the topic. Never carries the content key.
     HpsTopic { nonce: [u8; 12], ct: Vec<u8> },
     // NOTE: there is deliberately no receiver-beacon kind here any more. A `RecvBeacon { mailbox:
@@ -120,11 +120,11 @@ pub struct AdvertBody {
     pub version: u8,
     /// Application namespace on the shared fabric (DESIGN.md §17).
     pub app: AppId,
-    /// The publisher's address — discoverers learn this and can then message it
-    /// directly (its sealing key is derived from the address — DESIGN.md §4).
+    /// The publisher's address. Discoverers learn this and can then message it
+    /// directly (its sealing key is derived from the address, see DESIGN.md §4).
     pub publisher: PubKeyBytes,
     pub kind: AdvertKind,
-    /// Publisher clock in ms — advisory; also breaks ties on supersession.
+    /// Publisher clock in ms, advisory; also breaks ties on supersession.
     pub created_at: u64,
     /// Discard after `created_at + ttl_ms` (against the receiver's clock + skew).
     pub ttl_ms: u32,
@@ -140,7 +140,7 @@ pub struct Advert {
     pub id: AdvertId,
     pub body: AdvertBody,
     pub sig: Vec<u8>,
-    /// Hops from the publisher to wherever this copy is now — incremented on each
+    /// Hops from the publisher to wherever this copy is now, incremented on each
     /// re-gossip. NOT signed (advisory, like a bundle's hop_limit); lets a node
     /// show "N hops away". First arrival in a flood is usually the shortest path.
     pub hops: u8,
@@ -295,7 +295,7 @@ fn validate_kind_structure(kind: &AdvertKind) -> Result<()> {
     }
 }
 
-/// Bounded, compressed, LRU store for adverts on topics we don't subscribe to —
+/// Bounded, compressed, LRU store for adverts on topics we don't subscribe to:
 /// the best-effort relay path. Keeps relays light (DESIGN.md §16).
 #[derive(Default)]
 struct RelayCache {
@@ -393,8 +393,8 @@ impl Default for DirectoryLimits {
 
 /// A node's local directory. Service adverts flood through a bounded relay cache
 /// (and full retention for subscribed topics). Presence, contacts, and any
-/// common-name layer are built by apps on top of services — not the core
-/// (DESIGN.md §4, §15–§16, §23).
+/// common-name layer are built by apps on top of services, not the core
+/// (DESIGN.md §4, §15 and §16, §23).
 pub struct Directory {
     /// Topics this node subscribes to (full retention).
     subscriptions: HashSet<String>,
@@ -456,7 +456,7 @@ impl Directory {
         self.app = app;
     }
 
-    /// Subscribe to a service topic — its adverts now get full retention.
+    /// Subscribe to a service topic. Its adverts now get full retention.
     pub fn subscribe(&mut self, topic: impl Into<String>) {
         let topic = topic.into();
         // Promote anything already in the relay cache for this topic.
@@ -632,7 +632,7 @@ impl Directory {
             .get(&advert.id)
             .is_some_and(|expiry| *expiry >= now_ms)
         {
-            // Already seen — but a copy that travelled fewer hops means we found a
+            // Already seen, but a copy that travelled fewer hops means we found a
             // shorter path (e.g. a direct link after first hearing it via a relay).
             // Adopt the smaller hop count so "N hops away" reflects the closest path.
             if let Some(existing) = self.subscribed.get_mut(&advert.id) {
@@ -700,7 +700,7 @@ impl Directory {
 
         // App scoping (DESIGN.md §17): full retention only for our own app or the open fabric
         // (peer discovery / prekeys flood fabric-wide). Other apps' adverts are still carried in
-        // the relay cache — the fabric is shared and must keep forwarding — just never surfaced
+        // the relay cache (the fabric is shared and must keep forwarding), just never surfaced
         // locally. This is what stops one app from discovering another app's hps topics.
         let our_app = advert.body.app == self.app || advert.body.app == FABRIC_APP;
         if our_app && self.is_subscribed(advert.topic()) {
@@ -711,7 +711,7 @@ impl Directory {
         Ok(true)
     }
 
-    /// The latest known prekey bundle for `address`, if we've seen one — used to
+    /// The latest known prekey bundle for `address`, if we've seen one. Used to
     /// open a forward-secret session without a live round-trip (DESIGN.md §25).
     pub fn prekey(&self, address: &PubKeyBytes) -> Option<PreKeyBundle> {
         self.prekeys.get(address).map(|entry| entry.bundle.clone())
@@ -735,15 +735,15 @@ impl Directory {
             .chain(self.relay.adverts())
     }
 
-    /// Adverts a peer hasn't seen yet — the gossip offer set for this contact
+    /// Adverts a peer hasn't seen yet, the gossip offer set for this contact
     /// (service broadcasts: subscribed + relayed).
     pub fn gossip_offer(&self, peer_seen: &HashSet<AdvertId>) -> Vec<Advert> {
         self.all().filter(|a| !peer_seen.contains(&a.id)).collect()
     }
 
-    /// Advert ids we currently hold that were published by `pubk` — our OWN prekey/presence when
+    /// Advert ids we currently hold that were published by `pubk`, our OWN prekey/presence when
     /// `pubk` is us. Used to ALWAYS re-offer our own securing adverts on link-up (and periodically),
-    /// so a peer that lost state (restart / data-wipe / cache-evict) can re-secure — WITHOUT
+    /// so a peer that lost state (restart / data-wipe / cache-evict) can re-secure, WITHOUT
     /// re-flooding the foreign directory bulk, which stays per-peer-deduped.
     pub fn advert_ids_by_publisher(&self, pubk: &PubKeyBytes) -> Vec<AdvertId> {
         self.all()
@@ -944,7 +944,7 @@ mod tests {
         assert!(dir.ingest(relayed.clone(), 1).unwrap());
         assert_eq!(dir.browse("market", None)[0].hops, 2);
 
-        // The same advert via a direct link (1 hop) arrives later — adopt the shorter
+        // The same advert via a direct link (1 hop) arrives later, so adopt the shorter
         // path even though it's a duplicate id (and don't re-gossip it).
         let mut direct = relayed.clone();
         direct.hops = 1;
@@ -1327,7 +1327,7 @@ mod tests {
             bob_dir.ingest(adv, 2).unwrap();
         }
 
-        // B browses the marketplace and finds A's post — without ever meeting A.
+        // B browses the marketplace and finds A's post, without ever meeting A.
         let hits = bob_dir.browse("market", Some("bicycle"));
         assert_eq!(hits.len(), 1);
         let post = &hits[0];

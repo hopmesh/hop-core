@@ -2,7 +2,7 @@
 //!
 //! Each node has an [`Identity`]: a single Ed25519 keypair. The **address** is the
 //! Ed25519 public key, and the X25519 keys for sealing/DH are *derived* from it via
-//! Ed25519→Montgomery conversion (DESIGN.md §4) — so an address alone is enough to
+//! Ed25519→Montgomery conversion (DESIGN.md §4), so an address alone is enough to
 //! both verify signatures from and seal to a peer; nothing extra rides the wire.
 //!
 //! On top of that this module provides the building blocks for **forward-secret
@@ -49,10 +49,10 @@ pub fn short_addr(addr: &PubKeyBytes) -> ShortAddr {
     s
 }
 
-/// A node's secret identity — a single Ed25519 keypair. The address *is* the public
+/// A node's secret identity: a single Ed25519 keypair. The address *is* the public
 /// key; the X25519 keys used for sealing are **derived** from it (Montgomery), so an
 /// address alone is enough to both verify signatures from and seal messages to a
-/// peer — no separate sealing key on the wire. See DESIGN.md §4.
+/// peer, with no separate sealing key on the wire. See DESIGN.md §4.
 pub struct Identity {
     signing: SigningKey,
 }
@@ -65,7 +65,7 @@ impl Identity {
         }
     }
 
-    /// The 32-byte Ed25519 seed — persist it (securely) for a stable address.
+    /// The 32-byte Ed25519 seed. Persist it (securely) for a stable address.
     pub fn to_secret_bytes(&self) -> [u8; 32] {
         self.signing.to_bytes()
     }
@@ -77,13 +77,13 @@ impl Identity {
         }
     }
 
-    /// The node's address (Ed25519 public key) — also its sealing identity.
+    /// The node's address (Ed25519 public key), also its sealing identity.
     pub fn address(&self) -> PubKeyBytes {
         self.signing.verifying_key().to_bytes()
     }
 
     /// X25519 secret for sealing/Noise, derived from the Ed25519 seed (SHA-512 +
-    /// clamp — the standard Ed25519→Curve25519 conversion).
+    /// clamp, the standard Ed25519→Curve25519 conversion).
     fn x_secret(&self) -> StaticSecret {
         let h = Sha512::digest(self.signing.to_bytes());
         let mut s = [0u8; 32];
@@ -238,7 +238,7 @@ impl Drop for SignedPreKey {
 }
 
 impl SignedPreKey {
-    /// The retained secret bytes — persist these so late handshakes still resolve.
+    /// The retained secret bytes. Persist these so late handshakes still resolve.
     pub fn secret_bytes(&self) -> [u8; 32] {
         self.secret
     }
@@ -420,7 +420,7 @@ impl OneTimePreKeyBatch {
 /// delayed second message. See [`crate::session`] and DESIGN.md §25.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreKeyBundle {
-    /// The owner's address (Ed25519) — also its identity DH key (IK), via Montgomery.
+    /// The owner's address (Ed25519), also its identity DH key (IK), via Montgomery.
     pub address: PubKeyBytes,
     /// The signed prekey public (SPK).
     pub spk_pub: XPubKeyBytes,
@@ -611,7 +611,7 @@ pub fn verify(address: &PubKeyBytes, msg: &[u8], sig: &[u8]) -> bool {
 // §39 metadata privacy: recognition tags + mailbox pseudonyms
 // ---------------------------------------------------------------------------
 
-/// Length of a §39 tag (recognition or mailbox). 16 bytes — collision-safe for
+/// Length of a §39 tag (recognition or mailbox). 16 bytes, collision-safe for
 /// recognition while staying small on the wire.
 pub const TAG_LEN: usize = 16;
 /// An opaque §39 tag carried in a private bundle header (no identity leaks from it).
@@ -626,7 +626,7 @@ fn tag16(context: &str, key_material: &[u8]) -> Tag {
 
 /// Derive a recognition tag from the ephemeral·SPK DH `shared` secret and the bundle id.
 /// `pub` so a relay can verify a §39 delivery **vaccine**: the recipient reveals `shared`
-/// (a value only it can compute, and which leaks nothing about it — CDH), and a relay holding
+/// (a value only it can compute, and which leaks nothing about it, by CDH), and a relay holding
 /// the bundle checks this equals the tag it already stores before dropping its copy.
 pub fn recognition_tag_from_shared(shared: &[u8; 32], bundle_id: &[u8; 32]) -> Tag {
     let mut km = [0u8; 64];
@@ -672,10 +672,10 @@ pub fn recognition_shared(spk_secret: &[u8; 32], ephemeral_pub: &XPubKeyBytes) -
         .as_bytes()
 }
 
-/// §39 **recognition tag** — the "is this mine?" primitive (DESIGN.md §39). Bound to a
+/// §39 **recognition tag**: the "is this mine?" primitive (DESIGN.md §39). Bound to a
 /// recipient signed prekey (SPK, §25) and the bundle id via an ephemeral DH, so the
 /// sender and the recipient derive the SAME tag while an on-path relay (holding neither
-/// secret) cannot. The recipient matches with one DH + one hash — no payload decryption.
+/// secret) cannot. The recipient matches with one DH + one hash, no payload decryption.
 /// Domain-separated from the seal/X3DH KDFs, so the tag never leaks a session key.
 ///
 /// Sender side: pick a fresh ephemeral, DH against the recipient's SPK public, and return
@@ -722,11 +722,11 @@ pub fn recognition_tag_recipient(
     recognition_tag_from_shared(shared.as_bytes(), bundle_id)
 }
 
-/// §39 **mailbox-tag** — a recipient's rotatable pull pseudonym: `H("v2" ‖ address ‖ epoch)`
+/// §39 **mailbox-tag**: a recipient's rotatable pull pseudonym: `H("v2" ‖ address ‖ epoch)`
 /// (F-06). NOT the address itself (you cannot seal to it or message it, only bucket by it), and it
 /// **rotates every epoch**, so a global observer can't correlate a recipient's mailbox across epochs.
 /// A relay buckets a blind spool by it and a recipient names it in a want-beacon. Deriving it from
-/// `(address, epoch)` — not the prekey — decouples mailbox rotation from the (deterministic) prekey,
+/// `(address, epoch)` rather than the prekey decouples mailbox rotation from the (deterministic) prekey,
 /// and lets a relay verify a beacon's ownership from public info (the sender knows the recipient's
 /// address for a private send; a beacon is signed by that address, so it can't be forged for another).
 pub fn mailbox_tag(address: &PubKeyBytes, epoch: u64) -> Tag {
@@ -749,16 +749,16 @@ pub fn mailbox_tag(address: &PubKeyBytes, epoch: u64) -> Tag {
 /// (known or unknown) that collides on the prefix, not a unique match. The full tag still travels in
 /// the beacon (so `owns_mailbox` binding still authenticates the beacon against the publisher's signed
 /// address), but core-protocol-r2-02: the **bundle header now carries ONLY this prefix, never the full
-/// tag** — so a bundle-capturing address-knower can no longer read the full deterministic tag off a
+/// tag**, so a bundle-capturing address-knower can no longer read the full deterministic tag off a
 /// flooded copy and uniquely re-link the recipient; a capturer learns only the same anonymity-set
 /// membership the routing layer exposes. No routing *decision* is ever made on more than this prefix.
 ///
 /// Two bytes (16 bits) is the deliberate balance: wide enough that unrelated recipients rarely share a
-/// bucket (so the routing gradient/spool stays useful — a colliding recipient's bundle just also flows
+/// bucket (so the routing gradient/spool stays useful, since a colliding recipient's bundle just also flows
 /// toward the bucket and is dropped there by the final per-message-ephemeral recognition-tag check),
 /// yet small enough that a real anonymity set forms **once the deployment is large relative to 2^16**.
 ///
-/// **security-privacy-r2-03 — honest scope of the anonymity set.** The anonymity-set argument is a
+/// **security-privacy-r2-03, honest scope of the anonymity set.** The anonymity-set argument is a
 /// large-N argument: a target's prefix bucket holds ~N/2^16 addresses, which only exceeds 1 when N
 /// approaches or exceeds 2^16 (~65k) reachable addresses in the observed region. This prefix width is a
 /// COMPILE-TIME constant, NOT adaptive to observed N. So in any **sparse** deployment where N ≪ 2^16
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn montgomery_correspondence() {
         // The X25519 key derived from the Ed25519 secret (libsodium method) must
-        // match the Montgomery form of the Ed25519 public key — proving an address
+        // match the Montgomery form of the Ed25519 public key, proving an address
         // alone is enough to both verify signatures and seal to.
         use ed25519_dalek::SigningKey;
         use sha2::{Digest, Sha512};
@@ -1256,7 +1256,7 @@ mod tests {
     fn mailbox_route_is_a_prefix_and_forms_an_anonymity_set() {
         // sec-priv-04: routing keys on a short PREFIX of the mailbox-tag so an address-knower gets an
         // anonymity set instead of a unique confirmation. Prove (1) the route is exactly the prefix,
-        // and (2) many distinct addresses genuinely collide onto the same route — i.e. an observer who
+        // and (2) many distinct addresses genuinely collide onto the same route, i.e. an observer who
         // computes a target's route and sees that bucket active cannot tell WHICH address it belongs to.
         let bob = Identity::generate();
         let tag = mailbox_tag(&bob.address(), 3);
@@ -1267,7 +1267,7 @@ mod tests {
         );
 
         // With a 2-byte prefix there are only 2^16 buckets, so distinct addresses genuinely collide onto
-        // one route — the anonymity set. A BIRTHDAY search finds SOME colliding pair with overwhelming
+        // one route, the anonymity set. A BIRTHDAY search finds SOME colliding pair with overwhelming
         // probability in a few hundred keys (√2^16 ≈ 256), which is deterministically reliable (unlike
         // waiting for a hit in one SPECIFIC pre-chosen bucket, ~1/65536 per try, which is flaky). We use
         // a large bound purely as a can't-hang guard; a collision is found almost immediately.

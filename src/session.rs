@@ -5,7 +5,7 @@
 //! round-trip): the initiator runs [`crypto::x3dh_initiate`] against the
 //! responder's published [`crypto::PreKeyBundle`]; the responder later re-derives
 //! it with [`crypto::x3dh_respond`]. This module turns that root into a
-//! [`Session`] that gives every message its own key — **forward secrecy** (a
+//! [`Session`] that gives every message its own key: **forward secrecy** (a
 //! compromised key can't decrypt earlier messages) and **post-compromise
 //! recovery** (the DH ratchet heals after a leak).
 //!
@@ -86,7 +86,7 @@ impl RatchetMessage {
 /// One end of a Double Ratchet session with a single peer.
 ///
 /// `Serialize`/`Deserialize` so the full ratchet state can be **persisted** and restored
-/// across restarts — otherwise a process restart (or an iOS beacon-mode background-kill)
+/// across restarts. Otherwise a process restart (or an iOS beacon-mode background-kill)
 /// loses the session while the peer keeps theirs, desyncing the ratchet so every later
 /// message fails to decrypt (DESIGN.md §25). The skipped-key map (a `HashMap` with a tuple
 /// key) serializes as a sequence of entries, so it round-trips through postcard.
@@ -153,7 +153,7 @@ impl Session {
     }
 
     /// Responder side. `root` is the X3DH output; the signed-prekey keypair becomes
-    /// the initial ratchet key. No chains yet — the responder must receive before it
+    /// the initial ratchet key. No chains yet: the responder must receive before it
     /// can send (it learns the initiator's ratchet key from the first message).
     pub fn init_responder(root: [u8; 32], spk_secret: [u8; 32], spk_public: XPubKeyBytes) -> Self {
         Self {

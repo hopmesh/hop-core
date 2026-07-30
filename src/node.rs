@@ -45,13 +45,13 @@ use crate::{short_app, AppId, ShortApp, FABRIC_APP};
 // Every byte this node layer puts on the wire is decided in `wire_emit`, which is the file the
 // wire-version guard hashes. Re-exported here so the long-standing `crate::node::` /
 // `hop_core::node::` paths (the prelude, `core/hop`, `wire_vectors`) keep resolving.
-#[cfg(feature = "fuzzing")]
-pub use crate::wire_emit::fuzz_link_packet;
 use crate::wire_emit::{
     advert_record_exceeds_limit, carrier_chunk_payloads, decode_link_packet, derive_stream_id,
     encode_link_auth, encode_packet, fragment_bounds_ok, frame_record, SessionInner,
     SESSION_ESTABLISH_CT, STREAM_CHUNK,
 };
+#[cfg(feature = "fuzzing")]
+pub use crate::wire_emit::{fuzz_link_packet, fuzz_record_framing};
 pub use crate::wire_emit::{
     IdentityRecord, NodeKind, MAX_LINK_PACKET_BYTES, SERVICE_IDENTIFY, SERVICE_TELEMETRY,
 };
@@ -14495,7 +14495,7 @@ mod tests {
     #[test]
     fn ack_reports_forward_path_latency_not_round_trip() {
         // "Delivered" should tell the sender how long A→B took (the forward leg the recipient
-        // observed), not the A→B→A round trip. The recipient stamps `received − created_at`
+        // observed), not the A→B→A round trip. The recipient stamps `received - created_at`
         // into the ACK; the sender surfaces it via message_status's 4th field.
         let mut nodes = [
             Node::new(Identity::generate()),

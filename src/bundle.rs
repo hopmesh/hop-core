@@ -27,25 +27,25 @@ pub struct TraceHop {
 // interop, so the version gate must reject a mixed fleet:
 //   * sec-priv-04: routing/spool/want-beacon now key on the mailbox-tag's 2-byte PREFIX, not the full
 //     tag. An old node keys the gradient on the full tag, so it would never match a new node's
-//     prefix-bucketed spool/want — private delivery would silently degrade to flood-only across the
+//     prefix-bucketed spool/want, so private delivery would silently degrade to flood-only across the
 //     boundary. Bumping forces the mismatch to surface at `verify()` instead.
 //   * sec-priv-07: the delivery Vaccine no longer carries the plaintext delivered id; it floods only a
 //     blinded token. An old node can't act on the new anti-packet (different variant shape).
 // v4: core-protocol-r2-04 added a recipient-only CDH `proof` field to `Payload::Ack` (the private-ACK
 // forgery fix). `Ack` rides INSIDE the seal, so a reorder would be version-gated only if the version
-// also bumped — and this IS a struct-layout change (a trailing `Option` field), so a v3 decoder would
+// also bumped, and this IS a struct-layout change (a trailing `Option` field), so a v3 decoder would
 // fail to parse a v4 Ack and vice-versa. The gate must reject a mixed v3/v4 fleet: a v3 sender's
 // unproven private ACK would otherwise be silently trusted by a v4 recipient, and a v4 proof would be
 // unparseable by a v3 sender. No v3-decode window is offered because the Ack layout genuinely differs
-// (accepting v3 bytes and decoding as v4 would misread the trailing bytes) — mixed-fleet rollout is an
+// (accepting v3 bytes and decoding as v4 would misread the trailing bytes). Mixed-fleet rollout is an
 // infra/version-negotiation concern, not a safe in-core transcode.
 // core-protocol-r13-01 bumped v4 -> v5: the §39 private WIRE id binds the recognition header.
 // core-protocol-r14-01 bumped v5 -> v6: the private WIRE id now binds the ENTIRE inner (header + all
-// scalar fields, incl. flags), so no unbound field — e.g. a flipped flags.request_ack twin — can share a
+// scalar fields, incl. flags), so no unbound field (e.g. a flipped flags.request_ack twin) can share a
 // genuine private id and shadow it at a keep-first relay. See compute_private_wire_id.
 // v6 -> v7: HNS consolidated onto self-certifying reach records. The `Payload::HnsQuery`/`HnsAnswer`
 // variants (mesh-assisted name resolution) were REMOVED, which shifts the postcard discriminant
-// of every later variant, so a v6 decoder misreads a v7 Payload and vice-versa — the version gate must
+// of every later variant, so a v6 decoder misreads a v7 Payload and vice-versa. The version gate must
 // reject a mixed v6/v7 fleet. Name resolution is now a direct HTTPS /.well-known/hop fetch of the reach
 // record (Node::provide_reach_record); the old validator + DoH machinery are gone.
 // v7 -> v8: §35 carriage stamps. `Envelope` gained a trailing `access: Option<CarriageStamp>` field
@@ -66,7 +66,16 @@ pub struct TraceHop {
 // ACKs) to a 60s bucket so it is not a per-message sender timing fingerprint. This changes the wire
 // bytes (and thus the private wire id) of private bundles minted off a bucket boundary, so a v9 and a
 // v10 node compute different ids for the same logical send; the version gate must keep them apart.
-pub const BUNDLE_VERSION: u8 = 13;
+// v13 -> v14: NO wire-layout and NO semantic change. Stated plainly because every other entry in
+// this list is a real format break and reading this one as another would waste someone's day. The
+// dash-guard carve-out that excluded the manifest-listed wire sources from the repo's no-em-dash
+// law was retired (audit PROC-001), and cleaning the banned punctuation out of their comments moves
+// bytes tools/wire-version-guard.sh hashes, which is what demands a bump. A v13 node and a v14 node
+// encode byte-identical bundles apart from this constant; the version gate separates them only
+// because the constant moved. That is the one-time price of retiring a carve-out that had already
+// outlived two bumps it named as its own cleanup trigger, and it is not payable twice: the guard
+// now scans these files, so punctuation can never bank up here again.
+pub const BUNDLE_VERSION: u8 = 14;
 
 /// Maximum encoded size accepted by [`Bundle::from_bytes`]. Oversized application content is carried
 /// in bounded [`Payload::Carrier`] chunks, so a single decoded bundle never needs to allocate beyond
@@ -80,7 +89,7 @@ pub type BundleId = [u8; 32];
 ///
 /// WIRE DISCIPLINE (append-only): postcard encodes an enum by its variant *index*, so
 /// removing or reordering a variant renumbers the ones after it and breaks decode across
-/// every peer and the deployed relay (this is what the `InternetEgress` removal did —
+/// every peer and the deployed relay (this is what the `InternetEgress` removal did in
 /// commit 5dd64d3). Only ever *append* new variants at the end, and bump [`BUNDLE_VERSION`]
 /// when the wire layout changes. The discriminant order is locked by `destination_discriminants_are_stable`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,14 +103,14 @@ pub enum Destination {
     /// (DESIGN.md §32).
     Broadcast,
     /// §39 delivery **vaccine** (sec-priv-07): floods ONLY the recipient's revealed recognition
-    /// **token** (the ephemeral·SPK DH `shared`) — deliberately NO plaintext delivered id. A node
+    /// **token** (the ephemeral·SPK DH `shared`), deliberately NO plaintext delivered id. A node
     /// holding the delivered bundle recovers the match itself: for each held private bundle it checks
     /// `recognition_tag_from_shared(token, held_id) == held_tag` and drops the one that matches
     /// (epidemic recovery on delivery). Omitting the id is the privacy win: a passive observer that
     /// did NOT capture the specific flood can no longer read a bundle id off the anti-packet and learn
     /// a delivery event, and even a global log sees only an opaque 32-byte token with no id to bind it
-    /// to. (The residual — an observer that DID capture the flood retains that bundle's own public
-    /// `(id, tag)` and can still confirm delivery via the public recognition function — is intrinsic
+    /// to. (The residual, that an observer which DID capture the flood retains that bundle's own public
+    /// `(id, tag)` and can still confirm delivery via the public recognition function, is intrinsic
     /// to any self-verifying epidemic anti-packet and is the documented §39 cost; see the module docs
     /// and `vaccine_hides_delivered_id_from_non_capturing_observer`.) The token is CDH-safe: it reveals
     /// nothing that identifies the recipient. Carries NO src/dst/recipient.
@@ -135,7 +144,7 @@ pub enum Payload {
     HttpRequest {
         /// The target domain this request is for (e.g. `example.com`). Part of the signed
         /// bundle, so a `hop-endpoint` can validate it against the single domain it's
-        /// authorized to serve and refuse anything else — the endpoint can never be steered
+        /// authorized to serve and refuse anything else, so the endpoint can never be steered
         /// to a different origin (DESIGN.md §30).
         host: String,
         method: String,
@@ -184,7 +193,7 @@ pub enum Payload {
     /// is sealed to the recipient's address inside a [`PrivateHeader`] envelope whose
     /// cleartext src is zeroed and whose dst floods (`Broadcast`). The network learns
     /// nothing; only the holder of the matching prekey recognizes and opens it, then reads
-    /// `sender` (authenticated by the inner ratchet — X3DH binds this identity) instead of
+    /// `sender` (authenticated by the inner ratchet, since X3DH binds this identity) instead of
     /// the zeroed envelope src.
     Private {
         sender: PubKeyBytes,
@@ -198,17 +207,17 @@ pub enum Payload {
         delivery_hops: u8,
         /// **Forward-path** latency the destination observed: its receive time minus the
         /// message's `created_at` (the sender's send time). Reported back so the sender can
-        /// show "reached B in X" — the A→B leg — instead of the A→B→A round trip it would
+        /// show "reached B in X" (the A→B leg) instead of the A→B→A round trip it would
         /// otherwise measure from the ACK's arrival. Relies on rough clock agreement between
         /// devices (NTP-synced phones are close); `delivery_hops` is the clock-free measure.
         delivery_ms: u32,
         /// **core-protocol-r2-04 recipient-only delivery proof.** On a §39 **private** ACK this is
-        /// `Some(token)` where `token = recognition_shared(recipient_spk_secret, original.ephemeral)` —
+        /// `Some(token)` where `token = recognition_shared(recipient_spk_secret, original.ephemeral)`,
         /// the SAME CDH value the delivery vaccine reveals, computable ONLY by the bundle's true
         /// recipient (it needs the SPK secret). The sender, still holding the original private bundle,
         /// verifies `recognition_tag_from_shared(token, for_bundle_id) == original.private.tag` before
         /// flipping the send to Delivered. Without this, a private ACK was accepted on recognition
-        /// alone — but a private bundle is sealed to the sender's *public* address and its recognition
+        /// alone, but a private bundle is sealed to the sender's *public* address and its recognition
         /// tag keys on the sender's *published* SPK public, so anyone who learned the sender's address
         /// and guessed an in-flight `for_bundle_id` could forge a Delivered. `None` on the identity-
         /// signed **traced** ACK path (there the Ed25519 signature already authenticates the acker).
@@ -241,7 +250,7 @@ pub enum Payload {
         reason: u16,
     },
     /// Invoke a service/command on the destination node (DESIGN.md §29). `service` is a
-    /// namespaced name — built-in ones start `hop.` (e.g. `hop.identify`) and are answered
+    /// namespaced name: built-in ones start `hop.` (e.g. `hop.identify`) and are answered
     /// by the node itself; others are dispatched to the embedding app. `method` is a
     /// command within the service; `args` is an opaque, app-defined request body. The
     /// reply comes back as a [`Payload::ServiceResponse`] correlated by the request id.
@@ -260,7 +269,7 @@ pub enum Payload {
     /// **Transport carrier** for an oversized bundle (DESIGN.md §20). A bundle too large
     /// to send in one shot is split into ordered `Carrier` chunks carrying its raw bytes;
     /// the receiver reassembles them and processes the original bundle as if it arrived
-    /// whole. This is invisible plumbing — distinct from `StreamData`, which is an
+    /// whole. This is invisible plumbing, distinct from `StreamData`, which is an
     /// *application* stream delivered to the app progressively (SSE/WebSocket/live).
     Carrier {
         stream_id: StreamId,
@@ -337,7 +346,7 @@ pub enum Payload {
         ciphertext: Vec<u8>,
         sig: Vec<u8>,
     },
-    /// "I can't decrypt your forward-secret messages — our ratchet desynced; please drop our
+    /// "I can't decrypt your forward-secret messages: our ratchet desynced; please drop our
     /// session and re-establish" (DESIGN.md §25). A control message, statically sealed (it
     /// carries no content). The sender drops its session and re-initiates a fresh handshake,
     /// which re-syncs the ratchet so subsequent messages decrypt again.
@@ -350,7 +359,7 @@ pub enum Payload {
 /// recognition `tag` rather than an address match, and it is not identity-signed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateHeader {
-    /// Recognition tag — `KDF(ephemeral·SPK, id)`. Only the recipient recomputes it.
+    /// Recognition tag: `KDF(ephemeral·SPK, id)`. Only the recipient recomputes it.
     pub tag: Tag,
     /// The recognition ephemeral public (the recipient DHs it against its prekey).
     pub ephemeral: XPubKeyBytes,
@@ -359,7 +368,7 @@ pub struct PrivateHeader {
     /// spool this bundle toward the recipient's want-beacon bucket. We carry ONLY the prefix, never the
     /// full 16-byte tag. The full tag is a public deterministic function of a (broadly-known) address:
     /// carrying it verbatim let a bundle-capturing address-knower recompute the target's tag and
-    /// uniquely re-link the recipient off the header — defeating the sec-priv-04 anonymity-set claim
+    /// uniquely re-link the recipient off the header, defeating the sec-priv-04 anonymity-set claim
     /// (which only routing DECISIONS honored). With just the prefix on the wire, a capturer learns only
     /// the same anonymity-set membership the routing layer already exposed: "some address colliding on
     /// this prefix", never a unique confirmation. Routing is unaffected (every decision already keyed on
@@ -377,13 +386,13 @@ pub struct SignedInner {
     /// Application namespace on the shared fabric (DESIGN.md §17).
     pub app: AppId,
     pub id: BundleId,
-    /// Sender address. Zeroed on a private bundle (§39) — its sender is anonymous.
+    /// Sender address. Zeroed on a private bundle (§39): its sender is anonymous.
     pub src: PubKeyBytes,
     /// Destination. `Broadcast` on a private bundle (§39), which floods + is recognized.
     pub dst: Destination,
     /// Present iff this is a §39 private (untraceable) bundle.
     pub private: Option<PrivateHeader>,
-    /// Sender clock in ms — advisory only (see DESIGN.md §8).
+    /// Sender clock in ms, advisory only (see DESIGN.md §8).
     pub created_at: u64,
     pub lifetime_ms: u32,
     pub flags: BundleFlags,
@@ -398,15 +407,18 @@ pub struct SignedInner {
 pub struct Envelope {
     pub hop_limit: u8,
     pub custody: Option<PubKeyBytes>,
-    /// Binary spray-and-wait copy budget held by the current custodian (§6). The
-    /// count travels with the bundle so a receiver knows how many copies it now
-    /// owns. Not signed — it's per-custodian forwarding state, not content.
+    /// RESERVED wire capacity, not a live copy budget (DESIGN.md §6). This was the binary
+    /// spray-and-wait count held by the current custodian; the router does not read it and no
+    /// forwarding decision depends on it. It is retained only because deleting a field from the
+    /// envelope would shift the C ABI metadata layout nine SDK wrappers parse. A store must
+    /// round-trip it byte-exactly (`reserved_copy_budget_survives_a_store_round_trip`) and the
+    /// simulator asserts its inertness (`the_copy_budget_is_inert`). Not signed either way.
     pub copies: u16,
-    /// Hops travelled from the source so far — incremented on each forward. Lets
+    /// Hops travelled from the source so far, incremented on each forward. Lets
     /// the destination see the path length A→B. Not signed (advisory).
     pub hops: u8,
     /// Provenance: one [`TraceHop`] per forwarder, in order (DESIGN.md §27). Not
-    /// signed — it's mutable forwarding metadata. Lets the destination see the path
+    /// signed: it's mutable forwarding metadata. Lets the destination see the path
     /// (who + which app) and nodes learn routes from ACK/trace correlation.
     pub trace: Vec<TraceHop>,
     /// §35 carriage stamp: per-bundle backbone access + metering attribution, verified by
@@ -425,11 +437,12 @@ pub struct Envelope {
 pub struct BundleOpts {
     /// Application namespace on the shared fabric (DESIGN.md §17).
     pub app: AppId,
-    /// Sender clock in ms — advisory only (see DESIGN.md §8).
+    /// Sender clock in ms, advisory only (see DESIGN.md §8).
     pub created_at: u64,
     pub lifetime_ms: u32,
     pub hop_limit: u8,
-    /// Initial spray-and-wait copy budget L (§6). 1 = direct-delivery only.
+    /// Initial value written into the RESERVED `Envelope.copies` field (§6). Nothing routes on it,
+    /// so this changes no forwarding behaviour; it only sets the bytes a store round-trips.
     pub copies: u16,
     /// Service priority (0 = lowest, default 4 = normal).
     pub priority: u8,
@@ -441,7 +454,7 @@ impl Default for BundleOpts {
         Self {
             app: FABRIC_APP,
             created_at: 0,
-            lifetime_ms: 86_400_000, // 24h — a delay-tolerant default (hops can take a long time)
+            lifetime_ms: 86_400_000, // 24h, a delay-tolerant default (hops can take a long time)
             hop_limit: 8,
             copies: 8,
             priority: 4,
@@ -462,7 +475,7 @@ impl Bundle {
     /// Build, seal, and sign a new bundle from `from` to `dst`.
     ///
     /// `seal_to` is the **address** the payload is sealed to (its X25519 key is
-    /// derived from it) — usually the destination device (B), or a gateway address
+    /// derived from it), usually the destination device (B), or a gateway address
     /// for egress (A). An address is all you need; no separate sealing key.
     pub fn create(
         from: &Identity,
@@ -506,7 +519,7 @@ impl Bundle {
 
     /// Build a §39 **private** (untraceable) bundle: no identity `src` (zeroed), it floods
     /// (`Destination::Broadcast`), and it is not identity-signed (empty `sig`). `seal_to`
-    /// seals the payload (for now to an address — session-based sealing is a later phase);
+    /// seals the payload (for now to an address; session-based sealing is a later phase);
     /// `recipient_spk_pub` is the recipient's signed-prekey public, used to derive the
     /// recognition tag only the recipient can recompute.
     pub fn create_private(
@@ -570,7 +583,7 @@ impl Bundle {
     }
 
     /// §39 delivery vaccine anti-packet (sec-priv-07): an anonymous, unsigned bundle that floods ONLY
-    /// the recipient's revealed recognition token — no plaintext delivered id. No src, no recipient,
+    /// the recipient's revealed recognition token, with no plaintext delivered id. No src, no recipient,
     /// empty seal. Self-verifying by id (`id = H(domain ‖ token)`), and since the token is effectively
     /// unique per delivered bundle (a fresh ephemeral per message), all copies of one delivery's
     /// vaccine still dedup to a single flood.
@@ -624,7 +637,7 @@ impl Bundle {
         }
     }
 
-    /// r13-01: the §39 content id — `BLAKE3(domain ‖ sealed payload)` — that the recognition tag, the
+    /// r13-01: the §39 content id (`BLAKE3(domain ‖ sealed payload)`) that the recognition tag, the
     /// delivery vaccine, and the private-ACK proof all key on. Distinct from the wire [`Bundle::id`],
     /// which also binds the recognition header so a header rewrite can't reuse a genuine id. `None` for
     /// a non-private bundle.
@@ -645,7 +658,7 @@ impl Bundle {
     pub fn verify(&self) -> Result<()> {
         // Reject a bundle whose wire version this build doesn't speak. Relays call verify()
         // before storing/forwarding (node.rs `on_bundle`), so this is the network hot-path
-        // guard that complements the decode-time check in [`Bundle::from_bytes`] — a peer on a
+        // guard that complements the decode-time check in [`Bundle::from_bytes`]: a peer on a
         // newer wire layout is rejected loudly instead of misinterpreted (F-02).
         if !is_supported_bundle_version(self.inner.version) {
             return Err(Error::UnsupportedVersion {
@@ -663,7 +676,7 @@ impl Bundle {
             if !matches!(self.inner.dst, Destination::Broadcast) {
                 return Err(Error::BadSignature);
             }
-            // core-protocol-r13-01/r14-01: the wire id binds the ENTIRE inner — the sealed payload, the
+            // core-protocol-r13-01/r14-01: the wire id binds the ENTIRE inner, meaning the sealed payload, the
             // recognition header (tag/ephemeral/mailbox), AND every scalar (app/created_at/lifetime_ms/
             // flags/priority/...). A chimera reusing the sealed bytes but rewriting the header (r13) OR a
             // twin flipping a scalar like flags.request_ack (r14) MUST carry a different id, so it can
@@ -676,19 +689,19 @@ impl Bundle {
                 Err(Error::BadSignature)
             };
         }
-        // §39 vaccine (sec-priv-07): anonymous + unsigned. Self-verifying — its id binds its own token,
+        // §39 vaccine (sec-priv-07): anonymous + unsigned. Self-verifying, since its id binds its own token,
         // so a tampered anti-packet is rejected. The token is matched against each held bundle's tag at
         // drop time; no plaintext delivered id rides in the clear.
         if let Destination::Vaccine(token) = &self.inner.dst {
-            // core-protocol-r15-01: the vaccine id binds ONLY the token (by design — so every re-emitted
+            // core-protocol-r15-01: the vaccine id binds ONLY the token (by design, so every re-emitted
             // vaccine for one delivery dedups to a single flood), which leaves the rest of the bundle
             // unbound and, like any unsigned self-verifying id, forgeable in SHAPE. A same-id twin that
             // flips `is_ack` to false passes the id check yet skips the entire is_ack-gated resolve/drop
-            // in on_bundle, so it marks the vaccine id `seen` WITHOUT purging — then the genuine
+            // in on_bundle, so it marks the vaccine id `seen` WITHOUT purging, and then the genuine
             // anti-packet is deduped out and the delivered §39 bundle lingers + re-floods to TTL
             // (epidemic recovery defeated). A payload-bearing twin would similarly amplify the flood.
             // Enforce the canonical vaccine shape at the gate: it IS an ack, it is anonymous (no src),
-            // and it carries no payload — exactly what `create_vaccine` builds.
+            // and it carries no payload, exactly what `create_vaccine` builds.
             let canonical = self.inner.flags.is_ack
                 && self.inner.src == [0u8; 32]
                 && self.inner.payload.ciphertext.is_empty();
@@ -715,17 +728,19 @@ impl Bundle {
         Ok(postcard::from_bytes(&plaintext)?)
     }
 
-    /// Binary spray-and-wait handoff (§6): split this custodian's copy budget,
-    /// reducing our own count and returning the number to give the peer
-    /// (`floor(n/2)`). At a single copy this returns 0 — the wait phase, where the
-    /// bundle is only ever handed directly to its destination.
+    /// Halve the RESERVED `copies` field, returning `floor(n/2)` and keeping the rest. This is
+    /// arithmetic on a field nothing routes on (DESIGN.md §6): it is NOT a spray-and-wait handoff,
+    /// because no caller in this repo consults it before forwarding and the router forwards
+    /// epidemically regardless of the value. Kept as a plain helper for a host that wants to meter
+    /// its own reserved field; calling it changes no forwarding behaviour.
     pub fn split_copies(&mut self) -> u16 {
         let give = self.env.copies / 2;
         self.env.copies -= give;
         give
     }
 
-    /// Are we down to the last copy (wait phase)?
+    /// Is the RESERVED `copies` field down to one? Advisory only: there is no wait phase, and a
+    /// `true` here does not stop or gate a forward (DESIGN.md §6).
     pub fn is_last_copy(&self) -> bool {
         self.env.copies <= 1
     }
@@ -772,7 +787,7 @@ impl Bundle {
         }
     }
 
-    /// Encode to the wire format (postcard — see DESIGN.md §13.4).
+    /// Encode to the wire format (postcard; see DESIGN.md §13.4).
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         if self.is_private() && !self.env.trace.is_empty() {
             let mut clean = self.clone();
@@ -827,7 +842,7 @@ fn compute_id(src: &PubKeyBytes, sealed: &Sealed) -> BundleId {
     *hasher.finalize().as_bytes()
 }
 
-/// §39 private CONTENT id: `BLAKE3(domain ‖ sealed)` — no `src`. The seal's own ephemeral + nonce make
+/// §39 private CONTENT id: `BLAKE3(domain ‖ sealed)`, no `src`. The seal's own ephemeral + nonce make
 /// it unique per message. The recognition tag is keyed on THIS (available before the wire id, so there
 /// is no id⇄tag circularity), and a header rewrite leaves it unchanged. The WIRE id (below) then binds
 /// content_id ‖ header, so the two together defeat the recognition-header chimera class.
@@ -842,11 +857,11 @@ fn compute_private_content_id(sealed: &Sealed) -> BundleId {
 
 /// §39 private WIRE id (core-protocol-r13-01 + r14-01): `BLAKE3(domain ‖ postcard(inner with id zeroed))`.
 /// This is the bundle's on-wire `id`. A private bundle carries NO signature, so its id is its ONLY
-/// integrity check — it must therefore commit to the ENTIRE [`SignedInner`]: the sealed payload, the
+/// integrity check, so it must commit to the ENTIRE [`SignedInner`]: the sealed payload, the
 /// recognition header (`tag`/`ephemeral`/`mailbox`, inside `private`), AND every scalar field
-/// (`version`/`app`/`src`/`dst`/`created_at`/`lifetime_ms`/`flags`/`priority`). Any tamper — a rewritten
+/// (`version`/`app`/`src`/`dst`/`created_at`/`lifetime_ms`/`flags`/`priority`). Any tamper, whether a rewritten
 /// recognition header (the r13 chimera class) OR a flipped scalar such as `flags.request_ack` (the r14
-/// twin, which stripped the recipient's ACK + the delivery vaccine) — yields a DIFFERENT id, so the twin
+/// twin, which stripped the recipient's ACK + the delivery vaccine), yields a DIFFERENT id, so the twin
 /// floods as its own bundle and can never occupy the genuine id at a keep-first relay store. Any relay
 /// recomputes this with NO secret, and `verify()` rejects a bundle whose id doesn't match its own bytes,
 /// closing the whole tampering class at the gate. Hashing the postcard encoding (with `id` zeroed to
@@ -863,9 +878,9 @@ fn compute_private_wire_id(inner: &SignedInner) -> BundleId {
     *hasher.finalize().as_bytes()
 }
 
-/// §39 vaccine id (sec-priv-07): `BLAKE3(domain ‖ token)` — deterministic, so all vaccines for one
+/// §39 vaccine id (sec-priv-07): `BLAKE3(domain ‖ token)`, deterministic, so all vaccines for one
 /// delivery dedup to a single flood (the token is unique per delivered bundle), and self-verifying
-/// (the id binds its own token, no signature needed — a tampered token yields a different id and is
+/// (the id binds its own token, no signature needed: a tampered token yields a different id and is
 /// rejected by `verify()`). The `v2` domain shift also hard-forks the id off the old `(delivered,
 /// token)` layout so a stale-wire anti-packet can't be mistaken for a valid one.
 fn compute_vaccine_id(token: &[u8; 32]) -> BundleId {
@@ -979,7 +994,7 @@ mod tests {
         assert_eq!(b, decoded);
         decoded.verify().unwrap();
 
-        // "Is this mine?" — the recipient's prekey recognizes it; a stranger's does not.
+        // "Is this mine?" The recipient's prekey recognizes it; a stranger's does not.
         assert!(decoded.recognized_by(&spk.secret_bytes()));
         assert!(!decoded.recognized_by(&Identity::generate().derive_prekey().secret_bytes()));
 
@@ -1091,7 +1106,7 @@ mod tests {
         // INDEX. A reorder within the same BUNDLE_VERSION would silently misdecode sealed content across
         // the fleet with no version-gate failure. Lock every variant's leading discriminant here (mirror
         // of `destination_discriminants_are_stable`) so an accidental reorder fails CI loudly. To ADD a
-        // variant, append it at the END with the next index and extend this list — never reorder.
+        // variant, append it at the END with the next index and extend this list. Never reorder.
         use crate::session::{Header, RatchetMessage};
         let ratchet = RatchetMessage {
             header: Header {
@@ -1314,15 +1329,15 @@ mod tests {
         // core-protocol-r15-01: the vaccine id = BLAKE3(domain ‖ token) binds ONLY the token, so every
         // field but the token is unbound on this unsigned, self-verifying bundle. Pre-r15 an attacker who
         // captured a genuine vaccine's (cleartext) token could mint a same-id twin with is_ack flipped
-        // OFF: it passed verify(), skipped the is_ack-gated resolve/drop, and marked the vaccine id `seen`
-        // — so the genuine anti-packet was later deduped out and the delivered §39 bundle was never purged
+        // OFF: it passed verify(), skipped the is_ack-gated resolve/drop, and marked the vaccine id `seen`,
+        // so the genuine anti-packet was later deduped out and the delivered §39 bundle was never purged
         // (epidemic recovery defeated). r15 enforces the canonical vaccine shape at verify().
         let token = [7u8; 32];
         let genuine = Bundle::create_vaccine(token, BundleOpts::default());
         assert!(genuine.verify().is_ok(), "a genuine vaccine verifies");
         assert!(genuine.inner.flags.is_ack, "a genuine vaccine is an ack");
 
-        // Same token => same id, but is_ack flipped off — the resolve-suppression twin.
+        // Same token => same id, but is_ack flipped off: the resolve-suppression twin.
         let mut no_ack = genuine.clone();
         no_ack.inner.flags.is_ack = false;
         assert_eq!(
@@ -1332,7 +1347,7 @@ mod tests {
         );
         assert!(
             no_ack.verify().is_err(),
-            "r15: a non-ack vaccine twin is rejected — it can no longer occupy the vaccine id's seen slot"
+            "r15: a non-ack vaccine twin is rejected; it can no longer occupy the vaccine id's seen slot"
         );
 
         // A payload-bearing twin (flood amplification) is rejected too.

@@ -14,14 +14,13 @@ use super::*;
 use crate::access::{CarriageStamp, Stamper};
 use crate::discover::{Advert, AdvertKind};
 use crate::hps::{self, AccessMode, ServiceKind, TopicMeta, Visibility};
-use crate::link::Frame;
 use crate::node::{LinkAuth, LinkPacket, Wire};
 use crate::reach::ReachRecord;
 use crate::session::{Header, RatchetMessage};
 use crate::store::HaveSet;
 
 pub const CORPUS_SCHEMA: u32 = 1;
-pub const CORPUS_FILE: &str = "vectors/bundle-v13.json";
+pub const CORPUS_FILE: &str = "vectors/bundle-v14.json";
 
 const CREATED_AT: u64 = 1_725_000_123_456;
 const LIFETIME_MS: u32 = 604_800_000;
@@ -1193,16 +1192,6 @@ fn nested_layouts(reference_id: &BundleId) -> Vec<EncodingVector> {
             service_pubkey: Some(bytes32(0x34)),
         },
     ));
-    out.push(encoded(
-        "layout",
-        "Frame",
-        &Frame {
-            bundle_id: bytes32(0xa0),
-            frag_index: 1,
-            frag_count: 3,
-            bytes: vec![0x00, 0x7f, 0x80, 0xff],
-        },
-    ));
     out
 }
 
@@ -1361,7 +1350,10 @@ mod tests {
     #[test]
     fn corpus_covers_every_current_wire_enum_variant() {
         let corpus = corpus();
-        assert_eq!(corpus.bundle_version, 13);
+        // Deliberately a LITERAL, not `BUNDLE_VERSION`: comparing the constant to itself would
+        // pass through any bump unread. This line is the tripwire that makes a bump a decision,
+        // so update it only after checking the corpus really was regenerated for that version.
+        assert_eq!(corpus.bundle_version, 14);
         let destinations: BTreeSet<_> = corpus
             .destinations
             .iter()

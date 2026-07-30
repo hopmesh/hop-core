@@ -94,9 +94,7 @@ pub mod prelude {
     };
     pub use crate::discover::{Advert, AdvertBody, AdvertId, AdvertKind, Directory};
     pub use crate::error::{Error, Result};
-    pub use crate::link::{
-        fragment, Bearer, BearerEvent, Frame, LinkHandshake, LinkId, LinkSession, Reassembler, Role,
-    };
+    pub use crate::link::{BearerEvent, LinkHandshake, LinkId, LinkSession, Role};
     pub use crate::node::{
         HnsLookup, HnsResult, IdentityRecord, Node, NodeKind, ServiceReqItem, ServiceRespItem,
         SERVICE_IDENTIFY,

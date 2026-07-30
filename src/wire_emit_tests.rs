@@ -191,6 +191,81 @@ fn frame_record_fragments_in_order_above_the_threshold() {
     }
 }
 
+/// The framing ROUND TRIP, on both branches: whatever `frame_record` emits must decode inside the
+/// accepted envelope and reassemble to exactly the plaintext that went in.
+///
+/// The test above pins fragment ORDER but never reassembles, so a framing bug that dropped or
+/// duplicated a piece's bytes while keeping the indices tidy would pass it. This is also the exact
+/// invariant `wire_emit::fuzz_record_framing` asserts, so the always-run suite covers it
+/// deterministically instead of relying on the fuzzer to generate a large enough input (audit
+/// PROC-001, when `link_framing_reassembly` was repointed off the deleted generic framing layer).
+#[test]
+fn framing_round_trips_on_both_the_single_and_fragmented_branches() {
+    for (label, count) in [("single Data", 4usize), ("fragmented", 3_000usize)] {
+        let ids = vec![[0x5au8; 32]; count];
+        let record = Wire::Have(crate::store::HaveSet { ids });
+        let plaintext = postcard::to_allocvec(&record).expect("record encodes");
+        let framed = frame_record(&record, |piece| Some(piece.to_vec()));
+        assert!(!framed.is_empty(), "{label}: expected framing");
+
+        let mut buffered: Vec<u8> = Vec::new();
+        let mut next_idx: u16 = 0;
+        for bytes in &framed {
+            match decode_link_packet(bytes).expect("packet decodes") {
+                LinkPacket::Data(ct) => {
+                    assert_eq!(
+                        framed.len(),
+                        1,
+                        "{label}: a lone Data packet is the whole record"
+                    );
+                    buffered.extend_from_slice(&ct);
+                }
+                LinkPacket::DataFrag { idx, cnt, ct } => {
+                    assert_eq!(
+                        usize::from(cnt),
+                        framed.len(),
+                        "{label}: count matches pieces"
+                    );
+                    assert_eq!(idx, next_idx, "{label}: ascending index order");
+                    assert!(
+                        fragment_bounds_ok(cnt, ct.len(), buffered.len()),
+                        "{label}: emitted a piece outside the reassembly envelope"
+                    );
+                    buffered.extend_from_slice(&ct);
+                    next_idx += 1;
+                }
+                LinkPacket::Handshake(_) => panic!("{label}: framing emitted a Handshake packet"),
+            }
+        }
+        assert_eq!(
+            buffered, plaintext,
+            "{label}: round trip lost or reordered bytes"
+        );
+    }
+    // And the branches really are different, so this is not two runs of the same path.
+    let single = frame_record(
+        &Wire::Have(crate::store::HaveSet {
+            ids: vec![[0x5au8; 32]; 4],
+        }),
+        |piece| Some(piece.to_vec()),
+    );
+    let many = frame_record(
+        &Wire::Have(crate::store::HaveSet {
+            ids: vec![[0x5au8; 32]; 3_000],
+        }),
+        |piece| Some(piece.to_vec()),
+    );
+    assert_eq!(
+        single.len(),
+        1,
+        "small record must take the single-Data branch"
+    );
+    assert!(
+        many.len() > 1,
+        "large record must take the fragmented branch"
+    );
+}
+
 #[test]
 fn frame_record_abandons_the_remainder_when_the_ratchet_fails() {
     let ids = vec![[0x5au8; 32]; 3_000];

@@ -309,6 +309,87 @@ pub fn fuzz_link_packet(bytes: &[u8]) {
     }
 }
 
+/// Feature-scoped round-trip entry point for cargo-fuzz over the framing path that PRODUCTION
+/// actually runs: [`frame_record`] out, [`decode_link_packet`] plus [`fragment_bounds_ok`] back in.
+///
+/// This exists because the fuzz suite used to aim `link_framing_reassembly` at
+/// `link::{Frame, fragment, Reassembler}`, a second generic framing layer that no production code
+/// path ever called. Deleting that dead layer in the v13 to v14 bump (audit PROC-001) would have
+/// dropped a fuzz target outright, so the target was repointed here rather than removed: the fuzzer
+/// now exercises the framing that really carries records, which is strictly better coverage than
+/// the layer it replaced.
+///
+/// `Wire::Have` is the carrier because it is the cheapest byte-carrying record to build from
+/// arbitrary input, and a large enough id set pushes the plaintext past [`MAX_RECORD_PLAINTEXT`]
+/// so the multi-fragment branch is reached, not just the single-`Data` common case. Encryption is
+/// the identity function on purpose: the ratchet is fuzzed elsewhere, and framing must hold
+/// independently of it.
+///
+/// The invariant asserted: whatever is framed decodes back inside the accepted envelope and
+/// reassembles to the exact plaintext that went in. A panic or a mismatch is a finding.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_record_framing(bytes: &[u8]) {
+    let ids: Vec<crate::bundle::BundleId> = bytes
+        .chunks(32)
+        .take(MAX_RECORD_FRAGMENTS * (MAX_RECORD_PLAINTEXT / 32) + 8)
+        .map(|chunk| {
+            let mut id = [0u8; 32];
+            id[..chunk.len()].copy_from_slice(chunk);
+            id
+        })
+        .collect();
+    let record = Wire::Have(crate::store::HaveSet { ids });
+    let Ok(plaintext) = postcard::to_allocvec(&record) else {
+        return;
+    };
+
+    let framed = frame_record(&record, |piece| Some(piece.to_vec()));
+    if framed.is_empty() {
+        // Over MAX_RECORD_FRAGMENTS pieces: refusing to frame is the correct outcome.
+        return;
+    }
+
+    let mut buffered: Vec<u8> = Vec::new();
+    let mut next_idx: u16 = 0;
+    for packet_bytes in &framed {
+        let Some(packet) = decode_link_packet(packet_bytes) else {
+            panic!("frame_record emitted a packet decode_link_packet rejects");
+        };
+        match packet {
+            LinkPacket::Data(ct) => {
+                assert_eq!(
+                    framed.len(),
+                    1,
+                    "a single Data packet must be the whole record"
+                );
+                buffered.extend_from_slice(&ct);
+            }
+            LinkPacket::DataFrag { idx, cnt, ct } => {
+                assert_eq!(
+                    usize::from(cnt),
+                    framed.len(),
+                    "fragment count must match the number of emitted pieces"
+                );
+                assert_eq!(
+                    idx, next_idx,
+                    "fragments must be emitted in ascending index order"
+                );
+                assert!(
+                    fragment_bounds_ok(cnt, ct.len(), buffered.len()),
+                    "frame_record emitted a piece outside the reassembly envelope"
+                );
+                buffered.extend_from_slice(&ct);
+                next_idx += 1;
+            }
+            LinkPacket::Handshake(_) => panic!("frame_record must never emit a Handshake packet"),
+        }
+    }
+    assert_eq!(
+        buffered, plaintext,
+        "framing round trip lost or reordered bytes"
+    );
+}
+
 // Layout-pinning tests live OUTSIDE this file on purpose: this file is hashed by the wire-version
 // guard, so test churn here would demand a BUNDLE_VERSION bump. See `wire_emit_tests.rs`.
 #[cfg(test)]
