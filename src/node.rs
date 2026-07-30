@@ -179,7 +179,7 @@ pub const RECV_BEACON_REFRESH_MS: u64 = 30_000;
 pub const MAX_RECV_BEACON_DISTANCE: u8 = 3;
 /// Per-link fixed-window rate limit for inbound receiver-beacons. A legitimate peer emits its own
 /// two epoch prefixes on its refresh interval, plus at most one keep-alive per bucket it forwards
-/// (bounded by [`MAX_GRADIENT_BUCKETS_PER_LINK`]), so a real burst tops out around 64 in a window.
+/// (bounded by [`MAX_GRADIENT_BUCKETS_PER_PEER`]), so a real burst tops out around 64 in a window.
 /// Double that leaves headroom while still ending a line-rate flood.
 const RECV_BEACON_WINDOW_MS: u64 = 1_000;
 const MAX_RECV_BEACONS_PER_WINDOW: u32 = 128;
@@ -259,6 +259,16 @@ const OPK_RETAIN_AFTER_USE_MS: u64 = 6 * 3_600_000;
 /// busy node does not run dry between SPK rotations and silently fall back to 3-DH.
 const OPK_REPLENISH_BELOW: usize = 4;
 
+/// Absolute ceiling on retained one-time-prekey secrets, oldest-minted evicted first.
+///
+/// core-protocol-r19-01. `reap_opks` only ever drops a secret that was MARKED USED, so every
+/// replenish that fires while some of the old batch is still unspent leaked those unspent secrets
+/// permanently: the map only grew. That is a slow leak under honest traffic and the growth term an
+/// attacker aimed at by burning OPKs. A hard cap makes the bound absolute rather than behavioural.
+/// Several batches deep so an in-flight handshake against a superseded advert still resolves, and
+/// comfortably above [`OPK_BATCH_SIZE`] so the just-minted batch is never the eviction victim.
+const MAX_RETAINED_OPK_SECRETS: usize = 8 * OPK_BATCH_SIZE;
+
 /// The current prekey epoch for a clock reading.
 fn prekey_epoch(now_ms: u64) -> u64 {
     now_ms / PREKEY_EPOCH_MS
@@ -324,28 +334,104 @@ const PEER_SENT_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 /// [`crypto::MAILBOX_ROUTE_PREFIX_BYTES`] is 1: only 256 distinct route keys exist, so the table
 /// tops out two orders of magnitude below this. It is kept as a backstop for a future wider prefix,
 /// NOT as the anti-flood control. The control that actually binds is
-/// [`MAX_GRADIENT_BUCKETS_PER_LINK`], because the resource an attacker can consume is buckets *on
-/// its own link*, and nothing capped that before.
+/// [`MAX_GRADIENT_BUCKETS_PER_PEER`], because the resource an attacker can consume is buckets it
+/// occupies under its own authenticated identity, and nothing capped that before.
 pub const MAX_RECV_GRADIENT: usize = 4_096;
 
-/// Cap on how many route-prefix buckets ONE link may occupy in the gradient, with least-recently-
-/// seen eviction of that link's own entries.
+/// Cap on how many route-prefix buckets ONE AUTHENTICATED PEER may occupy in the gradient, summed
+/// over every link that peer holds, with least-recently-seen eviction of that peer's own entries.
 ///
 /// This is the bound that makes an unsigned beacon safe. A hostile neighbour can mint beacons for
 /// any prefix it likes (there is no signature to stop it, and under prefix routing there is nothing
 /// coherent to forge anyway: a bucket is shared by an anonymity set by design). What it must not be
-/// able to do is claim EVERY bucket and pull the node's whole private-forwarding decision onto its
-/// own link. At 64 of the 256 buckets a single link can capture at most a quarter of the routing
-/// space, and eviction is scoped to that link's own entries so one link's grinding never displaces
-/// another link's genuine route. The cost of being capped is graceful: an unrouted prefix falls
+/// able to do is claim EVERY bucket and pull the node's whole private-forwarding decision onto
+/// itself. At 64 of the 256 buckets one peer can capture at most a quarter of the routing space,
+/// and eviction is scoped to that peer's own entries so one peer's grinding never displaces
+/// another peer's genuine route. The cost of being capped is graceful: an unrouted prefix falls
 /// back to blind flood, which is where §39 started.
-pub const MAX_GRADIENT_BUCKETS_PER_LINK: usize = 64;
+///
+/// security-privacy-r19-01: THE ENFORCEMENT UNIT IS THE PEER, NOT THE LINK. It used to be the
+/// LinkId, which is a per-connection integer the far side mints for free: `on_connected` imposes no
+/// per-peer link limit and `hop-relayd` hands every inbound connection a fresh id, so one Ed25519
+/// identity opening 4 connections bought 4 x 64 = 256 buckets, i.e. the WHOLE table at
+/// `MAILBOX_ROUTE_PREFIX_BYTES = 1`. The quota now keys on the Noise-authenticated peer address
+/// carried in `LinkState::Up`, which is the only identity this node can actually punish, so extra
+/// connections buy no extra quota. A link with no established peer (only `LOCAL_LINK` in practice)
+/// falls back to being its own quota unit.
+pub const MAX_GRADIENT_BUCKETS_PER_PEER: usize = 64;
 
 /// core-protocol-r3-02: cap on remembered vaccine tokens whose target hadn't arrived yet (see
 /// `seen_vaccine_tokens`). Bounds the memory a distinct-token vaccine flood can pin; on overflow the
 /// oldest token is dropped (its target, if it ever arrives, then just falls back to TTL reclamation
 /// (the pre-fix behavior), never a black-hole). Same order as the private-bundle store cap.
 pub const MAX_SEEN_VACCINE_TOKENS: usize = 4_096;
+
+/// security-privacy-r19-02: how many held-store RESOLUTION PASSES a node will spend on §39 delivery
+/// vaccines per [`VACCINE_SCAN_WINDOW_MS`], across all links.
+///
+/// A vaccine is self-verifying from an attacker-chosen 32-byte token (`compute_vaccine_id` binds
+/// only the token), so minting a fresh, valid, never-before-seen one is free and unauthenticated.
+/// `resolve_vaccine_target` is O(held store) and on `hop-relayd` that is a `SELECT id` plus one
+/// `SELECT data` + postcard decode PER HELD BUNDLE on the single driver thread, at
+/// `set_max_relayed(8192)`. The `seen`-id short circuit bounds DUPLICATES of one vaccine; it does
+/// nothing about a stream of DISTINCT tokens, which the arrival rate limit alone lets scale linearly
+/// with the attacker's budget. This cap breaks that link: the number of store passes per window is a
+/// constant, independent of how many vaccines arrive. Over-budget tokens are queued and resolved in
+/// batched passes (see `pending_vaccine_tokens`), so a genuine vaccine caught in a flood still purges
+/// its target, just a beat later.
+pub const MAX_VACCINE_SCAN_PASSES_PER_WINDOW: u32 = 4;
+
+/// Window for [`MAX_VACCINE_SCAN_PASSES_PER_WINDOW`].
+pub const VACCINE_SCAN_WINDOW_MS: u64 = 1_000;
+
+/// How many queued tokens ONE batched resolution pass tests. A pass loads each held bundle once and
+/// hashes it against every token in the batch, so this (not the queue depth) is what multiplies the
+/// per-pass cost: one pass costs `held` store reads plus `held x batch` BLAKE3 hashes over 48 bytes.
+/// Bounding the batch rather than the queue is what lets the queue be deep enough that no single
+/// identity's arrival budget can push it to its bound (see [`MAX_PENDING_VACCINE_TOKENS`] for the
+/// arithmetic, and for what a multi-identity flood can still cost).
+pub const VACCINE_TOKENS_PER_SCAN_PASS: usize = 32;
+
+/// Depth of the deferred-resolution backlog (see `pending_vaccine_tokens`). 16 KiB of tokens.
+///
+/// The drain rate is GUARANTEED, not best-effort: the deferred drain holds its own pass budget,
+/// separate from arrival-time resolution (see [`Node::take_vaccine_scan_budget`]), so it always gets
+/// [`VACCINE_TOKENS_PER_SCAN_PASS`] x [`MAX_VACCINE_SCAN_PASSES_PER_WINDOW`] = 128 tokens per
+/// [`VACCINE_SCAN_WINDOW_MS`], i.e. 128/s, however hard the node is being flooded. With a SHARED
+/// budget this rate was best-effort and the claim was false: arrivals are checked first per packet, so
+/// a flood spent the window on arrivals, starved the drain to zero passes, and walked the backlog to
+/// the bound on its own.
+///
+/// Scoped honestly, because the rate only bounds the queue relative to an ARRIVAL rate, and hop-core
+/// itself does not cap vaccine arrivals (a vaccine is `is_ack`, so it is exempt from the F-07 per-link
+/// private-ingest limit). Behind `hop-relayd`, one identity's whole frame budget is
+/// `MAX_PEER_MSGS_PER_WINDOW` = 300 per 10 s = 30/s, well under the 128/s drain, so one identity
+/// cannot grow this queue at all. What CAN reach the bound is a Sybil fleet, or a bearer that admits
+/// vaccines faster than 128/s with no such per-identity budget in front of it. At the bound the
+/// residual below applies.
+///
+/// Stated plainly, because the bound is real and the previous comment here overclaimed it: at the
+/// bound the OLDEST queued token is evicted, and an evicted token is handed to
+/// [`Node::remember_vaccine_token`] so it keeps its ability to purge a target that arrives LATER. What
+/// it loses is the retroactive sweep against bundles the node ALREADY holds. That loss is permanent
+/// for that token, because `store.put` marked the vaccine's own id `seen` on arrival, so no re-flooded
+/// copy re-enters the resolution path. Under a flood deep enough to reach this bound, a genuine
+/// vaccine can therefore fail to purge an already-held target, which leaves that bundle to expire at
+/// its clamped TTL and leaves the sender's own send on "sending" until the private ACK arrives.
+pub const MAX_PENDING_VACCINE_TOKENS: usize = 512;
+
+/// security-privacy-r19-02: cap on how many §39 delivery vaccines a node holds for onward flood at
+/// once, carved out of (not additional to) the `max_relayed` custody window.
+///
+/// A vaccine must be able to PURGE, and must never occupy more custody than this fixed carve-out (it
+/// does occupy up to `MAX_RELAYED_VACCINES` slots; the claim is a bound, not zero). Forging one is free
+/// and unauthenticated, and vaccines are deliberately exempt from the §35 carriage gate (stamping one
+/// would leak the recipient), so without a separate ceiling a distinct-token flood turns the whole window
+/// over to attacker-minted anti-packets and collapses every genuine held bundle's residency to the
+/// time it takes to push 8192 forgeries. Held vaccines are evicted oldest-first among THEMSELVES, so
+/// the flood eats its own tail instead of genuine carriage. Large enough that ordinary vaccine
+/// traffic (one per private delivery, cleared as soon as it purges) never touches the bound.
+pub const MAX_RELAYED_VACCINES: usize = 64;
 
 /// TTL for an `hps://` discoverable-topic advert (7 days). Re-publish before it lapses so
 /// same-app peers keep seeing the topic (DESIGN.md §32).
@@ -392,6 +478,22 @@ struct GradientLink {
     /// LEAST-RECENTLY-SEEN link (security-privacy-r2-04), so a recipient that re-beacons on its
     /// short interval is never crowded out by a link that claimed a slot once and went quiet.
     last_seen: u64,
+}
+
+/// security-privacy-r19-01: the unit [`MAX_GRADIENT_BUCKETS_PER_PEER`] is charged against.
+///
+/// `Peer` is the Noise-authenticated address from `LinkState::Up`, and it covers every link that
+/// identity holds at once, which is what stops extra connections buying extra quota. `Link` is the
+/// fallback for a link with no established peer (`LOCAL_LINK`, or one still handshaking): there is no
+/// identity to aggregate under, and it is not a path an outside party can multiply.
+///
+/// Holding the identity rather than a materialized list of its link ids is deliberate: membership is
+/// then one hash lookup (`Node::quota_unit_holds_link`) instead of a scan of the node's whole link
+/// table, and an inbound beacon is unauthenticated and attacker-triggerable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GradientQuota {
+    Peer(PubKeyBytes),
+    Link(LinkId),
 }
 
 /// sec-priv-04: routing keys on the tag PREFIX (an anonymity set), so a single bucket may cover
@@ -991,6 +1093,10 @@ pub struct Node<S: Store = MemoryStore> {
     opk_secrets: HashMap<u32, zeroize::Zeroizing<[u8; 32]>>,
     /// First-use time per OPK id, driving the [`OPK_RETAIN_AFTER_USE_MS`] reap.
     opk_used_at: HashMap<u32, u64>,
+    /// Mint order of every id in `opk_secrets`, so [`MAX_RETAINED_OPK_SECRETS`] can evict the
+    /// oldest-minted secret. Ids wrap (`opk_next_id` starts at a random per-process offset and
+    /// wraps), so "oldest" cannot be read off the numeric id; it has to be recorded.
+    opk_order: VecDeque<u32>,
     /// OPK ids we have already spent on a given peer, so a second session to the same
     /// peer picks a different one instead of respending (which would silently collapse
     /// back to the security of a single OPK).
@@ -1012,7 +1118,8 @@ pub struct Node<S: Store = MemoryStore> {
     /// in that prefix's anonymity set. Laid by link-local, unsigned [`Wire::RecvBeacon`] records as
     /// they walk out from a recipient under a distance cap; a node then forwards a matching
     /// **private** bundle down those links instead of blind-flooding. Soft state, pruned by
-    /// `expires_at` in [`Node::tick`], capped per link by [`MAX_GRADIENT_BUCKETS_PER_LINK`] and
+    /// `expires_at` in [`Node::tick`], capped per authenticated peer by
+    /// [`MAX_GRADIENT_BUCKETS_PER_PEER`] and
     /// globally by [`MAX_RECV_GRADIENT`]. Empty ⇒ flood fallback (the privacy floor / cold start).
     recv_gradient: HashMap<Tag, GradientEntry>,
     /// §39 P5: mailbox-tags whose recipient just (re)beaconed here, i.e. a want-beacon. The host
@@ -1052,6 +1159,24 @@ pub struct Node<S: Store = MemoryStore> {
     /// and capped at [`MAX_SEEN_VACCINE_TOKENS`] (oldest-evicted) so a distinct-token flood can't grow
     /// it without bound.
     seen_vaccine_tokens: HashMap<[u8; 32], u64>,
+    /// security-privacy-r19-02: vaccine tokens whose held-store resolution pass was over the
+    /// [`MAX_VACCINE_SCAN_PASSES_PER_WINDOW`] budget when they arrived. Drained in [`Node::tick`] by
+    /// batched passes of [`VACCINE_TOKENS_PER_SCAN_PASS`] tokens (one pass loads each held bundle once
+    /// and tests it against the whole batch), so an unauthenticated flood cannot scale the node's scan
+    /// work with its own packet rate. Depth-capped by [`MAX_PENDING_VACCINE_TOKENS`], whose overflow
+    /// path (`defer_vaccine_scan`) remembers the evicted token rather than discarding it.
+    pending_vaccine_tokens: VecDeque<[u8; 32]>,
+    /// Fixed-window counter for arrival-time resolution passes: (window start ms, passes).
+    vaccine_scan_window: (u64, u32),
+    /// The DEFERRED DRAIN's own fixed-window pass counter, deliberately separate from
+    /// `vaccine_scan_window`. One shared counter let a sustained flood spend the whole window on
+    /// arrivals and starve the drain to zero passes, so the backlog only grew. See
+    /// [`Node::take_vaccine_scan_budget`].
+    vaccine_drain_window: (u64, u32),
+    /// security-privacy-r19-02: ids of held §39 delivery vaccines, oldest-admitted first. Bounded by
+    /// [`MAX_RELAYED_VACCINES`] so freely-mintable anti-packets can never take over the `max_relayed`
+    /// custody window that genuine (stamped, on a Keyed relay) carriage competes for.
+    relay_vaccines: VecDeque<BundleId>,
     /// Observability: when `observe` is on, each bundle sent over a link
     /// is recorded as (link, bundle_id, is_final_delivery), drained via [`Node::drain_transfers`].
     /// Never enabled in production; zero cost when off.
@@ -1386,6 +1511,7 @@ impl<S: Store> Node<S> {
             .map(|(id, sec)| (id, zeroize::Zeroizing::new(sec)))
             .collect();
         let opk_next_id = opk_first_id.wrapping_add(OPK_BATCH_SIZE as u32);
+        let opk_order: VecDeque<u32> = opk_batch.publics.iter().map(|o| o.id).collect();
         let mut node = Self {
             identity,
             store,
@@ -1419,6 +1545,7 @@ impl<S: Store> Node<S> {
             opk_next_id,
             opk_secrets,
             opk_used_at: HashMap::new(),
+            opk_order,
             opk_spent: HashSet::new(),
             recv_gradient: HashMap::new(),
             wanted_mailboxes: Vec::new(),
@@ -1428,6 +1555,10 @@ impl<S: Store> Node<S> {
             immune: HashMap::new(),
             delivered_private: HashSet::new(),
             seen_vaccine_tokens: HashMap::new(),
+            pending_vaccine_tokens: VecDeque::new(),
+            vaccine_scan_window: (0, 0),
+            vaccine_drain_window: (0, 0),
+            relay_vaccines: VecDeque::new(),
             observe: false,
             transfers: Vec::new(),
             sends_delivered: Vec::new(),
@@ -2786,10 +2917,29 @@ impl<S: Store> Node<S> {
             OPK_BATCH_SIZE,
         );
         for (id, sec) in batch.secret_bytes() {
-            self.opk_secrets.insert(id, zeroize::Zeroizing::new(sec));
+            if self
+                .opk_secrets
+                .insert(id, zeroize::Zeroizing::new(sec))
+                .is_none()
+            {
+                self.opk_order.push_back(id);
+            }
         }
         self.opk_next_id = self.opk_next_id.wrapping_add(OPK_BATCH_SIZE as u32);
         self.opk_batch = batch;
+        // core-protocol-r19-01: hold the retained-secret set to an ABSOLUTE bound. `reap_opks`
+        // only drops MARKED-USED secrets, so an unspent secret from a superseded batch was
+        // retained forever and every replenish grew the map. Evict oldest-minted first; the batch
+        // just minted is at the back and MAX_RETAINED_OPK_SECRETS is several batches deep, so a
+        // still-live advert is never the victim.
+        while self.opk_secrets.len() > MAX_RETAINED_OPK_SECRETS {
+            let Some(oldest) = self.opk_order.pop_front() else {
+                break;
+            };
+            // Zeroizing's Drop wipes the secret; removing the entry is what ends its life.
+            self.opk_secrets.remove(&oldest);
+            self.opk_used_at.remove(&oldest);
+        }
     }
 
     /// Wipe used OPK secrets past [`OPK_RETAIN_AFTER_USE_MS`], and replenish the
@@ -2808,6 +2958,9 @@ impl<S: Store> Node<S> {
             self.opk_secrets.remove(&id);
             self.opk_used_at.remove(&id);
         }
+        // Keep the mint-order ledger in step with the secret map, or it becomes its own leak.
+        self.opk_order
+            .retain(|id| self.opk_secrets.contains_key(id));
         // Unused OPKs from the currently published batch are what senders can still pick.
         let unused = self
             .opk_batch
@@ -2952,6 +3105,19 @@ impl<S: Store> Node<S> {
     /// window, so a private bundle addressed or spooled under a just-rotated tag (sender a bit
     /// behind, or spooled before the boundary) is still routed and pulled. Distinct epochs usually
     /// land in distinct prefix buckets, but not always at a 1-byte prefix, hence the dedup.
+    ///
+    /// security-privacy-r19-06, OPEN and stated rather than claimed away: this emits both prefixes
+    /// back to back on the SAME link, so our observable footprint per publish is `1 +
+    /// MAILBOX_EPOCH_WINDOW` prefixes, not one. Both are pure public functions of our public address
+    /// (`H(addr, e)[0]`, `H(addr, e-1)[0]`), so an observer that can attribute the pair to one source
+    /// and holds a candidate address confirms it at `1/65536` rather than the `1/256` the §39
+    /// anonymity-set figure quotes, and across `d` epoch boundaries the chain of overlapping pairs
+    /// yields `d + 1` bytes, a stable long-lived fingerprint. DESIGN.md §39 now states that figure and
+    /// the observer scope it applies to (a direct Noise neighbour already knows the beacon is ours, so
+    /// what it gains is selector width, not the fact of reachability). Closing it rather than
+    /// documenting it means not co-emitting the epochs attributably: stagger them, or serve the
+    /// previous epoch only from the spool. `a_recipients_beacon_footprint_per_publish_is_pinned` pins
+    /// the count so it cannot drift away from the documented figure unnoticed.
     fn publish_recv_beacon_on(&mut self, link: LinkId) {
         let addr = self.identity.address();
         let cur = mailbox_epoch(self.now_ms);
@@ -3025,14 +3191,24 @@ impl<S: Store> Node<S> {
         }
     }
 
-    /// sec-priv-07: recover which held private bundle a token-only delivery vaccine clears. The
+    /// sec-priv-07: recover which held private bundle each token-only delivery vaccine clears. The
     /// anti-packet no longer names a bundle id, so we test the revealed token against each held private
     /// bundle's own recognition tag: `recognition_tag_from_shared(token, held_id) == held_tag` holds iff
     /// this token is the recipient's DH for that exact bundle. A forged/foreign token matches nothing.
-    /// Bounded by the held-private-bundle count (the relay eviction cap), and run at most once per
-    /// unique vaccine (the flood is id-deduped upstream), so it is not a hot-path cost. Returns the
-    /// matched bundle id, or `None` if we hold no bundle this vaccine clears.
-    fn resolve_vaccine_target(&self, token: &[u8; 32]) -> Option<BundleId> {
+    ///
+    /// security-privacy-r19-02: takes a SLICE of tokens and resolves them in ONE pass over the held
+    /// store, because the pass, not the per-token comparison, is the expensive half. On `hop-relayd`
+    /// the store is SQLite, so a pass is `SELECT id` plus one `SELECT data` + postcard decode per held
+    /// bundle on the single driver thread; the per-token work on top of that is one BLAKE3 over 48
+    /// bytes. Batching is what lets [`MAX_VACCINE_SCAN_PASSES_PER_WINDOW`] bound the node's total
+    /// resolution cost per window without dropping anyone's vaccine. Returns the matched bundle id per
+    /// token, positionally, `None` where we hold nothing that token clears.
+    fn resolve_vaccine_targets(&self, tokens: &[[u8; 32]]) -> Vec<Option<BundleId>> {
+        let mut found: Vec<Option<BundleId>> = vec![None; tokens.len()];
+        if tokens.is_empty() {
+            return found;
+        }
+        let mut remaining = tokens.len();
         for id in self.store.have().ids {
             let Some(b) = self.store.get(&id) else {
                 continue;
@@ -3044,11 +3220,135 @@ impl<S: Store> Node<S> {
             ) else {
                 continue;
             };
-            if crypto::recognition_tag_from_shared(token, &content_id) == tag {
-                return Some(id);
+            for (slot, token) in found.iter_mut().zip(tokens) {
+                if slot.is_some() {
+                    continue;
+                }
+                if crypto::recognition_tag_from_shared(token, &content_id) == tag {
+                    *slot = Some(id);
+                    remaining -= 1;
+                }
+            }
+            if remaining == 0 {
+                break;
             }
         }
-        None
+        found
+    }
+
+    /// Act on a vaccine that resolved to a bundle we hold: mark our own send delivered, meter the
+    /// carriage, drop our copy and refuse any future one.
+    ///
+    /// The SENDER treats a verified vaccine as PROOF OF DELIVERY. Its private ACK can be lost (a
+    /// throttled link, a single-carrier contact), and once the vaccine has immunized the mesh,
+    /// retransmits can never trigger a re-ACK, so a lost ack would strand the sender on "Sending…"
+    /// forever. The vaccine floods network-wide and carries the same CDH token only the true
+    /// recipient can compute, so it is exactly as trustworthy as the ACK (minus hop/latency
+    /// metadata, which stays at its last-known values).
+    fn apply_vaccine_delivery(&mut self, delivered: BundleId) {
+        let display = self.display_id(&delivered);
+        if let Some(info) = self.tx.get_mut(&display) {
+            if !info.delivered {
+                info.delivered = true;
+                self.pending.remove(&delivered);
+                self.pending.remove(&display);
+                if self.observe {
+                    self.sends_delivered.push(display);
+                }
+            }
+        }
+        // §35: a §39 delivery vaccine proves this relay's held private bundle was delivered (the
+        // same delivery-justified atom, on the untraceable path).
+        self.meter_delivered(&delivered);
+        self.store.remove(&delivered);
+        self.relay_order.retain(|x| *x != delivered);
+        self.relay_vaccines.retain(|x| *x != delivered);
+        self.immune.insert(delivered, self.now_ms);
+    }
+
+    /// Whether a held-store resolution pass may run now, spending one unit of the
+    /// [`MAX_VACCINE_SCAN_PASSES_PER_WINDOW`] budget. Fixed window, node-global: the resource being
+    /// protected (the store, and on a relay the one SQLite driver thread) is node-global, so a
+    /// per-link budget would just be another integer the attacker mints by reconnecting.
+    ///
+    /// ARRIVALS and the DEFERRED DRAIN hold SEPARATE budgets, which matters and is not a detail. With
+    /// one shared counter, a sustained flood spends the whole window on arrivals (an arrival is checked
+    /// first, per packet) and `drain_pending_vaccine_scans` is starved to zero passes, so the backlog
+    /// only ever grows and every genuine vaccine in it walks to the queue bound. Splitting them means
+    /// the drain always gets its own `MAX_VACCINE_SCAN_PASSES_PER_WINDOW` passes, i.e. a guaranteed
+    /// `VACCINE_TOKENS_PER_SCAN_PASS x MAX_VACCINE_SCAN_PASSES_PER_WINDOW` tokens per window, no matter
+    /// how hard the node is being flooded. The invariant this whole control exists for is unharmed:
+    /// total store passes per window is still a CONSTANT independent of the attacker's packet rate,
+    /// just 2x the constant (arrivals + drain) rather than 1x.
+    fn take_vaccine_scan_budget(&mut self) -> bool {
+        Self::take_pass_budget(&mut self.vaccine_scan_window, self.now_ms)
+    }
+
+    /// The deferred drain's own budget. See [`Node::take_vaccine_scan_budget`] for why it is separate.
+    fn take_vaccine_drain_budget(&mut self) -> bool {
+        Self::take_pass_budget(&mut self.vaccine_drain_window, self.now_ms)
+    }
+
+    /// One fixed-window pass counter.
+    fn take_pass_budget(window: &mut (u64, u32), now_ms: u64) -> bool {
+        let (start, passes) = window;
+        if now_ms.saturating_sub(*start) >= VACCINE_SCAN_WINDOW_MS {
+            *start = now_ms;
+            *passes = 0;
+        }
+        if *passes >= MAX_VACCINE_SCAN_PASSES_PER_WINDOW {
+            return false;
+        }
+        *passes += 1;
+        true
+    }
+
+    /// Queue a vaccine token for the deferred batched pass (see `pending_vaccine_tokens`).
+    ///
+    /// security-privacy-r19-02 (closure): the bound is [`MAX_PENDING_VACCINE_TOKENS`] and it evicts
+    /// the OLDEST queued token, so it MUST NOT simply drop it. `store.put` marked that vaccine's own
+    /// id `seen` when it arrived, and the ingest arm is guarded on `!self.store.seen(&id)`, so a
+    /// dropped token is never reconsidered: no re-flooded copy of it can re-enter resolution. A
+    /// genuine delivery vaccine dropped here would be lost permanently, and the §39 vaccine IS the
+    /// delivery-confirmation path (`apply_vaccine_delivery` is what clears the sender's own send), so
+    /// bounding forged ones by discarding real ones trades a DoS for lost deliveries.
+    ///
+    /// Hand the evicted token to `remember_vaccine_token` instead. It keeps the half that needs no
+    /// store pass (purging a target that arrives later, via `already_vaccinated_by_token` at first
+    /// store) and loses only the retroactive sweep over bundles already held. That residual is stated
+    /// on [`MAX_PENDING_VACCINE_TOKENS`]; it is not claimed away.
+    fn defer_vaccine_scan(&mut self, token: [u8; 32]) {
+        if self.pending_vaccine_tokens.contains(&token) {
+            return;
+        }
+        if self.pending_vaccine_tokens.len() >= MAX_PENDING_VACCINE_TOKENS {
+            if let Some(evicted) = self.pending_vaccine_tokens.pop_front() {
+                self.remember_vaccine_token(evicted);
+            }
+        }
+        self.pending_vaccine_tokens.push_back(token);
+    }
+
+    /// Drain `pending_vaccine_tokens` in batched held-store passes, [`VACCINE_TOKENS_PER_SCAN_PASS`]
+    /// tokens per pass, for as long as the window budget allows. Called from [`Node::tick`]. Anything
+    /// still queued when the budget is gone waits for the next window; nothing is dropped here.
+    fn drain_pending_vaccine_scans(&mut self) {
+        while !self.pending_vaccine_tokens.is_empty() {
+            if !self.take_vaccine_drain_budget() {
+                return;
+            }
+            let batch = self
+                .pending_vaccine_tokens
+                .len()
+                .min(VACCINE_TOKENS_PER_SCAN_PASS);
+            let tokens: Vec<[u8; 32]> = self.pending_vaccine_tokens.drain(..batch).collect();
+            for (token, target) in tokens.iter().zip(self.resolve_vaccine_targets(&tokens)) {
+                match target {
+                    Some(delivered) => self.apply_vaccine_delivery(delivered),
+                    None => self.remember_vaccine_token(*token),
+                }
+            }
+        }
     }
 
     /// core-protocol-r3-02: remember a delivery-vaccine token whose target we don't hold yet, so a
@@ -3499,7 +3799,13 @@ impl<S: Store> Node<S> {
             InboxAcknowledgement::Private {
                 to: from,
                 for_bundle_id: bundle.id(),
-                delivery_hops: bundle.env.hops,
+                // sec-priv-r4-01: UNBLIND before exporting. `env.hops` on the private path is the
+                // secret per-bundle blind plus the true distance, and the recipient is the only
+                // party that can subtract it (we hold the token three lines up). Shipping the raw
+                // value made the SENDER's `message_status` report `blind + N` (0..=100 too high)
+                // for every ACKed private send, with no downstream way to correct it: Alice never
+                // sees the recognition secret. The adjacent `InboxItem` already calls `true_hops`.
+                delivery_hops: self.true_hops(bundle),
                 delivery_ms,
                 proof: token,
                 vaccine: token,
@@ -3721,6 +4027,9 @@ impl<S: Store> Node<S> {
                     None => true,
                     Some(ps) => ps.established_by != Some(ek_pub),
                 };
+                // Which OPK this handshake consumed, if any. Recorded here, SPENT below only once
+                // the AEAD has authenticated the handshake (see the `Ok` arm).
+                let mut consumed_opk: Option<u32> = None;
                 let mut candidate = if fresh {
                     // Missing key material is UNRECOVERABLE for this handshake, and the reset
                     // has to be requested HERE. Returning via `?` short-circuited past the
@@ -3758,12 +4067,15 @@ impl<S: Store> Node<S> {
                         &from,
                         &ek_pub,
                     )?;
-                    // Mark first use so the reaper can age this secret out. Recorded only
-                    // once the DH succeeded, so a garbage id cannot start the clock on a
-                    // key nobody legitimately used.
-                    if let Some(id) = opk_id {
-                        self.opk_used_at.entry(id).or_insert(self.now_ms);
-                    }
+                    // core-protocol-r19-01: do NOT mark first use here. A raw X25519 DH SUCCEEDS
+                    // FOR ANY well-formed ephemeral, so `x3dh_respond` returning Ok authenticates
+                    // nothing about the sender; the AEAD below is the only step that does. On the
+                    // §39 private path `authenticated` is false by construction, so anyone holding
+                    // the victim's gossiped prekey advert could mint bundles that burned the whole
+                    // OPK batch, drove `reap_opks` under OPK_REPLENISH_BELOW, and turned a few
+                    // unsigned packets into continuous signed advert republication plus unbounded
+                    // growth of the retained-secret maps. Spend it in the `Ok` arm instead.
+                    consumed_opk = opk_id;
                     let session = Session::init_responder(root, *secret, spk_pub);
                     PeerSession {
                         session,
@@ -3777,6 +4089,13 @@ impl<S: Store> Node<S> {
                 let decrypted = candidate.session.decrypt(&msg);
                 match decrypted {
                     Ok(inner) => {
+                        // The AEAD has now authenticated the handshake, so this is the first REAL
+                        // use of the one-time prekey: start its OPK_RETAIN_AFTER_USE_MS clock and
+                        // let it count against the replenish trigger. Anyone who cannot open the
+                        // ratchet can no longer spend a key.
+                        if let Some(id) = consumed_opk {
+                            self.opk_used_at.entry(id).or_insert(self.now_ms);
+                        }
                         let message = self.surface_session_inner(from, &inner)?;
                         Ok(PreparedInbound {
                             message,
@@ -7106,6 +7425,7 @@ impl<S: Store> Node<S> {
             self.store.remove(&id);
         }
         self.relay_order.clear();
+        self.relay_vaccines.clear();
         self.relay_fwd.clear();
         self.ack_replicate.clear();
         self.pending.clear();
@@ -7287,6 +7607,11 @@ impl<S: Store> Node<S> {
         // Drop relay-queue entries whose bundles have been delivered or expired.
         self.relay_order.retain(|id| self.store.contains(id));
         self.relay_fwd.retain(|id, _| self.store.contains(id));
+        self.relay_vaccines.retain(|id| self.store.contains(id));
+        // security-privacy-r19-02: resolve vaccine tokens deferred past the per-window scan budget,
+        // all of them in ONE held-store pass. Done after `store.prune` so the pass sees the same
+        // held set the rest of the tick does.
+        self.drain_pending_vaccine_scans();
         // Expire vaccine immunity after a bundle could no longer be live (1h).
         self.immune
             .retain(|_, t| now_ms.saturating_sub(*t) < 3_600_000);
@@ -7649,6 +7974,20 @@ impl<S: Store> Node<S> {
                 self.priv_ingest.remove(&link); // F-07: drop the rate-limit counter for a dead link
                 self.advert_ingest.remove(&link);
                 self.beacon_ingest.remove(&link);
+                // security-privacy-r19-01 (closure): drop this link's gradient next-hops now.
+                //
+                // A dead link is never a valid next-hop (`ForwardDecision` requires
+                // `LinkState::Up`), so these entries could only ever be garbage. Leaving them to age
+                // out at RECV_BEACON_TTL_MS also left them attributable to NO quota unit, because the
+                // peer address they were charged to lives in `LinkState::Up` and that is gone: a peer
+                // that reconnects gets a fresh LinkId and a fresh full quota while its previous
+                // connection's buckets still held per-bucket fan-out slots. Reconnecting is free, so
+                // the quota must not be re-armable by it. Cost is bounded by the table size
+                // (`256 ^ MAILBOX_ROUTE_PREFIX_BYTES`, today 256) and it runs once per disconnect.
+                self.recv_gradient.retain(|_, e| {
+                    e.links.retain(|(l, _)| *l != link);
+                    !e.links.is_empty()
+                });
             }
             BearerEvent::Data(link, bytes) => self.on_data(link, bytes),
         }
@@ -8612,41 +8951,37 @@ impl<S: Store> Node<S> {
                 // nothing and purges nothing. If we hold no match we just relay it onward (below) so
                 // real holders can act on it.
                 //
-                // core-protocol-r2-03 / security-privacy-r2-01: `resolve_vaccine_target` is an
+                // core-protocol-r2-03 / security-privacy-r2-01: `resolve_vaccine_targets` is an
                 // O(held-private-bundles) DH+hash scan, and a vaccine is `is_ack` so it is EXEMPT from
                 // the F-07 per-link private-ingest limit. Without a dedup gate here, EVERY flooded
                 // duplicate copy of the SAME vaccine (all sharing one id = H(domain‖token)) would
                 // re-run the whole scan, CPU amplification an attacker triggers by re-injecting one
                 // vaccine. Short-circuit on the store's `seen` set: the first copy scans + resolves
-                // once, subsequent copies (same id) are skipped before the scan. A forged random-token
-                // vaccine still scans at most once per unique id, and the per-link rate limit on
-                // Vaccine ingest (see `allow_private_ingest` call site) bounds the mint rate.
+                // once, subsequent copies (same id) are skipped before the scan.
+                //
+                // security-privacy-r19-02: `seen` bounds DUPLICATES of one token, and the arrival
+                // limiter bounds the mint RATE, but neither bounds the per-unit cost, so a stream of
+                // DISTINCT forged tokens (free: `compute_vaccine_id` binds only an attacker-chosen
+                // 32 bytes, and `verify()` needs no signature and no §35 stamp) still bought one full
+                // held-store pass EACH. Spend a window budget instead: over budget, the token is
+                // queued for the batched passes `tick` runs, each of which resolves up to
+                // `VACCINE_TOKENS_PER_SCAN_PASS` queued tokens in ONE pass over the store. The node's
+                // scan work is then a constant per window regardless of the flood.
+                //
+                // Note this arm is guarded on `!self.store.seen(&id)`, which is what makes queue loss
+                // permanent rather than retryable: once `store.put` marks this vaccine's id seen, no
+                // re-flooded copy reaches resolution again. That is why `defer_vaccine_scan` remembers
+                // an evicted token instead of dropping it.
                 Destination::Vaccine(token) if !self.store.seen(&id) => {
-                    if let Some(delivered) = self.resolve_vaccine_target(&token) {
-                        // The SENDER treats a verified vaccine as PROOF OF DELIVERY. Its private ACK
-                        // can be lost (a throttled link, a single-carrier contact), and once the
-                        // vaccine has immunized the mesh, retransmits can never trigger a re-ACK, so
-                        // a lost ack would strand the sender on "Sending…" forever. The vaccine floods
-                        // network-wide and carries the same CDH token only the true recipient can
-                        // compute, so it is exactly as trustworthy as the ACK (minus hop/latency
-                        // metadata, which stays at its last-known values).
-                        let display = self.display_id(&delivered);
-                        if let Some(info) = self.tx.get_mut(&display) {
-                            if !info.delivered {
-                                info.delivered = true;
-                                self.pending.remove(&delivered);
-                                self.pending.remove(&display);
-                                if self.observe {
-                                    self.sends_delivered.push(display);
-                                }
-                            }
-                        }
-                        // §35: a §39 delivery vaccine proves this relay's held private bundle was
-                        // delivered (the same delivery-justified atom, on the untraceable path).
-                        self.meter_delivered(&delivered);
-                        self.store.remove(&delivered);
-                        self.relay_order.retain(|x| *x != delivered);
-                        self.immune.insert(delivered, self.now_ms);
+                    if !self.take_vaccine_scan_budget() {
+                        self.defer_vaccine_scan(token);
+                    } else if let Some(delivered) = self
+                        .resolve_vaccine_targets(&[token])
+                        .into_iter()
+                        .next()
+                        .flatten()
+                    {
+                        self.apply_vaccine_delivery(delivered);
                     } else {
                         // core-protocol-r3-02: we hold no bundle this vaccine clears YET. It may be
                         // racing ahead of its target (a relay that saw the vaccine first). Remember the
@@ -8760,11 +9095,45 @@ impl<S: Store> Node<S> {
                     .or_insert((relay_src, d, self.now_ms));
                 self.prune_forwarded_if_needed();
             }
+            if is_vaccine {
+                self.relay_vaccines.push_back(id);
+                self.evict_vaccines_if_needed();
+            }
             self.evict_relayed_if_needed();
             // F-09: offer just the bundle we accepted to the other links, not the whole store.
             self.offer_bundle_to_all_except(id, from_link);
         }
         stored
+    }
+
+    /// security-privacy-r19-02: keep held §39 delivery vaccines within [`MAX_RELAYED_VACCINES`],
+    /// evicting oldest-admitted first.
+    ///
+    /// A vaccine must be able to PURGE, and must occupy no more than its fixed carve-out. Minting a
+    /// valid, unique, unauthenticated one is free, and it is exempt from the §35 carriage gate by
+    /// design, so sharing the general `max_relayed` window with genuine carriage meant a flood took the whole
+    /// window: `pick_evict_victim` scores a Vaccine dst and a §39 private Broadcast dst identically
+    /// (utility = priority x 100 + route, route 0.0 for both), so at equal priority eviction fell to
+    /// insertion order and every genuine held bundle's residency collapsed to the time it takes to
+    /// push `max_relayed` forgeries. A private sub-cap makes the flood evict its OWN oldest instead.
+    fn evict_vaccines_if_needed(&mut self) {
+        while self.relay_vaccines.len() > MAX_RELAYED_VACCINES {
+            let Some(victim) = self.relay_vaccines.pop_front() else {
+                break;
+            };
+            self.store.remove(&victim);
+            self.relay_order.retain(|x| *x != victim);
+            self.relay_fwd.remove(&victim);
+            self.forwarded.remove(&victim);
+            for state in self.links.values_mut() {
+                if let LinkState::Up(established) = state {
+                    established.sent_bundles.remove(&victim);
+                }
+            }
+            for sent in self.peer_sent.values_mut() {
+                sent.bundles.remove(&victim);
+            }
+        }
     }
 
     /// Keep relayed (not-ours) bundles within `max_relayed`. Custody policy (DESIGN.md §6):
@@ -8930,7 +9299,8 @@ impl<S: Store> Node<S> {
     /// [`Wire::RecvBeacon`]): the claim is scoped to the authenticated Noise link it arrived on, and
     /// what it claims is a shared anonymity-set bucket, not a private name. Three things bound it:
     /// the distance cap terminates the distance-vector loop, split-horizon stops the trivial
-    /// two-node ping-pong, and [`MAX_GRADIENT_BUCKETS_PER_LINK`] stops one link owning the table.
+    /// two-node ping-pong, and [`MAX_GRADIENT_BUCKETS_PER_PEER`] stops one PEER owning the table
+    /// (a per-link bound would not: extra connections are free).
     fn on_recv_beacon(&mut self, from_link: LinkId, route: crypto::MailboxRoute, distance: u8) {
         if distance >= MAX_RECV_BEACON_DISTANCE {
             return; // at/past the radius: neither recorded nor carried onward
@@ -9005,12 +9375,19 @@ impl<S: Store> Node<S> {
             },
             None => true,
         };
-        let is_new_bucket_for_link = !self
-            .recv_gradient
-            .get(&mailbox)
-            .is_some_and(|e| e.links.iter().any(|(l, _)| *l == from_link));
-        if is_new_bucket_for_link {
-            self.evict_for_link_bucket_cap(from_link);
+        // security-privacy-r19-01: the quota unit is the AUTHENTICATED PEER, so it covers every
+        // link that peer holds at once. Charging per LinkId let one identity buy N x the quota by
+        // opening N connections. Resolving the unit is one hash lookup and the occupancy test below
+        // is one lookup per link already IN this bucket (at most MAX_GRADIENT_LINKS_PER_BUCKET), so an
+        // inbound beacon never costs work proportional to the node's total link count.
+        let quota = self.gradient_quota_unit(from_link);
+        let is_new_bucket_for_peer = !self.recv_gradient.get(&mailbox).is_some_and(|e| {
+            e.links
+                .iter()
+                .any(|(l, _)| self.quota_unit_holds_link(&quota, *l))
+        });
+        if is_new_bucket_for_peer {
+            self.evict_for_peer_bucket_cap(&quota);
         }
         if self.recv_gradient.len() >= MAX_RECV_GRADIENT
             && !self.recv_gradient.contains_key(&mailbox)
@@ -9092,14 +9469,61 @@ impl<S: Store> Node<S> {
         *count <= MAX_RECV_BEACONS_PER_WINDOW
     }
 
-    /// Enforce [`MAX_GRADIENT_BUCKETS_PER_LINK`] before `from_link` claims one more bucket: while it
+    /// The unit [`MAX_GRADIENT_BUCKETS_PER_PEER`] is charged against for a beacon arriving on `link`.
+    ///
+    /// security-privacy-r19-01. A `LinkId` is a per-connection integer the far side mints for free
+    /// (`on_connected` caps nothing per peer, and `hop-relayd` allocates a fresh id per inbound
+    /// connection), so a quota keyed on it multiplies by the number of connections one identity
+    /// opens. `LinkState::Up` carries the address the handshake proved, which is the identity this
+    /// node can actually refuse, rate-limit and denylist. A link with no established peer
+    /// (`LOCAL_LINK`, or one still handshaking) is its own quota unit: there is no identity to
+    /// aggregate it under, and it is not a path an outside party can multiply.
+    ///
+    /// security-privacy-r19-01 (closure): this returns the IDENTITY, never a materialized set of that
+    /// peer's link ids. The first cut built a `Vec<LinkId>` by iterating all of `self.links` on every
+    /// inbound beacon, and then membership-tested that vector inside a scan of every bucket, so an
+    /// attacker-triggerable packet cost O(total links) allocation plus O(buckets x links-per-bucket x
+    /// total links) comparisons on a relay holding thousands of connections. That is the same class of
+    /// unauthenticated hot-path cost security-privacy-r19-02 exists to bound, so it is not acceptable
+    /// here either. Membership is now `quota_unit_holds_link`, one `HashMap` lookup.
+    fn gradient_quota_unit(&self, link: LinkId) -> GradientQuota {
+        match self.links.get(&link) {
+            Some(LinkState::Up(est)) => GradientQuota::Peer(est.peer),
+            _ => GradientQuota::Link(link),
+        }
+    }
+
+    /// Whether `link` is charged to `quota`. O(1): one `self.links` lookup, no allocation, no scan of
+    /// the node's link table. A link that is no longer `Up` belongs to no peer quota (its gradient
+    /// entries are dropped on `Disconnected`, so this is only reachable mid-teardown).
+    fn quota_unit_holds_link(&self, quota: &GradientQuota, link: LinkId) -> bool {
+        match quota {
+            GradientQuota::Link(l) => *l == link,
+            GradientQuota::Peer(peer) => {
+                matches!(self.links.get(&link), Some(LinkState::Up(e)) if e.peer == *peer)
+            }
+        }
+    }
+
+    /// Enforce [`MAX_GRADIENT_BUCKETS_PER_PEER`] before this peer claims one more bucket: while it
     /// is at the cap, drop its own least-recently-seen entry (and any bucket that leaves empty).
     ///
-    /// Eviction is scoped to this link's entries on purpose. A global "evict something" would let a
-    /// hostile neighbour spend its own quota to delete OTHER links' genuine routes, converting a
-    /// bounded nuisance into a targeted black-hole. Scanning every bucket is cheap: the table holds
-    /// at most `256 ^ MAILBOX_ROUTE_PREFIX_BYTES` keys and today that is 256.
-    fn evict_for_link_bucket_cap(&mut self, from_link: LinkId) {
+    /// Eviction is scoped to this peer's entries on purpose. A global "evict something" would let a
+    /// hostile neighbour spend its own quota to delete OTHER peers' genuine routes, converting a
+    /// bounded nuisance into a targeted black-hole. A bucket counts as occupied by the peer if ANY
+    /// of its links sits in it, and evicting a bucket drops ALL of that peer's links from it, so a
+    /// second connection can neither add occupancy the quota misses nor survive as a residue of an
+    /// eviction.
+    ///
+    /// Cost, stated because a beacon is unauthenticated and attacker-triggerable: this runs ONLY when
+    /// the peer is claiming a bucket it does not already occupy, and one run is
+    /// `buckets x links-per-bucket` O(1) membership tests, bounded by
+    /// `256 ^ MAILBOX_ROUTE_PREFIX_BYTES` (today 256) x `MAX_GRADIENT_LINKS_PER_BUCKET` (8) = 2048
+    /// hash lookups, INDEPENDENT of how many links or peers the node holds. The `loop` re-runs only
+    /// while the peer is still at the cap, so it is one pass in the steady state. It replaces a first
+    /// cut whose membership test was a linear scan of a `Vec` of every one of that peer's link ids,
+    /// making the same work O(total links) per test.
+    fn evict_for_peer_bucket_cap(&mut self, quota: &GradientQuota) {
         loop {
             let mut occupied: Vec<(Tag, u64)> = self
                 .recv_gradient
@@ -9108,19 +9532,34 @@ impl<S: Store> Node<S> {
                     entry
                         .links
                         .iter()
-                        .find(|(l, _)| *l == from_link)
-                        .map(|(_, gl)| (*key, gl.last_seen))
+                        .filter(|(l, _)| self.quota_unit_holds_link(quota, *l))
+                        .map(|(_, gl)| gl.last_seen)
+                        .min()
+                        .map(|last_seen| (*key, last_seen))
                 })
                 .collect();
-            if occupied.len() < MAX_GRADIENT_BUCKETS_PER_LINK {
+            if occupied.len() < MAX_GRADIENT_BUCKETS_PER_PEER {
                 return;
             }
             occupied.sort_by_key(|(key, last_seen)| (*last_seen, *key));
             let Some((victim, _)) = occupied.first().copied() else {
                 return;
             };
+            // Snapshot which of the victim bucket's links this quota unit holds BEFORE taking the
+            // mutable borrow: `quota_unit_holds_link` needs `&self`, so it cannot run inside a
+            // `retain` on `recv_gradient`. The snapshot is at most `MAX_GRADIENT_LINKS_PER_BUCKET`
+            // long, so the `contains` below is a bounded constant, not a scan of the link table.
+            let doomed: Vec<LinkId> = match self.recv_gradient.get(&victim) {
+                Some(entry) => entry
+                    .links
+                    .iter()
+                    .map(|(l, _)| *l)
+                    .filter(|l| self.quota_unit_holds_link(quota, *l))
+                    .collect(),
+                None => return,
+            };
             if let Some(entry) = self.recv_gradient.get_mut(&victim) {
-                entry.links.retain(|(l, _)| *l != from_link);
+                entry.links.retain(|(l, _)| !doomed.contains(l));
                 if entry.links.is_empty() {
                     self.recv_gradient.remove(&victim);
                 }
@@ -9741,6 +10180,67 @@ mod tests {
             if !any {
                 break;
             }
+        }
+    }
+
+    /// A `MemoryStore` that counts held-bundle READS, so a test can measure the real cost of a
+    /// held-store pass instead of trusting a counter the code under test maintains about itself.
+    /// On `hop-relayd` each of these is a `SELECT data` plus a postcard decode on the one SQLite
+    /// driver thread, which is the resource security-privacy-r19-02 is about.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryStore,
+        bundle_reads: std::cell::Cell<usize>,
+    }
+
+    impl Store for CountingStore {
+        fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+            self.inner.put(bundle, now_ms)
+        }
+        fn rehydrate(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+            self.inner.rehydrate(bundle, now_ms)
+        }
+        fn get(&self, id: &BundleId) -> Option<Bundle> {
+            self.bundle_reads.set(self.bundle_reads.get() + 1);
+            self.inner.get(id)
+        }
+        fn remove(&mut self, id: &BundleId) -> Option<Bundle> {
+            self.inner.remove(id)
+        }
+        fn seen(&self, id: &BundleId) -> bool {
+            self.inner.seen(id)
+        }
+        fn contains(&self, id: &BundleId) -> bool {
+            self.inner.contains(id)
+        }
+        fn have(&self) -> crate::store::HaveSet {
+            self.inner.have()
+        }
+        fn prune(&mut self, now_ms: u64) {
+            self.inner.prune(now_ms)
+        }
+        fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
+            self.inner.seen_expiry(id)
+        }
+        fn put_kv(&mut self, key: &str, value: Vec<u8>) {
+            self.inner.put_kv(key, value)
+        }
+        fn apply_kv_batch(&mut self, mutations: &[KvMutation]) -> std::result::Result<(), String> {
+            self.inner.apply_kv_batch(mutations)
+        }
+        fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
+            self.inner.get_kv(key)
+        }
+        fn remove_kv(&mut self, key: &str) {
+            self.inner.remove_kv(key)
+        }
+        fn list_kv_page(
+            &self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Vec<(String, Vec<u8>)> {
+            self.inner.list_kv_page(prefix, after, limit)
         }
     }
 
@@ -13649,6 +14149,137 @@ mod tests {
     }
 
     #[test]
+    fn an_unauthenticated_private_session_init_cannot_burn_one_time_prekeys() {
+        // core-protocol-r19-01. `opk_used_at` was written the instant `x3dh_respond` returned Ok.
+        // A raw X25519 DH SUCCEEDS FOR ANY well-formed ephemeral, so that proves nothing about the
+        // sender; only the AEAD three lines later authenticates the handshake, and it ran AFTER the
+        // mutation and on a candidate that gets discarded. On the §39 private path `authenticated`
+        // is false by construction, so anyone holding the victim's GOSSIPED prekey advert (public
+        // by design: it floods the mesh) could mint SessionInits with garbage ciphertext, mark every
+        // OPK used, drive `reap_opks` below OPK_REPLENISH_BELOW, and turn a handful of tiny unsigned
+        // bundles per tick into continuous network-wide signed advert republication.
+        let mut victim = Node::new(Identity::generate());
+        victim.set_time(1_000);
+        let victim_addr = victim.address();
+        let victim_spk = victim.prekey.public;
+        let batch: Vec<u32> = victim.opk_batch.publics.iter().map(|o| o.id).collect();
+        assert_eq!(batch.len(), OPK_BATCH_SIZE);
+        let (_, unused_before, retained_before) = victim.opk_stats();
+        assert_eq!(unused_before, OPK_BATCH_SIZE, "nothing spent yet");
+        let _ = victim.drain_outgoing();
+
+        // The attacker needs no session, no signature, and no link to the victim: just the advert.
+        let attacker = Identity::generate();
+        for (round, id) in batch.iter().enumerate() {
+            let hostile = Payload::Private {
+                sender: attacker.address(),
+                inner: Box::new(Payload::SessionInit {
+                    ek_pub: attacker.derive_prekey().public,
+                    spk_pub: victim_spk,
+                    opk_id: Some(*id),
+                    msg: crate::session::RatchetMessage {
+                        header: crate::session::Header {
+                            dh: attacker.derive_prekey().public,
+                            pn: 0,
+                            n: 0,
+                        },
+                        ciphertext: vec![round as u8; 16], // garbage: the AEAD cannot open it
+                    },
+                }),
+            };
+            let bundle = Bundle::create_private(
+                &victim_addr,
+                &victim_spk,
+                &hostile,
+                Some(crypto::mailbox_route(&crypto::mailbox_tag(&victim_addr, 0))),
+                BundleOpts::default(),
+            )
+            .unwrap();
+            assert!(
+                victim.read_message(&bundle).is_err(),
+                "the AEAD rejects it, which is the whole point"
+            );
+        }
+
+        let (_, unused_after, retained_after) = victim.opk_stats();
+        assert_eq!(
+            unused_after, OPK_BATCH_SIZE,
+            "a handshake that never authenticated must not spend a one-time prekey"
+        );
+        for id in &batch {
+            assert!(
+                victim.holds_opk(*id),
+                "and the secret's OPK_RETAIN_AFTER_USE_MS clock is not started by an outsider"
+            );
+        }
+
+        // Sustained: no replenish trigger, so no fresh batch and no signed advert republication.
+        for round in 0..40u32 {
+            victim.tick(1_000 + round as u64 * 1_000);
+        }
+        let (_, unused_final, retained_final) = victim.opk_stats();
+        assert_eq!(unused_final, OPK_BATCH_SIZE, "still nothing spent");
+        assert_eq!(
+            retained_final, retained_before,
+            "and the retained-secret map did not grow on the attacker's schedule \
+             (was {retained_before}, after the flood {retained_after}, after 40 ticks {retained_final})"
+        );
+        assert!(
+            !victim
+                .drain_outgoing()
+                .iter()
+                .any(|(_, bytes)| !bytes.is_empty()),
+            "no advert flood was triggered by unauthenticated traffic"
+        );
+
+        // The control is precise, not a mute: a REAL authenticated handshake still spends one.
+        let mut sender = Node::new(Identity::generate());
+        sender.set_time(1_000);
+        let mut net = Wire2::new();
+        let mut pair = [sender, victim];
+        net.connect(&mut pair, 0, 1, 1, 1);
+        exchange_prekeys(&mut net, &mut pair);
+        let to = pair[1].address();
+        pair[0]
+            .send_message(to, "t".into(), b"real".to_vec(), false)
+            .unwrap();
+        net.pump(&mut pair);
+        assert_eq!(pair[1].take_inbox().len(), 1, "the genuine message arrives");
+        let (_, unused_genuine, _) = pair[1].opk_stats();
+        assert_eq!(
+            unused_genuine,
+            OPK_BATCH_SIZE - 1,
+            "an AUTHENTICATED handshake does spend its one-time prekey"
+        );
+    }
+
+    #[test]
+    fn retained_one_time_prekey_secrets_are_absolutely_capped() {
+        // core-protocol-r19-01. `reap_opks` only ever drops a secret it has seen MARKED USED, so
+        // every replenish that fired while part of the old batch was still unspent retained those
+        // unspent secrets forever: the map only grew, one leak per replenish, with no ceiling
+        // anywhere. Mint far past the cap and assert the bound is absolute.
+        let mut node = Node::new(Identity::generate());
+        node.set_time(1_000);
+        for _ in 0..64 {
+            node.mint_opk_batch();
+        }
+        let (_, _, retained) = node.opk_stats();
+        assert!(
+            retained <= MAX_RETAINED_OPK_SECRETS,
+            "retained OPK secrets are absolutely capped at {MAX_RETAINED_OPK_SECRETS}, got {retained}"
+        );
+        // The just-published batch must never be the eviction victim, or a fresh advert would point
+        // at secrets the node no longer holds and every first contact would need a round trip.
+        for opk in node.opk_batch.publics.clone() {
+            assert!(
+                node.holds_opk(opk.id),
+                "the currently published batch is always retained"
+            );
+        }
+    }
+
+    #[test]
     fn forged_private_session_init_preserves_session_and_does_not_reflect_reset() {
         let mut nodes = [
             Node::new(Identity::generate()),
@@ -13801,6 +14432,63 @@ mod tests {
         assert!(
             nodes[1].take_inbox().is_empty(),
             "the relay is not an endpoint for either leg"
+        );
+    }
+
+    #[test]
+    fn the_private_delivery_ack_reports_the_true_hop_count_not_the_blind() {
+        // sec-priv-r4-01. A private bundle leaves the sender with `env.hops` seeded to a SECRET
+        // per-bundle blind in 0..=MAX_HOP_BLIND rather than 0, so no relay can read proximity to the
+        // origin off the wire. Only the recipient can subtract it. `inbox_acknowledgement` copied
+        // `bundle.env.hops` verbatim into the private ACK while the InboxItem built four lines later
+        // already called `true_hops`, so the RECIPIENT's UI was right and the SENDER's was wrong by
+        // the whole blind, with no way to correct it downstream: Alice never sees the recognition
+        // secret. Two hops were reported as anything from 2 to 102.
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 Alice
+            Node::new(Identity::generate()), // 1 Carol (relay)
+            Node::new(Identity::generate()), // 2 Bob
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        net.connect(&mut nodes, 1, 2, 2, 2);
+        exchange_prekeys(&mut net, &mut nodes);
+
+        let bob = nodes[2].address();
+        let id = nodes[0]
+            .send_message(bob, "t".into(), b"count my hops".to_vec(), true)
+            .unwrap();
+        // The blind is what makes this test meaningful: with a zero blind the bug is invisible.
+        let blind = nodes[0]
+            .store
+            .get(&id)
+            .expect("sender holds its send")
+            .env
+            .hops;
+        assert!(
+            blind > 0,
+            "the send must carry a non-zero hop blind for this to prove anything"
+        );
+        net.pump(&mut nodes);
+
+        let received = nodes[2].inbox_items();
+        assert_eq!(received.len(), 1, "Bob received it");
+        let bobs_view = received[0].hops;
+        accept_all(&mut nodes[2]);
+        net.pump(&mut nodes);
+
+        let (_, delivered, hops, _) = nodes[0].message_status(&id).expect("tracked");
+        assert!(
+            delivered,
+            "the private ACK flipped Alice's message to Delivered"
+        );
+        assert_eq!(
+            hops, bobs_view,
+            "the sender is told the same TRUE path length the recipient unblinded, not blind + N"
+        );
+        assert_eq!(
+            hops, 2,
+            "and that is the real distance travelled (Alice -> Carol -> Bob is two traversals)"
         );
     }
 
@@ -14179,8 +14867,10 @@ mod tests {
         // Nothing capped this before: MAX_RECV_GRADIENT is 4096 while only 256 route keys can exist
         // at a 1-byte prefix, so the global cap could never bind and a single hostile neighbour could
         // claim EVERY bucket and pull the node's whole private-forwarding decision onto its own link.
-        // Now one link is bounded to MAX_GRADIENT_BUCKETS_PER_LINK, evicting its OWN least-recently-
+        // Now one PEER is bounded to MAX_GRADIENT_BUCKETS_PER_PEER, evicting its OWN least-recently-
         // seen entries, and a genuine route learned from a different link is untouched by the grind.
+        // (These links have no established peer, so each link is its own quota unit; the multi-link
+        // one-identity case is pinned by `one_peer_cannot_buy_extra_gradient_quota_with_more_links`.)
         let mut relay = Node::new(Identity::generate());
         relay.set_time(1_000);
         let genuine_link: LinkId = 7;
@@ -14205,7 +14895,7 @@ mod tests {
             .filter(|e| e.links.iter().any(|(l, _)| *l == hostile_link))
             .count();
         assert_eq!(
-            occupied, MAX_GRADIENT_BUCKETS_PER_LINK,
+            occupied, MAX_GRADIENT_BUCKETS_PER_PEER,
             "one link is held to its bucket quota no matter how many prefixes it claims"
         );
         assert!(
@@ -14214,6 +14904,259 @@ mod tests {
                 .get(&victim_bucket)
                 .is_some_and(|e| e.links.iter().any(|(l, _)| *l == genuine_link)),
             "eviction is scoped to the grinding link's own entries, so a genuine route survives"
+        );
+    }
+
+    #[test]
+    fn one_peer_cannot_buy_extra_gradient_quota_with_more_links() {
+        // security-privacy-r19-01. The bucket quota used to key on LinkId, which is a per-connection
+        // integer the far side mints for free: hop-core's `on_connected` imposes no per-peer link
+        // limit and hop-relayd allocates a fresh id per inbound connection. So ONE Ed25519 identity
+        // opening K connections bought K x MAX_GRADIENT_BUCKETS_PER_PEER buckets, and at
+        // MAILBOX_ROUTE_PREFIX_BYTES = 1 there are only 256 buckets in total: four connections took
+        // the whole table, making that identity a candidate next hop for every private bundle
+        // transiting the node. The quota now binds the Noise-authenticated peer address.
+        //
+        // Against the old per-link enforcement this test measures 4 x 64 = 256 buckets held by one
+        // identity; with the fix it is 64, and the honest peer's route is untouched either way.
+        let links_per_peer: LinkId = 4;
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 relay under attack
+            Node::new(Identity::generate()), // 1 hostile identity, many connections
+            Node::new(Identity::generate()), // 2 honest recipient, one connection
+        ];
+        let mut net = Wire2::new();
+        for k in 0..links_per_peer {
+            net.connect(&mut nodes, 0, 10 + k, 1, 20 + k);
+        }
+        net.connect(&mut nodes, 0, 90, 2, 91);
+
+        let hostile_links: Vec<LinkId> = (0..links_per_peer).map(|k| 10 + k).collect();
+        let honest_link: LinkId = 90;
+
+        // The honest recipient's genuine route, laid first.
+        let mut honest_route = [0u8; crypto::MAILBOX_ROUTE_PREFIX_BYTES];
+        honest_route[0] = 0xfe;
+        let honest_bucket = route_key_from_prefix(&honest_route);
+        nodes[0].set_time(1_000);
+        nodes[0].record_gradient(honest_bucket, honest_link, 0);
+
+        // The grind. Each connection claims its OWN disjoint block of MAX_GRADIENT_BUCKETS_PER_PEER
+        // prefixes, which is what makes the multiplier visible: per-LINK enforcement lets every
+        // connection keep a full quota in a different quarter of the space, so their union is the
+        // whole 256-bucket table. (Had they all ground the same order, per-link enforcement would
+        // have converged them onto the same trailing 64 and hidden the bug.)
+        for (n, link) in hostile_links.iter().enumerate() {
+            for i in 0..MAX_GRADIENT_BUCKETS_PER_PEER {
+                let mut route = [0u8; crypto::MAILBOX_ROUTE_PREFIX_BYTES];
+                route[0] = (n * MAX_GRADIENT_BUCKETS_PER_PEER + i) as u8;
+                nodes[0].set_time(2_000 + (n * MAX_GRADIENT_BUCKETS_PER_PEER + i) as u64);
+                nodes[0].record_gradient(route_key_from_prefix(&route), *link, 0);
+            }
+        }
+
+        let occupied_by_the_hostile_identity = nodes[0]
+            .recv_gradient
+            .values()
+            .filter(|e| e.links.iter().any(|(l, _)| hostile_links.contains(l)))
+            .count();
+        assert_eq!(
+            occupied_by_the_hostile_identity, MAX_GRADIENT_BUCKETS_PER_PEER,
+            "one authenticated identity is held to ONE quota no matter how many links it opens \
+             (got {occupied_by_the_hostile_identity} buckets across {links_per_peer} connections)"
+        );
+        // The whole point of the cap: it cannot reach every bucket, so most prefixes still fall
+        // back to the epidemic flood rather than being pulled onto the attacker's links.
+        assert!(
+            occupied_by_the_hostile_identity < 256,
+            "and therefore cannot own the entire 1-byte route space"
+        );
+        assert!(
+            nodes[0]
+                .recv_gradient
+                .get(&honest_bucket)
+                .is_some_and(|e| e.links.iter().any(|(l, _)| *l == honest_link)),
+            "eviction stays scoped to the grinding PEER's own entries, so an honest route survives"
+        );
+    }
+
+    #[test]
+    fn a_recipients_beacon_footprint_per_publish_is_pinned() {
+        // security-privacy-r19-06 closure item 1: pin how many distinct route prefixes ONE route_to_me
+        // recipient puts on one link per publish, because that count IS the anonymity claim.
+        //
+        // `publish_recv_beacon_on` emits the current epoch AND MAILBOX_EPOCH_WINDOW past epochs, so the
+        // footprint is up to 1 + MAILBOX_EPOCH_WINDOW prefixes, not 1. Both are pure public functions
+        // of a public address, so an observer that can attribute the pair to one source and holds a
+        // candidate address tests it at 1/(256^footprint), not 1/256. DESIGN.md §39 now states that
+        // figure and the observer scope it applies to; this test is what stops the count drifting away
+        // from the stated figure unnoticed.
+        // Measured on the OBSERVER, from records that actually crossed the link, not recomputed from
+        // the emitting loop: the observer lays one gradient bucket per distinct prefix it received.
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 the direct link peer, i.e. the observer
+            Node::new(Identity::generate()), // 1 the route_to_me recipient
+        ];
+        let mut net = Wire2::new();
+        // A clock several epochs in, so a previous epoch genuinely exists. At epoch 0 the publish loop
+        // breaks early and the footprint really is 1, which would make this test vacuous.
+        let now = MAILBOX_EPOCH_MS * 5 + 1;
+        assert!(
+            mailbox_epoch(now) >= MAILBOX_EPOCH_WINDOW,
+            "a past epoch must exist for the overlap window to be observable"
+        );
+        nodes[0].set_time(now);
+        nodes[1].set_time(now);
+        net.connect(&mut nodes, 0, 5, 1, 6);
+
+        let before = nodes[0].recv_gradient.len();
+        nodes[1].publish_recv_beacon();
+        net.pump(&mut nodes);
+        let footprint = nodes[0]
+            .recv_gradient
+            .values()
+            .filter(|e| e.links.iter().any(|(l, _)| *l == 5))
+            .count();
+        assert_eq!(before, 0, "the observer starts with an empty gradient");
+
+        let addr = nodes[1].address();
+        let epoch = mailbox_epoch(now);
+        let cur = crypto::mailbox_route(&crypto::mailbox_tag(&addr, epoch));
+        let prev = crypto::mailbox_route(&crypto::mailbox_tag(&addr, epoch - 1));
+        let distinct_epoch_prefixes = if cur == prev { 1 } else { 2 };
+        assert_eq!(
+            footprint, distinct_epoch_prefixes,
+            "ONE publish puts {distinct_epoch_prefixes} distinct route prefix(es) on one link \
+             (current epoch + MAILBOX_EPOCH_WINDOW = {MAILBOX_EPOCH_WINDOW} past epochs, deduped). \
+             DESIGN.md §39 sizes the pair-attributing observer's anonymity set as \
+             N/(256^footprint); re-check that figure if this count changes."
+        );
+        // Not vacuous: at a 1-byte prefix the two epochs collide 1-in-256 of the time, so only assert
+        // the pair is really observable when the addresses did not collide.
+        if distinct_epoch_prefixes == 2 {
+            assert!(
+                footprint > 1,
+                "the overlap window is why the footprint is a PAIR; the single-prefix claim is the \
+                 one that would be false"
+            );
+        }
+    }
+
+    #[test]
+    fn reconnecting_does_not_re_arm_one_peers_gradient_quota() {
+        // security-privacy-r19-01 (closure): the quota must bind the authenticated peer on EVERY
+        // path, and reconnecting is free. The peer address the quota keys on lives in
+        // `LinkState::Up`, so a dropped link's gradient entries were attributable to NO quota unit
+        // while they aged out over RECV_BEACON_TTL_MS (90 s), and the far side gets a fresh LinkId per
+        // connection. Disconnect/reconnect therefore had to be checked, not assumed: a peer that
+        // cycles its connection must not accumulate more than one quota's worth of next-hops.
+        //
+        // `handle(Disconnected)` now drops that link's gradient entries outright (a dead link is
+        // never a valid next-hop anyway, since forwarding requires `LinkState::Up`).
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 relay under attack
+            Node::new(Identity::generate()), // 1 hostile identity, reconnecting
+        ];
+        let mut net = Wire2::new();
+        let mut clock = 1_000u64;
+
+        // Two connection generations from the SAME identity, each grinding its own disjoint block of
+        // MAX_GRADIENT_BUCKETS_PER_PEER prefixes (disjoint blocks are what make a leak visible: had
+        // both ground the same order they would have converged onto one block and hidden it).
+        for generation in 0..2usize {
+            let link: LinkId = 10 + generation as LinkId;
+            net.connect(&mut nodes, 0, link, 1, 20 + generation as LinkId);
+            for i in 0..MAX_GRADIENT_BUCKETS_PER_PEER {
+                let mut route = [0u8; crypto::MAILBOX_ROUTE_PREFIX_BYTES];
+                route[0] = (generation * MAX_GRADIENT_BUCKETS_PER_PEER + i) as u8;
+                clock += 1;
+                nodes[0].set_time(clock);
+                nodes[0].record_gradient(route_key_from_prefix(&route), link, 0);
+            }
+            if generation == 0 {
+                nodes[0].handle(BearerEvent::Disconnected(link));
+            }
+        }
+
+        // Every bucket this identity holds, across both generations, live or stale.
+        let held_by_the_identity = nodes[0]
+            .recv_gradient
+            .values()
+            .filter(|e| e.links.iter().any(|(l, _)| *l == 10 || *l == 11))
+            .count();
+        assert_eq!(
+            held_by_the_identity, MAX_GRADIENT_BUCKETS_PER_PEER,
+            "one identity gets ONE quota no matter how many times it reconnects (got \
+             {held_by_the_identity} buckets across 2 connection generations)"
+        );
+        assert!(
+            nodes[0]
+                .recv_gradient
+                .values()
+                .all(|e| e.links.iter().all(|(l, _)| *l != 10)),
+            "and the dropped connection leaves no next-hop behind: a dead link can never forward"
+        );
+    }
+
+    #[test]
+    fn one_peer_holds_one_quota_across_simultaneous_and_sequential_links() {
+        // security-privacy-r19-01 (closure): the two multiplication paths one identity has are extra
+        // SIMULTANEOUS links and extra SEQUENTIAL ones. `one_peer_cannot_buy_extra_gradient_quota_
+        // with_more_links` pins the simultaneous case and `reconnecting_does_not_re_arm_one_peers_
+        // gradient_quota` pins the sequential one; this pins them COMBINED, which is the shape a real
+        // attacker uses (hold several connections, cycle them, keep grinding).
+        let mut nodes = [
+            Node::new(Identity::generate()),
+            Node::new(Identity::generate()),
+        ];
+        let mut net = Wire2::new();
+        let mut clock = 1_000u64;
+        let mut claimed = 0usize;
+        let mut all_links: Vec<LinkId> = Vec::new();
+
+        // Three rounds; each round holds two simultaneous connections, grinds a fresh block on both,
+        // then drops one of them. Blocks never repeat, so any leaked quota shows up as extra buckets.
+        for round in 0..3u8 {
+            let a: LinkId = 100 + (round as LinkId) * 2;
+            let b: LinkId = 101 + (round as LinkId) * 2;
+            net.connect(&mut nodes, 0, a, 1, 200 + (round as LinkId) * 2);
+            net.connect(&mut nodes, 0, b, 1, 201 + (round as LinkId) * 2);
+            all_links.push(a);
+            all_links.push(b);
+            for link in [a, b] {
+                for _ in 0..MAX_GRADIENT_BUCKETS_PER_PEER / 2 {
+                    let mut route = [0u8; crypto::MAILBOX_ROUTE_PREFIX_BYTES];
+                    route[0] = (claimed % 256) as u8;
+                    claimed += 1;
+                    clock += 1;
+                    nodes[0].set_time(clock);
+                    nodes[0].record_gradient(route_key_from_prefix(&route), link, 0);
+                }
+            }
+            nodes[0].handle(BearerEvent::Disconnected(a));
+        }
+        assert!(
+            claimed > MAX_GRADIENT_BUCKETS_PER_PEER,
+            "the grind attempted more than one quota's worth ({claimed} prefixes)"
+        );
+
+        let held = nodes[0]
+            .recv_gradient
+            .values()
+            .filter(|e| e.links.iter().any(|(l, _)| all_links.contains(l)))
+            .count();
+        // A bound, not an equality: the final round drops one of its two live links, and that link's
+        // share of the quota goes with it, so the surviving count sits at or below the cap rather than
+        // exactly on it. Under the old per-LINK enforcement this measures 96 (each of the 6 links
+        // keeps its own 32 under a 64 cap, less the 3 disconnected links' shares).
+        assert!(
+            held <= MAX_GRADIENT_BUCKETS_PER_PEER,
+            "one identity is held to one quota across simultaneous AND sequential links (got {held} \
+             buckets from {claimed} claims over 6 connections)"
+        );
+        assert!(
+            held > 0,
+            "and the cap is a cap, not a mute: this peer still holds routes"
         );
     }
 
@@ -14540,6 +15483,344 @@ mod tests {
         assert!(
             !fresh.immune.contains_key(&id),
             "and it is not falsely marked delivered"
+        );
+    }
+
+    /// One private §39 bundle addressed to `to`, as a relay would be carrying it. Not sealed to
+    /// anyone this test can open; only its shape (private, Broadcast-dst, recognition-tagged)
+    /// matters, which is exactly what `resolve_vaccine_targets` scans.
+    fn held_private_bundle(to: &Identity, body: &[u8]) -> Bundle {
+        Bundle::create_private(
+            &to.address(),
+            &to.derive_prekey().public,
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: body.to_vec(),
+            },
+            Some(crypto::mailbox_route(&crypto::mailbox_tag(
+                &to.address(),
+                0,
+            ))),
+            BundleOpts::default(),
+        )
+        .unwrap()
+    }
+
+    /// A valid, never-before-seen delivery vaccine minted from an attacker-chosen token. Free to
+    /// produce: `compute_vaccine_id` binds only the token, and `verify()` requires no signature and
+    /// no §35 carriage stamp.
+    fn forged_vaccine(n: u32) -> Bundle {
+        let mut token = [0xC0u8; 32];
+        token[..4].copy_from_slice(&n.to_le_bytes());
+        Bundle::create_vaccine(
+            token,
+            BundleOpts {
+                created_at: 0,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_forged_vaccine_flood_cannot_scale_scan_work_with_its_own_packet_rate() {
+        // security-privacy-r19-02. `resolve_vaccine_targets` is O(held store), and on hop-relayd that
+        // is one SELECT + postcard decode PER HELD BUNDLE on the single SQLite driver thread at
+        // set_max_relayed(8192). The `seen`-id short circuit only bounds DUPLICATES of one token, and
+        // the arrival limiter only bounds the mint RATE, so a stream of DISTINCT forged tokens bought
+        // a FULL store pass EACH: cost scaled linearly with the attacker's packet budget.
+        //
+        // Measure the resource itself (held-bundle reads), not a counter the node keeps about itself.
+        // Unsafe behaviour: reads ~= floods x held. With the window budget: reads <= a constant
+        // number of passes over the same store, no matter how many vaccines arrive.
+        let held = 40usize;
+        let floods = 60u32;
+        let recipient = Identity::generate();
+        let mut relay = Node::with_store(Identity::generate(), CountingStore::default());
+        relay.set_time(1_000);
+        for i in 0..held {
+            relay.on_bundle(1, held_private_bundle(&recipient, &i.to_le_bytes()));
+        }
+        let carried: Vec<BundleId> = relay.store.have().ids;
+        assert_eq!(carried.len(), held, "the relay is carrying a full store");
+
+        relay.store.bundle_reads.set(0);
+        for n in 0..floods {
+            relay.on_bundle(9, forged_vaccine(n));
+        }
+        let reads = relay.store.bundle_reads.get();
+        // Budgeted passes over the store, plus the ordinary per-arrival reads every bundle costs
+        // (the store-and-offer path), which are a small constant per packet and NOT a function of
+        // how much the relay is holding.
+        let ceiling = MAX_VACCINE_SCAN_PASSES_PER_WINDOW as usize * held + 2 * floods as usize;
+        let unsafe_cost = floods as usize * held;
+        assert!(
+            reads <= ceiling,
+            "vaccine resolution is capped at {MAX_VACCINE_SCAN_PASSES_PER_WINDOW} held-store passes \
+             per window; {floods} forged vaccines against {held} held bundles cost {reads} reads \
+             (ceiling {ceiling})"
+        );
+        assert!(
+            reads * 4 < unsafe_cost,
+            "and that is far below the one-pass-per-packet cost this closes ({unsafe_cost} reads)"
+        );
+
+        // The cap is a budget, not a mute: the over-budget tokens are queued for the batched pass.
+        // At this depth (well under MAX_PENDING_VACCINE_TOKENS) none is evicted from the queue at
+        // all; what happens to a token that IS evicted, at a depth this test does not reach, is
+        // pinned by `a_genuine_vaccine_evicted_from_the_deferral_queue_still_purges_its_target`.
+        let queued = relay.pending_vaccine_tokens.len();
+        assert_eq!(
+            queued,
+            floods as usize - MAX_VACCINE_SCAN_PASSES_PER_WINDOW as usize,
+            "every over-budget token is queued; none is silently discarded"
+        );
+        relay.set_time(1_000 + VACCINE_SCAN_WINDOW_MS + 1);
+        relay.store.bundle_reads.set(0);
+        relay.tick(1_000 + VACCINE_SCAN_WINDOW_MS + 1);
+        assert!(
+            relay.pending_vaccine_tokens.is_empty(),
+            "the deferred queue drains within one window's budget"
+        );
+        // Batched: VACCINE_TOKENS_PER_SCAN_PASS tokens share ONE pass over the store, so the drain
+        // costs ceil(queued / batch) passes plus whatever the rest of `tick` reads, never one pass per
+        // queued token. Both bounds below are load-bearing: the first is the same constant-per-window
+        // ceiling the arrival phase is held to, the second is the distance from the unsafe cost.
+        let drain_reads = relay.store.bundle_reads.get();
+        let passes = queued.div_ceil(VACCINE_TOKENS_PER_SCAN_PASS);
+        let unbatched_cost = queued * held;
+        assert!(
+            drain_reads <= ceiling,
+            "the drain stays inside the same per-window ceiling ({drain_reads} reads for {queued} \
+             queued tokens in {passes} batched pass(es), ceiling {ceiling})"
+        );
+        assert!(
+            drain_reads * 4 < unbatched_cost,
+            "and is far below one pass per queued token ({unbatched_cost} reads)"
+        );
+    }
+
+    #[test]
+    fn a_forged_vaccine_flood_cannot_take_the_custody_window() {
+        // security-privacy-r19-02. A vaccine must be able to PURGE, and must occupy no more than its
+        // fixed carve-out (it does occupy up to MAX_RELAYED_VACCINES slots; the property is a bound,
+        // not zero). Vaccines are deliberately exempt from the §35 carriage gate (stamping one would
+        // leak the recipient), and pick_evict_victim scores a Vaccine dst and a §39 private Broadcast
+        // dst identically (utility = priority x 100 + route, route 0.0 for both), so sharing one
+        // custody window with genuine carriage meant a distinct-token flood turned the whole window
+        // over to attacker-minted anti-packets. Vaccines now evict their OWN oldest instead.
+        let held = 12usize;
+        let recipient = Identity::generate();
+        let mut relay = Node::new(Identity::generate());
+        relay.set_time(1_000);
+        // A custody window barely larger than the genuine set: this is the pressure the flood used
+        // to exploit, and it keeps the test honest about what "displaced" means.
+        relay.set_max_relayed(held + MAX_RELAYED_VACCINES);
+        for i in 0..held {
+            relay.on_bundle(1, held_private_bundle(&recipient, &i.to_le_bytes()));
+        }
+        let genuine: Vec<BundleId> = relay.store.have().ids;
+        assert_eq!(genuine.len(), held);
+
+        // Sustained flood, well past both the custody window and the vaccine sub-cap. Spread over
+        // several ingest windows so the arrival limiter is not what is being measured.
+        for round in 0..8u32 {
+            relay.set_time(1_000 + round as u64 * 1_000);
+            for n in 0..200u32 {
+                relay.on_bundle(9, forged_vaccine(round * 1_000 + n));
+            }
+        }
+
+        for id in &genuine {
+            assert!(
+                relay.store.contains(id),
+                "a freely-mintable anti-packet must never evict genuine custody"
+            );
+        }
+        let vaccines_held = relay
+            .store
+            .have()
+            .ids
+            .into_iter()
+            .filter(|id| {
+                relay
+                    .store
+                    .get(id)
+                    .is_some_and(|b| matches!(b.inner.dst, Destination::Vaccine(_)))
+            })
+            .count();
+        assert!(
+            vaccines_held <= MAX_RELAYED_VACCINES,
+            "held vaccines are capped at {MAX_RELAYED_VACCINES}, got {vaccines_held}"
+        );
+        // The genuine share of the custody queue is what the sub-cap protects, and it is what the
+        // assertion above measures. Note deliberately NOT asserted here: `relay_order.len() <= held +
+        // MAX_RELAYED_VACCINES` is true by construction, because that is the value passed to
+        // `set_max_relayed`, so `evict_relayed_if_needed` enforces it whether the vaccine sub-cap
+        // exists or not. It would read like proof and prove nothing.
+        let genuine_in_queue = relay
+            .relay_order
+            .iter()
+            .filter(|id| genuine.contains(id))
+            .count();
+        assert_eq!(
+            genuine_in_queue,
+            held,
+            "every genuine bundle keeps its custody slot through a {} vaccine flood",
+            8 * 200
+        );
+    }
+
+    #[test]
+    fn a_genuine_vaccine_still_purges_when_it_lands_inside_a_forged_flood() {
+        // The budget must not become a way to SUPPRESS the anti-packet: a real vaccine that arrives
+        // while the scan budget is spent is deferred, not dropped, and the batched pass still purges
+        // its target and marks it immune.
+        let recipient = Identity::generate();
+        let mut relay = Node::new(Identity::generate());
+        relay.set_time(1_000);
+        let target = held_private_bundle(&recipient, b"real");
+        let target_id = target.id();
+        let ephemeral = target.inner.private.as_ref().unwrap().ephemeral;
+        relay.on_bundle(1, target);
+        assert!(relay.store.contains(&target_id), "relay carries the target");
+
+        // Burn the whole window budget on forgeries first.
+        for n in 0..(MAX_VACCINE_SCAN_PASSES_PER_WINDOW + 2) {
+            relay.on_bundle(9, forged_vaccine(10_000 + n));
+        }
+        assert!(
+            relay.store.contains(&target_id),
+            "the forgeries clear nothing"
+        );
+
+        // Now the real one, minted from the recipient's own recognition secret.
+        let token =
+            crypto::recognition_shared(&recipient.derive_prekey().secret_bytes(), &ephemeral);
+        relay.on_bundle(
+            9,
+            Bundle::create_vaccine(
+                token,
+                BundleOpts {
+                    created_at: 0,
+                    ..Default::default()
+                },
+            ),
+        );
+        relay.set_time(1_000 + VACCINE_SCAN_WINDOW_MS + 1);
+        relay.tick(1_000 + VACCINE_SCAN_WINDOW_MS + 1);
+        assert!(
+            !relay.store.contains(&target_id),
+            "a genuine vaccine deferred by the budget still purges its target"
+        );
+        assert!(
+            relay.immune.contains_key(&target_id),
+            "and still immunizes against a re-flood"
+        );
+    }
+
+    #[test]
+    fn a_sustained_flood_cannot_starve_the_deferred_vaccine_drain() {
+        // security-privacy-r19-02 (closure). The deferral queue is only a safe place to hold a genuine
+        // vaccine if it actually DRAINS under the conditions that fill it. Arrival-time resolution and
+        // the deferred drain used to share one per-window pass counter, and an arrival is checked first
+        // (per packet), so a sustained flood spent every window's budget on arrivals and the drain got
+        // zero passes: the backlog only grew, and every genuine vaccine in it walked to the queue bound
+        // where it loses its retroactive sweep. The drain now holds its OWN budget.
+        //
+        // Revert-proof: with one shared counter the queue below still holds tokens after the tick.
+        let held = 4usize;
+        let recipient = Identity::generate();
+        let mut relay = Node::with_store(Identity::generate(), CountingStore::default());
+        relay.set_time(1_000);
+        for i in 0..held {
+            relay.on_bundle(1, held_private_bundle(&recipient, &i.to_le_bytes()));
+        }
+
+        // One window: arrivals burn the whole arrival budget and queue the rest, then tick runs INSIDE
+        // the same window, exactly as a flooded relay's event loop would.
+        for n in 0..40u32 {
+            relay.on_bundle(9, forged_vaccine(n));
+        }
+        let queued = relay.pending_vaccine_tokens.len();
+        assert!(
+            queued > 0,
+            "the flood did overflow the arrival budget and queue tokens"
+        );
+        relay.tick(1_000);
+        assert!(
+            relay.pending_vaccine_tokens.len() < queued,
+            "the drain makes progress in the SAME window the arrivals filled it, rather than being \
+             starved by them ({queued} queued, {} left)",
+            relay.pending_vaccine_tokens.len()
+        );
+
+        // And the invariant the budget exists for still holds: total passes per window is a constant,
+        // independent of the packet rate. Two budgets means 2x the constant, not a rate-scaled cost.
+        let cap = 2 * MAX_VACCINE_SCAN_PASSES_PER_WINDOW as usize * held;
+        relay.store.bundle_reads.set(0);
+        for n in 100..400u32 {
+            relay.on_bundle(9, forged_vaccine(n));
+        }
+        relay.tick(1_000);
+        assert!(
+            relay.store.bundle_reads.get() <= cap + 2 * 300,
+            "300 more forged vaccines in the same window buy no more store passes ({} reads, arrival \
+             + drain ceiling {cap} plus the per-packet store-and-offer constant)",
+            relay.store.bundle_reads.get()
+        );
+    }
+
+    #[test]
+    fn a_genuine_vaccine_evicted_from_the_deferral_queue_still_purges_its_target() {
+        // security-privacy-r19-02 CLOSURE REGRESSION. The first cut of the deferral queue bounded it
+        // with a bare `pop_front`, which silently and PERMANENTLY discarded whatever genuine vaccine
+        // happened to be at the front. Permanently, because `store.put` marks the vaccine's own id
+        // `seen` on arrival and the ingest arm is guarded on `!self.store.seen(&id)`, so no re-flooded
+        // copy is ever reconsidered. The §39 vaccine is the delivery-confirmation path
+        // (`apply_vaccine_delivery` is what clears the sender's send and drops the relay's copy), so
+        // bounding forged vaccines by discarding real ones trades a DoS for lost deliveries.
+        //
+        // `defer_vaccine_scan` now hands an evicted token to `remember_vaccine_token`, so it keeps the
+        // half that costs no store pass: purging a target that arrives later. Revert-proof: with the
+        // bare `pop_front`, the target below is stored and re-flooded to its clamped TTL.
+        let recipient = Identity::generate();
+        let target = held_private_bundle(&recipient, b"evicted-from-the-queue");
+        let target_id = target.id();
+        let ephemeral = target.inner.private.as_ref().unwrap().ephemeral;
+        // The token only the real recipient can compute (same forgery-resistance as the live path).
+        let genuine =
+            crypto::recognition_shared(&recipient.derive_prekey().secret_bytes(), &ephemeral);
+
+        let mut relay = Node::new(Identity::generate());
+        relay.set_time(1_000);
+
+        // The genuine vaccine got deferred (its window's scan budget was already spent) and sits at
+        // the FRONT of the queue, so it is exactly what an overflow evicts.
+        relay.defer_vaccine_scan(genuine);
+        for n in 0..MAX_PENDING_VACCINE_TOKENS {
+            let mut forged = [0xC0u8; 32];
+            forged[..4].copy_from_slice(&(n as u32).to_le_bytes());
+            relay.defer_vaccine_scan(forged);
+        }
+        assert_eq!(
+            relay.pending_vaccine_tokens.len(),
+            MAX_PENDING_VACCINE_TOKENS,
+            "the deferral queue stays depth-bounded under a distinct-token flood"
+        );
+        assert!(
+            !relay.pending_vaccine_tokens.contains(&genuine),
+            "and the flood did push the genuine token out of the queue (the case under test)"
+        );
+
+        // The target arrives AFTER that eviction, i.e. only the remembered token can save it.
+        relay.on_bundle(8, target);
+        assert!(
+            !relay.store.contains(&target_id),
+            "a genuine vaccine evicted from the deferral queue still purges a later-arriving target"
+        );
+        assert!(
+            relay.immune.contains_key(&target_id),
+            "and still immunizes, so a re-flood cannot restore the delivered copy"
         );
     }
 
@@ -15950,7 +17231,7 @@ mod tests {
 
         // (2) A real holder still drops the delivered bundle: it recovers the target from the token.
         assert_eq!(
-            nodes[1].resolve_vaccine_target(&token),
+            nodes[1].resolve_vaccine_targets(&[token])[0],
             Some(id),
             "a holder recovers the delivered id from the token alone"
         );
@@ -15966,7 +17247,7 @@ mod tests {
 
         // A token for a bundle we don't hold resolves to nothing (no false purge, no correlation gain).
         assert_eq!(
-            nodes[1].resolve_vaccine_target(&[0x11; 32]),
+            nodes[1].resolve_vaccine_targets(&[[0x11; 32]])[0],
             None,
             "a token we hold no bundle for matches nothing"
         );
@@ -19874,6 +21155,81 @@ mod access_gate_tests {
             "vaccine not refused by the gate"
         );
         assert!(relay.take_usage().is_empty(), "vaccines are never metered");
+    }
+
+    #[test]
+    fn a_keyed_relays_stamped_custody_survives_a_unique_token_vaccine_flood() {
+        // security-privacy-r19-02 closure item 2, on a KEYED relay specifically, because that is the
+        // policy the finding's invariant is stated under: "under a Keyed access policy a relay takes
+        // custody of a foreign bundle only against a verifying carriage stamp, and no unauthenticated
+        // packet may ... displace genuine custody."
+        //
+        // The asymmetry is the whole point. Genuine carriage had to present a stamp signed by a key in
+        // the keyserver to get its slot. A vaccine needs nothing: no stamp, no tenant, no signature,
+        // just an attacker-chosen 32 bytes. So a keyed relay is exactly where a flood of freely-minted
+        // anti-packets evicting stamped, billable custody would be worst, and it is the case the
+        // policy-agnostic custody test does not cover.
+        let (stamper, key) = tenant_stamper();
+        let mut relay = keyed_relay(&key);
+        let held = 10usize;
+        relay.set_max_relayed(held + MAX_RELAYED_VACCINES);
+
+        // Genuine STAMPED foreign carriage, admitted through the gate.
+        let mut stamped: Vec<BundleId> = Vec::new();
+        for i in 0..held {
+            let mut b = foreign(&i.to_le_bytes());
+            let id = b.id();
+            b.env.access = Some(Box::new(stamper.stamp(&id, NOW)));
+            relay.on_bundle(1, b);
+            assert!(relay.store.contains(&id), "stamped carriage admitted");
+            stamped.push(id);
+        }
+        assert_eq!(
+            relay.take_access_refused(),
+            0,
+            "no stamped bundle was refused"
+        );
+
+        // A sustained flood of UNIQUE forged tokens, spread over several ingest windows so the arrival
+        // limiter is not what is being measured, and far past both the custody window and the sub-cap.
+        for round in 0..8u32 {
+            relay.set_time(NOW + round as u64 * 1_000);
+            for n in 0..200u32 {
+                let mut token = [0xE0u8; 32];
+                token[..4].copy_from_slice(&(round * 1_000 + n).to_le_bytes());
+                relay.on_bundle(
+                    9,
+                    Bundle::create_vaccine(
+                        token,
+                        BundleOpts {
+                            created_at: 0,
+                            ..Default::default()
+                        },
+                    ),
+                );
+            }
+        }
+
+        for id in &stamped {
+            assert!(
+                relay.store.contains(id),
+                "an unstamped, freely-minted anti-packet must never displace stamped custody on a \
+                 keyed relay"
+            );
+        }
+        let genuine_in_queue = relay
+            .relay_order
+            .iter()
+            .filter(|id| stamped.contains(id))
+            .count();
+        assert_eq!(
+            genuine_in_queue, held,
+            "and every stamped bundle keeps its slot in the custody queue"
+        );
+        assert!(
+            relay.take_usage().is_empty(),
+            "and the flood is still never metered"
+        );
     }
 
     #[test]
