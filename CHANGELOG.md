@@ -5,6 +5,7 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- per-mirror repository, and retryable release artifacts (bf04449)
 - fmt drift, orphaned doc comments, and Android tests that raced the network (dc44ef4)
 - two bugs in my own one-time-prekey work, plus three CI breaks (93859f8)
 - revive dead ingest, fail closed, bound stamps, measure bytes and carriage (1912c75)
@@ -28,6 +29,7 @@ git-cliff. Do not edit by hand.
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
+- invert the license tiers, FSL moves from core to services (14d7fec)
 - purge em-dashes and en-dashes from source (d222435)
 - gate ssrf ip filter behind reqwest feature; fmt (a6f4665)
 - drop the root license, license per-component (FSL-1.1-ALv2) (#146) (be2a5a7)
@@ -36,6 +38,7 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- regenerate from conventional commits (2741000)
 - restate the gradient cap in its real unit, correct the 1-byte prefix figures, record two open residuals (a99af07)
 - correct claims stated more strongly than the code supports (CLAIM-001..009) (f3fbfbf)
 - regenerate from conventional commits (b96e019)
