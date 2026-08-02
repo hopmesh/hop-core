@@ -30,6 +30,19 @@
 //! It is NOT a trust or admission decision. Whether a relay may carry your traffic is
 //! §35 (carriage stamps); whether you believe what it hands back is the bundle's own
 //! signature or self-verifying id. A pool entry is a place to dial, nothing more.
+//!
+//! ## The dial string is opaque, which is what makes Tor free here
+//!
+//! Because `url` is never parsed, an `.onion` endpoint is an ordinary candidate: it is
+//! added, scored, backed off, evicted, and failed over by the same code as a `wss://` one,
+//! and a relay published both ways is simply two entries, so a node that loses the clearnet
+//! path fails over to the Tor path without any new policy. The tests at the bottom of this
+//! file pin that equivalence so a future "validate the URL" change cannot quietly break it.
+//!
+//! Be precise about what that buys, because overclaiming here would be a privacy bug: Tor
+//! hides the node's **IP** from the relay and the network path. It does NOT hide the node's
+//! **hop address**, because links are mutually authenticated Noise XX, so the relay learns
+//! the address of whoever connects over any transport. See `docs/tor.md`.
 
 use std::collections::HashMap;
 
@@ -73,7 +86,8 @@ pub enum EndpointSource {
 /// One candidate relay and its health.
 #[derive(Clone, Debug)]
 pub struct RelayEndpoint {
-    /// Opaque dial string the bearer interprets, e.g. `wss://relay.example/_hop`.
+    /// Opaque dial string the bearer interprets, e.g. `wss://relay.example/_hop` or
+    /// `ws://<56-char-v3>.onion/_hop` when the host dials through a SOCKS proxy.
     /// Deliberately opaque here: this module must not learn a transport.
     pub url: String,
     /// The relay's hop address, when we learned it from a signed reach record. `None`
@@ -496,6 +510,116 @@ mod tests {
         let mut p = RelayPool::new();
         assert!(!p.add("", None, EndpointSource::Configured));
         assert!(p.is_empty());
+    }
+
+    // ---- Tor (.onion) endpoints -------------------------------------------------------------
+    //
+    // A v3 onion address is 56 base32 chars. These are shaped like real ones but are not real
+    // services. The point of this block is that NOTHING below is onion-specific machinery: every
+    // assertion is the clearnet behavior above, re-run with an onion dial string, so a future
+    // "validate the URL" change that would break Tor reach fails here instead of in the field.
+
+    const ONION_EU: &str =
+        "ws://i3azam4xowcraffcdopctb4uq7wq23uhi3azam4xowcraffcdopctb4d.onion/_hop";
+    const ONION_US: &str =
+        "ws://nnv2luu3biio3t7mcmf5v3uhivv5lp5rnnv2luu3biio3t7mcmf5v3ud.onion/_hop";
+
+    #[test]
+    fn an_onion_endpoint_is_accepted_and_dialable() {
+        let mut p = RelayPool::new();
+        assert!(p.add(ONION_EU, None, EndpointSource::Configured));
+        assert_eq!(p.next_dial(0).unwrap().url, ONION_EU);
+        assert_eq!(p.available_count(0), 1);
+    }
+
+    #[test]
+    fn an_onion_endpoint_is_health_scored_like_any_other() {
+        // Same score ladder, same backoff curve, same recovery. If onion URLs were special-cased
+        // anywhere, one of these would diverge from the wss:// cases above.
+        let mut p = pool_with(&[ONION_EU]);
+        p.record_failure(ONION_EU, 0);
+        assert!(
+            p.next_dial(0).is_some(),
+            "one failure is noise, still dialable"
+        );
+        p.record_failure(ONION_EU, 0);
+        assert!(p.next_dial(0).is_none(), "two failures back it off");
+        let until = p.endpoints()[0].backoff_until_ms;
+        assert_eq!(
+            until, BACKOFF_BASE_MS,
+            "the first backoff step is the shared base"
+        );
+        assert!(p.next_dial(until).is_some(), "and it comes back on its own");
+        p.record_success(ONION_EU, until);
+        assert_eq!(p.endpoints()[0].consecutive_failures, 0);
+    }
+
+    #[test]
+    fn failover_works_in_both_directions_between_tor_and_clearnet() {
+        // The deployment this exists for: one relay per continent reachable BOTH ways. Losing the
+        // clearnet path must move traffic to Tor, and losing Tor must move it back, with no policy
+        // beyond the ordinary health score.
+        let mut p = pool_with(&["wss://relay.example/_hop", ONION_EU]);
+        p.record_success("wss://relay.example/_hop", 0);
+        assert_eq!(p.next_dial(1).unwrap().url, "wss://relay.example/_hop");
+
+        // Clearnet blocked (a network that drops the relay's port): fail over to Tor.
+        p.record_failure("wss://relay.example/_hop", 1);
+        p.record_failure("wss://relay.example/_hop", 1);
+        assert_eq!(
+            p.next_dial(1).unwrap().url,
+            ONION_EU,
+            "a blocked clearnet relay must yield to the onion endpoint"
+        );
+
+        // Tor blocked too (the other half of why this is not Tor-only): once the clearnet backoff
+        // lapses, the clearnet endpoint is dialable again and the onion one steps aside.
+        p.record_failure(ONION_EU, 1);
+        p.record_failure(ONION_EU, 1);
+        let lapsed = p
+            .endpoints()
+            .iter()
+            .map(|e| e.backoff_until_ms)
+            .max()
+            .unwrap();
+        assert_eq!(
+            p.next_dial(lapsed).unwrap().url,
+            "wss://relay.example/_hop",
+            "the proven clearnet endpoint is preferred again once both windows lapse"
+        );
+    }
+
+    #[test]
+    fn one_relay_published_both_ways_is_two_independent_dial_paths() {
+        // Deliberate: the pool keys on the dial string, so the same operator's clearnet and onion
+        // URLs are separate entries with separate health. That is the property that makes "both
+        // transports on the same node" useful, since a blocked transport must not poison the other.
+        let mut p = RelayPool::new();
+        assert!(p.add("wss://relay.example/_hop", None, EndpointSource::Configured));
+        assert!(p.add(ONION_EU, None, EndpointSource::Configured));
+        assert_eq!(p.len(), 2);
+        p.record_failure("wss://relay.example/_hop", 0);
+        p.record_failure("wss://relay.example/_hop", 0);
+        assert_eq!(
+            p.endpoints()[1].consecutive_failures,
+            0,
+            "health is per dial path"
+        );
+        assert_eq!(p.available_count(0), 1);
+    }
+
+    #[test]
+    fn a_reach_record_can_publish_an_onion_endpoint() {
+        // Discovery has to carry Tor too, or an operator could only ever hand out clearnet. The
+        // record signs an opaque endpoint string, so this needs nothing new.
+        use crate::crypto::Identity;
+        let relay = Identity::generate();
+        let rec = crate::reach::ReachRecord::sign(&relay, ONION_US, 3600, 1_000);
+        let mut p = RelayPool::new();
+        assert!(p.learn_from_reach(&rec));
+        let picked = p.next_dial(0).expect("a learned onion relay is dialable");
+        assert_eq!(picked.url, ONION_US);
+        assert_eq!(picked.address, Some(relay.address()));
     }
 
     #[test]
