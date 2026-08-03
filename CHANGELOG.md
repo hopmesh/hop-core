@@ -38,6 +38,7 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- regenerate from conventional commits (7a81fb6)
 - regenerate from conventional commits (e6b97f2)
 - regenerate from conventional commits (2741000)
 - restate the gradient cap in its real unit, correct the 1-byte prefix figures, record two open residuals (a99af07)
@@ -79,6 +80,8 @@ git-cliff. Do not edit by hand.
 - observe bundle-per-link transfers for the swarm viz (325a0ae)
 
 ### Other
+- rustfmt the new relay-pool onion tests (28abe6c)
+- prove .onion relays flow through the pool, and add an Apple SOCKS hook (8a0d9f3)
 - bump our crates in every standalone/vendored Cargo.lock (aad3ff7)
 - scope two vaccine-budget claims to what they actually bound (bb5302b)
 - give the deferred vaccine drain its own pass budget so a flood cannot starve it (8d15430)
