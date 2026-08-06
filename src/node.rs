@@ -3552,7 +3552,7 @@ impl<S: Store> Node<S> {
     /// recovers the delivered bundle itself (`recognition_tag_from_shared(token, held_id) == held_tag`)
     /// and drops it. No plaintext delivered id on the wire. Outlives the message to chase the tail.
     fn emit_vaccine(&mut self, token: [u8; 32], lifetime_ms: u32) {
-        let bundle = Bundle::create_vaccine(
+        let mut bundle = Bundle::create_vaccine(
             token,
             BundleOpts {
                 created_at: self.now_ms,
@@ -3560,6 +3560,10 @@ impl<S: Store> Node<S> {
                 ..Default::default()
             },
         );
+        // sec-relay-p1-02: start the advisory hop count at a per-vaccine blind rather than 0, so the
+        // first relay this reaches cannot read a hop count of 1 and pin the delivery on its
+        // Noise-identified link peer. See `vaccine_hop_blind`.
+        bundle.env.hops = vaccine_hop_blind(&self.identity, &token);
         self.submit(bundle);
     }
 
@@ -9759,14 +9763,15 @@ impl<S: Store> Node<S> {
                 ForwardDecision::Forward if direct => {
                     let mut copy = b.clone();
                     if copy.forwarded() {
-                        copy.add_hop(me_short, me_app); // provenance (§27)
-                                                        // Release custody only for fire-and-forget bundles. For request_ack
-                                                        // ones (carrier chunks, messages), keep custody until the delivery
-                                                        // ACK confirms receipt; handing to the destination is optimistic, and
-                                                        // a chunk it misses in a brief background window must be re-offerable
-                                                        // on its next wake, not deleted here (the ACK vaccine removes it for
-                                                        // real). Without this, a large transfer to a backgrounded device can
-                                                        // lose chunks the relay already dropped, and dedup blocks re-injection.
+                        // Provenance (§27), except on a vaccine: see `stamp_provenance`.
+                        stamp_provenance(&mut copy, me_short, me_app);
+                        // Release custody only for fire-and-forget bundles. For request_ack
+                        // ones (carrier chunks, messages), keep custody until the delivery
+                        // ACK confirms receipt; handing to the destination is optimistic, and
+                        // a chunk it misses in a brief background window must be re-offerable
+                        // on its next wake, not deleted here (the ACK vaccine removes it for
+                        // real). Without this, a large transfer to a backgrounded device can
+                        // lose chunks the relay already dropped, and dedup blocks re-injection.
                         if !own && !b.inner.flags.request_ack {
                             self.store.remove(&id);
                         }
@@ -9784,7 +9789,7 @@ impl<S: Store> Node<S> {
                     // by the hop limit and reclaimed by the delivery-ACK vaccine.
                     let mut copy = b.clone();
                     if copy.forwarded() {
-                        copy.add_hop(me_short, me_app); // provenance (§27)
+                        stamp_provenance(&mut copy, me_short, me_app); // provenance (§27)
                         Some(copy)
                     } else {
                         None
@@ -9943,6 +9948,47 @@ fn is_for(bundle: &Bundle, addr: &PubKeyBytes) -> bool {
 /// beyond ~49 days clamps rather than wrapping.
 fn forward_ms(now: u64, created_at: u64) -> u32 {
     now.saturating_sub(created_at).min(u32::MAX as u64) as u32
+}
+
+/// Stamp §27 provenance on the copy we are about to hand a neighbour.
+///
+/// sec-relay-p1-02: a §39 **delivery vaccine** gets NO provenance, and any that arrived on it is
+/// stripped rather than propagated. A vaccine is emitted by the RECIPIENT of a private bundle the
+/// instant it recognizes one, and it is the only anonymous class that was still traced: it is not
+/// `is_private()` (no `PrivateHeader`), so `add_hop` treated it as an ordinary traced bundle and
+/// wrote the emitter's 8-byte short address into the envelope. The first forwarder is the recipient
+/// itself, so `trace[0]` named the person who had just received a §39 message, in cleartext, and
+/// that naming then travelled the whole flood, telling relays with no link to that node what an
+/// adjacent relay would otherwise have had to infer. Clearing (not skipping) also scrubs a trace
+/// injected by an older or hostile forwarder, the same discipline `add_hop` already applies to
+/// private bundles.
+fn stamp_provenance(copy: &mut Bundle, node: ShortAddr, app: ShortApp) {
+    if matches!(copy.inner.dst, Destination::Vaccine(..)) {
+        copy.env.trace.clear();
+        return;
+    }
+    copy.add_hop(node, app);
+}
+
+/// The per-vaccine hop-count blind (sec-relay-p1-02), the vaccine twin of the private bundle's
+/// [`crypto::hop_blind_from_shared`].
+///
+/// A vaccine used to leave its emitter with `hops = 0`, so the first relay it reached read
+/// `hops = 1` on arrival and concluded that its Noise-authenticated link peer was the emitter, that
+/// is, that this exact address had just received a §39 private message. Starting the count at a
+/// secret-keyed offset removes the arithmetic that inference rests on.
+///
+/// Keyed on the emitter's identity seed and the (public) revealed token, so it is deterministic for
+/// the emitter, independent per vaccine, and unpredictable to everyone else. It is deliberately NOT
+/// derived from the token alone: the token rides in the clear inside `Destination::Vaccine`, so any
+/// relay could recompute a token-only offset and subtract it. Nothing consumes a vaccine's hop
+/// count (vaccines never reach an inbox, and forwarding is bounded by `hop_limit`, not by `hops`),
+/// so unlike the private-bundle blind this one never has to be undone.
+fn vaccine_hop_blind(identity: &Identity, token: &[u8; 32]) -> u8 {
+    let key = blake3::derive_key("hop vaccine hop-blind v1", &identity.to_secret_bytes());
+    let digest = blake3::keyed_hash(&key, token);
+    // Bounded exactly like the private blind, so `blind + travelled` cannot wrap the u8 counter.
+    digest.as_bytes()[0] % (crypto::MAX_HOP_BLIND + 1)
 }
 
 #[cfg(test)]
@@ -13954,6 +14000,156 @@ mod tests {
         assert!(
             saw_nonzero >= 20,
             "private bundles must leave the sender with a blinded hop count, saw {saw_nonzero}/24 non-zero"
+        );
+    }
+
+    #[test]
+    fn a_relay_learns_the_permanent_address_of_every_node_that_connects_to_it() {
+        // CHARACTERISATION, not a fix. This is the open gap DESIGN.md §39 ("What a relay still learns") records: every link runs
+        // mutually-authenticated Noise XX over the node's LONG-TERM identity key, so the operator of
+        // any relay learns the permanent hop address of everything that dials it, and can link the
+        // same address across sessions. Nothing in §39 changes that, and running a relay is therefore
+        // the cheapest deanonymisation position in the system. The test exists so the property is
+        // stated in code: if someone lands ephemeral relay-link identities, this test is what they
+        // must consciously rewrite, rather than discovering the disclosure again from scratch.
+        let device_seed = [0x1du8; 32];
+        let device_address = Identity::from_secret_bytes(&device_seed).address();
+        let mut nodes = [
+            Node::new(Identity::from_secret_bytes(&device_seed)), // 0 a phone
+            Node::new(Identity::generate()),                      // 1 the relay it dials
+        ];
+        nodes[1].set_kind(NodeKind::Relay);
+
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1);
+        assert_eq!(
+            nodes[1].peers(),
+            vec![device_address],
+            "the relay authenticates, and therefore learns, the device's permanent address"
+        );
+
+        // And it survives a reconnect on a fresh link id: the address is the identity, so the relay
+        // re-recognizes the same device every time it comes back. That linkability over time is the
+        // part that matters, not any single sighting.
+        nodes[0].handle(BearerEvent::Disconnected(1));
+        nodes[1].handle(BearerEvent::Disconnected(1));
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 9, 1, 9);
+        assert_eq!(
+            nodes[1].peers(),
+            vec![device_address],
+            "a reconnect re-presents the same permanent address, so sessions are linkable"
+        );
+    }
+
+    #[test]
+    fn vaccine_hop_blind_is_secret_bounded_and_per_vaccine() {
+        // sec-relay-p1-02, the vaccine twin of `hop_blind_is_secret_bounded_and_per_bundle`. Three
+        // properties, each one a way the blind could fail to protect anything.
+        let bob = Identity::from_secret_bytes(&[0x2bu8; 32]);
+        let mallory = Identity::from_secret_bytes(&[0x3cu8; 32]);
+
+        // 1. BOUNDED and DETERMINISTIC: `blind + travelled` must not wrap the u8 counter, and the
+        // same emitter re-deriving the same vaccine must land on the same offset.
+        let token = [0x77u8; 32];
+        assert!(vaccine_hop_blind(&bob, &token) <= crypto::MAX_HOP_BLIND);
+        assert_eq!(
+            vaccine_hop_blind(&bob, &token),
+            vaccine_hop_blind(&bob, &token)
+        );
+
+        // 2. SECRET: keyed on the emitter's identity, so a relay holding the (public, in-the-clear)
+        // token cannot recompute the offset and subtract it back off.
+        assert_ne!(
+            vaccine_hop_blind(&bob, &token),
+            vaccine_hop_blind(&mallory, &token),
+            "the blind must depend on the emitter's secret, not just the revealed token"
+        );
+
+        // 3. PER-VACCINE and rarely zero: a blind that were usually 0 would leave `hops == 1` on the
+        // wire most of the time, which is the inference this closes. Uniform over 0..=MAX, so 24
+        // draws all landing on 0 has probability ~(1/101)^24.
+        let mut saw_nonzero = 0;
+        for i in 0..24u8 {
+            let mut t = [0u8; 32];
+            t[0] = i;
+            if vaccine_hop_blind(&bob, &t) != 0 {
+                saw_nonzero += 1;
+            }
+        }
+        assert!(
+            saw_nonzero >= 20,
+            "the blind must vary per vaccine, saw {saw_nonzero}/24 non-zero"
+        );
+    }
+
+    #[test]
+    fn a_delivery_vaccine_neither_names_nor_counts_back_to_the_recipient_that_emitted_it() {
+        // sec-relay-p1-02. A vaccine is emitted by the RECIPIENT the moment it recognizes a §39
+        // private bundle, so anything on that vaccine which points at its emitter says "this address
+        // just received an untraceable message". Two things did:
+        //   * the §27 provenance trace, because a vaccine is not `is_private()`, so `add_hop` wrote
+        //     the emitter's short address into `trace[0]` and every downstream relay inherited it;
+        //   * an unblinded hop count, which arrived at the first relay reading exactly 1.
+        // Both are checked here against the copy the relay actually receives.
+        let bob_seed = [0x5bu8; 32];
+        let bob_identity = Identity::from_secret_bytes(&bob_seed);
+        let bob_short = short_addr(&bob_identity.address());
+        let mut nodes = [
+            Node::new(Identity::generate()),                   // 0 Alice (sender)
+            Node::new(Identity::generate()),                   // 1 Carol (the relay in between)
+            Node::new(Identity::from_secret_bytes(&bob_seed)), // 2 Bob (recipient, emits the vaccine)
+        ];
+        let mut net = Wire2::new();
+        net.connect(&mut nodes, 0, 1, 1, 1); // Alice <-> Carol
+        net.connect(&mut nodes, 1, 2, 2, 2); // Carol <-> Bob
+        exchange_prekeys(&mut net, &mut nodes);
+
+        let bob = nodes[2].address();
+        nodes[0]
+            .send_message(bob, "text/plain".into(), b"meet at dawn".to_vec(), true)
+            .unwrap();
+        net.pump(&mut nodes);
+        assert_eq!(nodes[2].inbox_items().len(), 1, "Bob received the message");
+        // Accepting the inbox item is what emits the delivery ACK and its vaccine (sec-priv-07).
+        accept_all(&mut nodes[2]);
+        net.pump(&mut nodes);
+
+        // The vaccine Carol holds is the copy Bob handed her: one forward from its emitter.
+        let (token, vaccine) = nodes[1]
+            .store
+            .have()
+            .ids
+            .into_iter()
+            .filter_map(|id| nodes[1].store.get(&id))
+            .find_map(|b| match b.inner.dst {
+                Destination::Vaccine(token) => Some((token, b)),
+                _ => None,
+            })
+            .expect("the relay carries the delivery vaccine Bob emitted");
+
+        assert!(
+            vaccine.env.trace.is_empty(),
+            "a vaccine must carry no provenance; trace[0] would be its emitter, the recipient"
+        );
+        assert!(
+            !vaccine.trace().iter().any(|h| h.node == bob_short),
+            "the recipient's short address must not ride the vaccine"
+        );
+
+        let blind = vaccine_hop_blind(&bob_identity, &token);
+        assert_ne!(
+            blind, 0,
+            "fixture check: this seed must give a non-zero blind for the assertion below to mean anything"
+        );
+        assert_eq!(
+            vaccine.env.hops,
+            blind.saturating_add(1),
+            "the vaccine arrives at the relay carrying the emitter's blind plus its one real hop"
+        );
+        assert_ne!(
+            vaccine.env.hops, 1,
+            "hops == 1 over an authenticated link would pin the delivery on the relay's link peer"
         );
     }
 
