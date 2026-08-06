@@ -25,8 +25,9 @@ pub struct TraceHop {
 // mis-addressing private bundles. (Struct layouts are unchanged; the break is in tag semantics.)
 // v3: two coupled §39 semantic changes, both invisible in struct layout but breaking cross-version
 // interop, so the version gate must reject a mixed fleet:
-//   * sec-priv-04: routing/spool/want-beacon now key on the mailbox-tag's 2-byte PREFIX, not the full
-//     tag. An old node keys the gradient on the full tag, so it would never match a new node's
+//   * sec-priv-04: routing/spool/want-beacon now key on the mailbox-tag's PREFIX, 2 bytes AS OF v3
+//     (narrowed to 1 in v12, see that entry below; this line records what v3 shipped and is not
+//     renumbered), not the full tag. An old node keys the gradient on the full tag, so it would never match a new node's
 //     prefix-bucketed spool/want, so private delivery would silently degrade to flood-only across the
 //     boundary. Bumping forces the mismatch to surface at `verify()` instead.
 //   * sec-priv-07: the delivery Vaccine no longer carries the plaintext delivered id; it floods only a
@@ -66,6 +67,26 @@ pub struct TraceHop {
 // ACKs) to a 60s bucket so it is not a per-message sender timing fingerprint. This changes the wire
 // bytes (and thus the private wire id) of private bundles minted off a bucket boundary, so a v9 and a
 // v10 node compute different ids for the same logical send; the version gate must keep them apart.
+// v11 -> v12: sec-priv-04 follow-up. `MAILBOX_ROUTE_PREFIX_BYTES` narrowed 2 -> 1, so
+// `PrivateHeader.mailbox` is ONE byte on the wire and there are 256 route buckets rather than the
+// 65_536 that w=2 gave.
+// This entry exists because the list did not have one, and its absence was itself the bug (audit
+// CLAIM-004 / PROTO-004): a reader scanning these entries for the current prefix width found only the
+// v3 line above, which says 2 bytes and is correct as HISTORY (the prefix really was 2 bytes when v3
+// shipped) and so must never be renumbered. The narrowing is a privacy dial, not a layout preference:
+// at w=2 a target's bucket held ~N/65536 addresses, i.e. the target alone for every realistic
+// population, so the anonymity set was a unique identifier. See `crypto::MAILBOX_ROUTE_PREFIX_BYTES`
+// for the shipped figures and the WIDEN TO 2 condition. Same bump also blinded the advisory hop count
+// on private bundles, so a first-hop relay cannot read `hops == 0` and attribute origination. A mailbox
+// field that was 2 bytes in v11 and is 1 byte in v12 is a different byte count in the same header
+// slot, so the version gate must keep the two apart.
+// v12 -> v13: the §39 receiver-beacon stopped being a flooded, identity-signed advert. The signed
+// `AdvertKind::RecvBeacon` (whose advert body carried the publisher's real address in cleartext next to
+// the FULL 16-byte mailbox tag, three hops deep) was replaced by the link-local, UNSIGNED, prefix-only
+// `Wire::RecvBeacon` record. Removing an `AdvertKind` variant shifts the postcard discriminant of every
+// later variant, so a v12 decoder misreads a v13 advert; the gate must reject a mixed fleet. It also
+// deleted the relay-side beacon ownership check, which is why no live comment may claim a beacon's
+// ownership is signature-verifiable (`crypto::mailbox_tag` says so explicitly).
 // v13 -> v14: NO wire-layout and NO semantic change. Stated plainly because every other entry in
 // this list is a real format break and reading this one as another would waste someone's day. The
 // dash-guard carve-out that excluded the manifest-listed wire sources from the repo's no-em-dash
@@ -75,7 +96,20 @@ pub struct TraceHop {
 // because the constant moved. That is the one-time price of retiring a carve-out that had already
 // outlived two bumps it named as its own cleanup trigger, and it is not payable twice: the guard
 // now scans these files, so punctuation can never bank up here again.
-pub const BUNDLE_VERSION: u8 = 14;
+// v14 -> v15: again NO wire-layout and NO semantic change, and again a real hard break, for the same
+// mechanical reason: tools/wire-version-guard.sh hashes crypto.rs and bundle.rs whole, so rewriting a
+// comment in either one costs a bump. What was rewritten is audit PROTO-004: the doc block above
+// `crypto::MAILBOX_ROUTE_PREFIX_BYTES` still described the pre-v12 2-byte / 16-bit prefix above a
+// constant whose value is 1, still claimed a receiver-beacon is signed by the address that owns the mailbox (false
+// since v13, above), and still referenced an `owns_mailbox` binding that exists nowhere in the tree.
+// Deferring those edits to "the next real wire bump" is exactly what v12, v13 and v14 each did, so the
+// prose was wrong for three consecutive versions while the deferral read as a plan. Paying one bump for
+// prose is the smaller cost, and it is not payable a fourth time: tools/mailbox-prefix-doc-guard.sh now
+// derives the documented bucket count from the constant and fails CI when any normative surface
+// disagrees, so this class of drift is caught pre-merge instead of banked. The same bump carries the
+// security-privacy-r19-06 beacon stagger, which is behavioural (node.rs, not a hashed file) and changes
+// no bytes: a v14 node and a v15 node encode byte-identical bundles apart from this constant.
+pub const BUNDLE_VERSION: u8 = 15;
 
 /// Maximum encoded size accepted by [`Bundle::from_bytes`]. Oversized application content is carried
 /// in bounded [`Payload::Carrier`] chunks, so a single decoded bundle never needs to allocate beyond

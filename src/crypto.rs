@@ -727,8 +727,17 @@ pub fn recognition_tag_recipient(
 /// **rotates every epoch**, so a global observer can't correlate a recipient's mailbox across epochs.
 /// A relay buckets a blind spool by it and a recipient names it in a want-beacon. Deriving it from
 /// `(address, epoch)` rather than the prekey decouples mailbox rotation from the (deterministic) prekey,
-/// and lets a relay verify a beacon's ownership from public info (the sender knows the recipient's
-/// address for a private send; a beacon is signed by that address, so it can't be forged for another).
+/// and means a SENDER can compute the same tag from public info (it already holds the recipient's
+/// address for a private send), which is what lets the header carry a routing hint at all.
+///
+/// A beacon's ownership is NOT verifiable, and no relay tries. That claim used to live here, on the
+/// premise of an identity-signed `AdvertKind::RecvBeacon`; wire v13 replaced it with the unsigned,
+/// link-local [`crate::wire_emit::Wire::RecvBeacon`], which carries only the routing prefix, so anyone
+/// can claim any bucket. That is deliberate rather than a regression: under prefix routing a bucket is
+/// a shared anonymity set BY DESIGN, so there is nothing coherent to own, and a false claimant just
+/// drops sealed bundles it cannot recognize. What bounds bucket pollution is link authentication plus
+/// the distance cap, split-horizon, and the per-peer bucket quota, all in `node.rs`. See
+/// `Wire::RecvBeacon` for the full argument.
 pub fn mailbox_tag(address: &PubKeyBytes, epoch: u64) -> Tag {
     let mut material = [0u8; 40];
     material[..32].copy_from_slice(address);
@@ -746,33 +755,33 @@ pub fn mailbox_tag(address: &PubKeyBytes, epoch: u64) -> Tag {
 /// To break that unique linkage we route, spool, and match want-beacons on a short **prefix** of the
 /// tag instead of the whole thing. An address-knower observing a routing/spool bucket then only learns
 /// "some recipient whose tag shares this prefix is active", i.e. an **anonymity set** of every address
-/// (known or unknown) that collides on the prefix, not a unique match. The full tag still travels in
-/// the beacon (so `owns_mailbox` binding still authenticates the beacon against the publisher's signed
-/// address), but core-protocol-r2-02: the **bundle header now carries ONLY this prefix, never the full
-/// tag**, so a bundle-capturing address-knower can no longer read the full deterministic tag off a
-/// flooded copy and uniquely re-link the recipient; a capturer learns only the same anonymity-set
-/// membership the routing layer exposes. No routing *decision* is ever made on more than this prefix.
+/// (known or unknown) that collides on the prefix, not a unique match. The full tag travels NOWHERE:
+/// core-protocol-r2-02 took it out of the bundle header, and wire v13 took it out of the receiver-beacon
+/// with the signed advert that used to carry it, so a bundle-capturing or beacon-observing
+/// address-knower can no longer read the full deterministic tag off a copy and uniquely re-link the
+/// recipient. It learns only the same anonymity-set membership the routing layer exposes, and no routing
+/// *decision* is ever made on more than this prefix.
 ///
-/// Two bytes (16 bits) is the deliberate balance: wide enough that unrelated recipients rarely share a
-/// bucket (so the routing gradient/spool stays useful, since a colliding recipient's bundle just also flows
-/// toward the bucket and is dropped there by the final per-message-ephemeral recognition-tag check),
-/// yet small enough that a real anonymity set forms **once the deployment is large relative to 2^16**.
+/// **The shipped numbers, in one place** (the guard `tools/mailbox-prefix-doc-guard.sh` derives this
+/// exact sentence from the constant below and fails CI in every normative surface that disagrees with
+/// it, because this prose went stale across three consecutive wire versions before anything mechanical
+/// tied it to the value):
 ///
-/// **security-privacy-r2-03, honest scope of the anonymity set.** The anonymity-set argument is a
-/// large-N argument: a target's prefix bucket holds ~N/2^16 addresses, which only exceeds 1 when N
-/// approaches or exceeds 2^16 (~65k) reachable addresses in the observed region. This prefix width is a
-/// COMPILE-TIME constant, NOT adaptive to observed N. So in any **sparse** deployment where N ≪ 2^16
-/// (the current fleet is single-digit devices; even a few hundred is far below 2^16), a target's bucket
-/// is almost always occupied by the target ALONE. Against an address-knower who computes the target's
-/// route and observes that bucket active in a region, the "anonymity set" is then effectively empty:
-/// seeing the bucket active is, with near-certainty, a per-address reachability disclosure ("this
-/// specific target is reachable here this epoch"). This is on top of the intrinsic §39 cost that being
-/// pull-reachable via a signed beacon already reveals reachability. Do NOT rely on the fixed 2-byte
-/// prefix for meaningful anonymity below ~2^16 reachable addresses; at that scale its only role is to
-/// keep routing buckets from being unique KEYS on the wire, not to hide the recipient from an
-/// address-knower. Widening `k` adaptively as N grows (so ~N/2^k stays ≥ a target set size) is the real
-/// fix and is tracked as future work; it is a wire-affecting change (the header carries this prefix, so
-/// its width is part of the format) and so is deliberately out of scope for this in-core hardening pass.
+/// MAILBOX_ROUTE_PREFIX_BYTES = 1 => 256 buckets, anonymity set ~N/256, set of one below ~256 reachable addresses
+///
+/// **security-privacy-r2-03 / r19-04, honest scope of that set.** It is a large-N argument, and this
+/// width is a COMPILE-TIME constant, NOT adaptive to observed N. Below ~256 reachable addresses in the
+/// observed region a target's bucket is often occupied by the target ALONE, so against an
+/// address-knower who computes the target's route and watches that bucket the set collapses toward one:
+/// seeing the bucket active is then, with near-certainty, a per-address reachability disclosure ("this
+/// specific target is reachable here this epoch"). A 1000-device fleet sits at set size ~4, which is
+/// small but is not one. Do NOT rely on this prefix for meaningful anonymity against an address-knower
+/// below ~256 reachable addresses; at that scale its only role is to keep routing buckets from being
+/// unique KEYS on the wire, so a *passive* indexer without the address still cannot derive one. Being
+/// pull-reachable at all reveals reachability to a direct peer regardless, which is the intrinsic §39
+/// cost. Widening `w` adaptively as N grows (so ~N/256^w stays >= a target set size) is the real fix
+/// and is tracked as future work; it is wire-affecting (the header carries this prefix, so its width is
+/// part of the format), which is why it is a deliberate deferral and not an oversight.
 pub const MAILBOX_ROUTE_PREFIX_BYTES: usize = 1;
 
 // WHY 1 BYTE, AND WHEN TO CHANGE IT (sec-priv-04 follow-up, wire v12).
@@ -1266,11 +1275,11 @@ mod tests {
             "the route is the tag's leading prefix, nothing more"
         );
 
-        // With a 2-byte prefix there are only 2^16 buckets, so distinct addresses genuinely collide onto
-        // one route, the anonymity set. A BIRTHDAY search finds SOME colliding pair with overwhelming
-        // probability in a few hundred keys (√2^16 ≈ 256), which is deterministically reliable (unlike
-        // waiting for a hit in one SPECIFIC pre-chosen bucket, ~1/65536 per try, which is flaky). We use
-        // a large bound purely as a can't-hang guard; a collision is found almost immediately.
+        // The prefix leaves only 256 buckets, so distinct addresses genuinely collide onto one route,
+        // the anonymity set. A BIRTHDAY search finds SOME colliding pair with overwhelming probability
+        // in a couple of dozen keys (√256 = 16), which is deterministically reliable (unlike waiting
+        // for a hit in one SPECIFIC pre-chosen bucket, ~1/256 per try, which is flakier). We use a
+        // large bound purely as a can't-hang guard; a collision is found almost immediately.
         let _ = &bob;
         let mut seen: std::collections::HashMap<[u8; MAILBOX_ROUTE_PREFIX_BYTES], PubKeyBytes> =
             std::collections::HashMap::new();

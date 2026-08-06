@@ -177,9 +177,10 @@ pub const RECV_BEACON_REFRESH_MS: u64 = 30_000;
 /// what terminates the distance-vector loop (split-horizon alone does not, in a mesh with cycles).
 /// Past the cap a private bundle falls back to blind-flood, which is the §39 privacy floor anyway.
 pub const MAX_RECV_BEACON_DISTANCE: u8 = 3;
-/// Per-link fixed-window rate limit for inbound receiver-beacons. A legitimate peer emits its own
-/// two epoch prefixes on its refresh interval, plus at most one keep-alive per bucket it forwards
-/// (bounded by [`MAX_GRADIENT_BUCKETS_PER_PEER`]), so a real burst tops out around 64 in a window.
+/// Per-link fixed-window rate limit for inbound receiver-beacons. A legitimate peer emits ONE of its
+/// own epoch prefixes per refresh interval (security-privacy-r19-06 staggered the overlap window, so
+/// a publish is never a pair), plus at most one keep-alive per bucket it forwards (bounded by
+/// [`MAX_GRADIENT_BUCKETS_PER_PEER`]), so a real burst tops out around 64 in a window.
 /// Double that leaves headroom while still ending a line-rate flood.
 const RECV_BEACON_WINDOW_MS: u64 = 1_000;
 const MAX_RECV_BEACONS_PER_WINDOW: u32 = 128;
@@ -194,7 +195,32 @@ const SESSION_MAX_IDLE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// How many extra PAST epochs a recipient keeps beaconing and a relay keeps accepting, so a bundle
 /// addressed/spooled just before an epoch boundary (or under a bit of clock skew) is still routed and
 /// pulled after rotation. Window = 1 ⇒ current + previous epoch are live.
+///
+/// The window's epochs are live for the WHOLE current epoch, deliberately: a sender always stamps its
+/// own current epoch, so the previous epoch can only be stamped by a skewed clock or by a bundle
+/// minted before the boundary, and a delay-tolerant network has to assume that bundle sits in a blind
+/// spool for hours. Time-bounding the window to a short grace period after the boundary would trade a
+/// real delay-tolerance guarantee (a bundle deposited at 23:00 and pulled at 10:00 the next day) for a
+/// privacy nicety, so what got bounded instead is the OBSERVABLE co-emission: see
+/// [`BEACON_EPOCH_STAGGER_MS`] and [`Node::publish_recv_beacon_on`].
 const MAILBOX_EPOCH_WINDOW: u64 = 1;
+/// security-privacy-r19-06: minimum wall-clock separation between a CURRENT-epoch receiver-beacon and
+/// a PAST-window one leaving this node.
+///
+/// The overlap window used to be emitted as a burst: one `publish_recv_beacon_on` call put
+/// `H(addr, e)[0]` and `H(addr, e-1)[0]` on the SAME link back to back, both freshly changed, so a
+/// forwarder re-emitted both at distance 1 adjacently and an observer one hop out could attribute the
+/// PAIR to one upstream recipient. Both prefixes are pure public functions of a public address, so
+/// attributing the pair takes the address-knower's false-positive rate from `1/256` to `1/65536` (the
+/// selector the wire-v12 narrowing to one byte existed to remove) and bridges the epochs the rotation
+/// exists to separate.
+///
+/// The fix is structural, not statistical: a publish carries exactly ONE epoch's prefix, and the two
+/// epochs are held apart by this interval. Half the refresh interval keeps each epoch's own bucket on
+/// a full [`RECV_BEACON_REFRESH_MS`] cadence (so neither lease gets closer to
+/// [`RECV_BEACON_TTL_MS`] than it was before) while putting the two arrivals in different
+/// re-emission passes at every forwarder along the way.
+const BEACON_EPOCH_STAGGER_MS: u64 = RECV_BEACON_REFRESH_MS / 2;
 
 /// The current mailbox epoch for a clock reading.
 fn mailbox_epoch(now_ms: u64) -> u64 {
@@ -1027,7 +1053,24 @@ pub struct Node<S: Store = MemoryStore> {
     /// STABLE links, not just at link-up; see the re-gossip in `tick`).
     last_regossip_ms: u64,
     /// Last time we emitted our §39 P4 receiver-beacon (re-emitted on [`RECV_BEACON_REFRESH_MS`]).
+    /// The periodic-refresh clock, moved by [`Node::tick`] only.
     last_recv_beacon_ms: u64,
+    /// Last time a CURRENT-epoch receiver-beacon left this node by ANY path, the tick refresh or the
+    /// link-up emission. Separate from `last_recv_beacon_ms` because it is a stagger reference, not a
+    /// refresh timer: a link coming up right before a window emission would otherwise put both epoch
+    /// prefixes on that fresh link adjacently, which is the co-arrival
+    /// [`BEACON_EPOCH_STAGGER_MS`] exists to prevent. Folding the two clocks into one would let a
+    /// node whose links flap faster than the refresh interval starve the periodic refresh entirely.
+    last_cur_beacon_emit_ms: u64,
+    /// Last time we emitted a receiver-beacon for a PAST epoch of [`MAILBOX_EPOCH_WINDOW`]
+    /// (security-privacy-r19-06). Its own clock, so the window's prefix keeps a full
+    /// [`RECV_BEACON_REFRESH_MS`] cadence while never sharing a publish with the current epoch.
+    last_window_beacon_ms: u64,
+    /// Which past epoch of [`MAILBOX_EPOCH_WINDOW`] the next window emission serves, as an offset
+    /// back from the current epoch (always >= 1). With `MAILBOX_EPOCH_WINDOW = 1` this is constant at
+    /// 1; it rotates so a wider window still emits ONE prefix per publish rather than a burst of
+    /// `MAILBOX_EPOCH_WINDOW` of them, which is the property this finding is about.
+    window_beacon_back: u64,
     /// Have we ever emitted a receiver-beacon? The beacon is a LINK-LOCAL record now, so a fresh
     /// link starts with no knowledge of us and must be told at link-up rather than inheriting it
     /// from the directory (the old flooded advert rode the link-up advert re-offer for free). This
@@ -1521,6 +1564,9 @@ impl<S: Store> Node<S> {
             clock_anchored: false,
             last_regossip_ms: 0,
             last_recv_beacon_ms: 0,
+            last_cur_beacon_emit_ms: 0,
+            last_window_beacon_ms: 0,
+            window_beacon_back: 1,
             has_beaconed: false,
             route_to_me: true,
             links: HashMap::new(),
@@ -3093,48 +3139,82 @@ impl<S: Store> Node<S> {
     /// "this address owns this mailbox". Nothing downstream ever consumed the full tag: the
     /// ownership check it enabled is moot under prefix routing (see [`Wire::RecvBeacon`]), and the
     /// gradient projected the tag to this same prefix immediately.
+    ///
+    /// This publishes the CURRENT mailbox epoch only. The past window of [`MAILBOX_EPOCH_WINDOW`] is
+    /// published by [`Node::publish_window_recv_beacon`], on its own clock and never in the same
+    /// publish, so what leaves this node is one prefix at a time (security-privacy-r19-06; see
+    /// [`BEACON_EPOCH_STAGGER_MS`]).
     pub fn publish_recv_beacon(&mut self) {
         self.has_beaconed = true;
+        self.last_cur_beacon_emit_ms = self.now_ms;
         let links: Vec<LinkId> = self.links.keys().copied().collect();
         for link in links {
-            self.publish_recv_beacon_on(link);
+            self.publish_recv_beacon_on(link, 0);
         }
     }
 
-    /// Our own receiver-beacon on ONE link. F-06: beacon the current mailbox epoch AND the past
-    /// window, so a private bundle addressed or spooled under a just-rotated tag (sender a bit
-    /// behind, or spooled before the boundary) is still routed and pulled. Distinct epochs usually
-    /// land in distinct prefix buckets, but not always at a 1-byte prefix, hence the dedup.
+    /// §39 F-06 + security-privacy-r19-06: publish ONE PAST epoch of [`MAILBOX_EPOCH_WINDOW`], so a
+    /// private bundle addressed or spooled under a just-rotated tag (a sender whose clock sits behind
+    /// the boundary, or a bundle minted before it and still in a blind spool) is still routed and
+    /// pulled after rotation.
     ///
-    /// security-privacy-r19-06, OPEN and stated rather than claimed away: this emits both prefixes
-    /// back to back on the SAME link, so our observable footprint per publish is `1 +
-    /// MAILBOX_EPOCH_WINDOW` prefixes, not one. Both are pure public functions of our public address
-    /// (`H(addr, e)[0]`, `H(addr, e-1)[0]`), so an observer that can attribute the pair to one source
-    /// and holds a candidate address confirms it at `1/65536` rather than the `1/256` the §39
-    /// anonymity-set figure quotes, and across `d` epoch boundaries the chain of overlapping pairs
-    /// yields `d + 1` bytes, a stable long-lived fingerprint. DESIGN.md §39 now states that figure and
-    /// the observer scope it applies to (a direct Noise neighbour already knows the beacon is ours, so
-    /// what it gains is selector width, not the fact of reachability). Closing it rather than
-    /// documenting it means not co-emitting the epochs attributably: stagger them, or serve the
-    /// previous epoch only from the spool. `a_recipients_beacon_footprint_per_publish_is_pinned` pins
-    /// the count so it cannot drift away from the documented figure unnoticed.
-    fn publish_recv_beacon_on(&mut self, link: LinkId) {
+    /// Separate from [`Node::publish_recv_beacon`] on purpose, and separated in TIME from it by
+    /// [`BEACON_EPOCH_STAGGER_MS`]: co-emitting the window with the current epoch was the finding.
+    /// Rotates through the window one epoch per call, so widening `MAILBOX_EPOCH_WINDOW` widens the
+    /// cycle rather than the per-publish footprint.
+    ///
+    /// Does nothing before the first current-epoch beacon (`has_beaconed`), so a passive recipient
+    /// stays silent, and nothing while no past epoch exists (a clock inside epoch 0), where
+    /// `saturating_sub` would re-emit the current prefix and make the "one prefix per publish"
+    /// property true only by accident.
+    fn publish_window_recv_beacon(&mut self) -> bool {
+        if !self.window_beacon_is_serviceable() {
+            return false;
+        }
+        let back = self.window_beacon_back;
+        self.last_window_beacon_ms = self.now_ms;
+        self.window_beacon_back = if back >= MAILBOX_EPOCH_WINDOW {
+            1
+        } else {
+            back + 1
+        };
+        let links: Vec<LinkId> = self.links.keys().copied().collect();
+        for link in links {
+            self.publish_recv_beacon_on(link, back);
+        }
+        true
+    }
+
+    /// Is there a past epoch of [`MAILBOX_EPOCH_WINDOW`] to serve right now? False before this node
+    /// has beaconed at all (a passive recipient stays silent), and false while the clock sits inside
+    /// epoch 0, where `saturating_sub` would re-emit the CURRENT prefix and make "one prefix per
+    /// publish" true only by accident. [`Node::tick`] folds this into its due test rather than only
+    /// into the emission, so an unserviceable window cannot win a tick and emit nothing.
+    fn window_beacon_is_serviceable(&self) -> bool {
+        MAILBOX_EPOCH_WINDOW >= 1
+            && self.has_beaconed
+            && mailbox_epoch(self.now_ms) >= self.window_beacon_back
+    }
+
+    /// Our own receiver-beacon on ONE link, for EXACTLY ONE mailbox epoch: the current one at
+    /// `back = 0`, or a past epoch of [`MAILBOX_EPOCH_WINDOW`] at `back >= 1`.
+    ///
+    /// security-privacy-r19-06, CLOSED here rather than documented. This used to loop
+    /// `0..=MAILBOX_EPOCH_WINDOW` and send a record per epoch, so one call put `H(addr, e)[0]` and
+    /// `H(addr, e - 1)[0]` on the SAME link back to back. Both are pure public functions of our public
+    /// address, so an observer that could attribute that pair to one source tested a candidate address
+    /// at `1/65536` instead of the `1/256` the §39 anonymity-set figure quotes, and the shared prefix
+    /// bridged consecutive epochs across the rotation that exists to separate them. Emitting one epoch
+    /// per call is what removes the pair: a forwarder records each arrival separately and re-emits it
+    /// in a separate pass ([`Node::on_recv_beacon`] carries onward at ARRIVAL, on `changed`), so
+    /// nothing downstream ever sees two freshly-changed buckets arrive together from one upstream.
+    /// Pinned by `a_recipients_beacon_footprint_per_publish_is_pinned` (the count) and
+    /// `an_observer_never_sees_both_epoch_prefixes_co_arrive` (the observer-side property).
+    fn publish_recv_beacon_on(&mut self, link: LinkId, back: u64) {
         let addr = self.identity.address();
-        let cur = mailbox_epoch(self.now_ms);
-        let mut routes: Vec<crypto::MailboxRoute> = Vec::new();
-        for back in 0..=MAILBOX_EPOCH_WINDOW {
-            let epoch = cur.saturating_sub(back);
-            let route = crypto::mailbox_route(&crypto::mailbox_tag(&addr, epoch));
-            if !routes.contains(&route) {
-                routes.push(route);
-            }
-            if epoch == 0 {
-                break; // no older epochs exist
-            }
-        }
-        for route in routes {
-            self.send_record(link, &Wire::RecvBeacon { route, distance: 0 });
-        }
+        let epoch = mailbox_epoch(self.now_ms).saturating_sub(back);
+        let route = crypto::mailbox_route(&crypto::mailbox_tag(&addr, epoch));
+        self.send_record(link, &Wire::RecvBeacon { route, distance: 0 });
     }
 
     /// Whether we hold a forward-secret session with `addr`, i.e. messages to/from
@@ -7717,13 +7797,40 @@ impl<S: Store> Node<S> {
         self.reap_opks();
         // §39 P4: keep our receiver-beacon fresh (short interval ≪ its TTL) so the gradient toward
         // us stays alive and re-points if we move. Passive (max-privacy) recipients skip this.
-        if self.route_to_me
-            && now_ms.saturating_sub(self.last_recv_beacon_ms) >= RECV_BEACON_REFRESH_MS
-        {
+        //
+        // ONE epoch per tick, never both (security-privacy-r19-06). The current epoch owns the
+        // refresh interval; the past window rides its own interval and can only fire once
+        // BEACON_EPOCH_STAGGER_MS has passed since the last current-epoch emission, so the two never
+        // leave in one tick and never leave adjacently, whatever rate the host ticks at. The branches
+        // are mutually exclusive STRUCTURALLY, not only by the interval arithmetic, so a later edit to
+        // the arithmetic cannot silently re-create the burst.
+        //
+        // When both are due, the one that has waited LONGER wins. A plain "current epoch first" would
+        // starve the window outright on a host that ticks slower than the refresh interval: the
+        // current epoch would be due on every tick, take every tick, and the past window's bucket would
+        // never form at all. That cadence is already degraded for the current epoch (a tick slower than
+        // RECV_BEACON_REFRESH_MS cannot keep any lease inside RECV_BEACON_TTL_MS), and a permanently
+        // missing route is worse than a slower one. The whole scheme assumes `tick` is called well
+        // under the refresh interval, which is the same assumption RECV_BEACON_REFRESH_MS itself makes;
+        // at that rate each epoch keeps its full 30s cadence, half an interval apart.
+        let cur_age = now_ms.saturating_sub(self.last_recv_beacon_ms);
+        let window_age = now_ms.saturating_sub(self.last_window_beacon_ms);
+        let cur_due = self.route_to_me && cur_age >= RECV_BEACON_REFRESH_MS;
+        // Serviceability is part of DUE, not just of the emission. If a clock inside epoch 0 (no past
+        // epoch exists yet) could win the tick and then emit nothing, `last_window_beacon_ms` would
+        // never move, `window_age` would grow without bound, and the window branch would win every
+        // subsequent tick and starve the CURRENT epoch, which is the mirror image of the bug above.
+        let window_due = self.route_to_me
+            && self.window_beacon_is_serviceable()
+            && window_age >= RECV_BEACON_REFRESH_MS
+            && now_ms.saturating_sub(self.last_cur_beacon_emit_ms) >= BEACON_EPOCH_STAGGER_MS;
+        if cur_due && (!window_due || cur_age >= window_age) {
             self.last_recv_beacon_ms = now_ms;
-            // Emits current + window epochs, as the route PREFIX only. Nothing identifying leaves.
+            // Emits the CURRENT epoch's route PREFIX only. Nothing identifying leaves.
             self.publish_recv_beacon();
             self.beaconed_tick = true; // observability: emitted a recv-beacon this tick (see drain_beaconed)
+        } else if window_due && self.publish_window_recv_beacon() {
+            self.beaconed_tick = true;
         }
         // Retry any content still waiting on a prekey (it gossips, §25).
         self.flush_pending_content();
@@ -8143,8 +8250,16 @@ impl<S: Store> Node<S> {
             // flooded beacon rode the advert re-offer above and so reached a new peer at link-up for
             // free; a link-local record has to be sent explicitly, or a reconnecting peer would
             // blind-flood everything addressed to us until our next 30s refresh.
+            //
+            // The CURRENT epoch only, and it moves the stagger clock: the past window reaches this
+            // fresh link on its own interval, at least BEACON_EPOCH_STAGGER_MS later, so a link that
+            // comes up just before a window emission does not receive the pair adjacently
+            // (security-privacy-r19-06). The window's own gradient bucket therefore takes up to one
+            // refresh interval longer to form on a new link than it used to, which costs steering (a
+            // near-boundary bundle blind-floods, the §39 floor) and never delivery.
             if self.route_to_me && self.has_beaconed {
-                self.publish_recv_beacon_on(link);
+                self.last_cur_beacon_emit_ms = self.now_ms;
+                self.publish_recv_beacon_on(link, 0);
             }
             // Adverts (prekeys + presence) FIRST, then bulk bundles: a peer needs our prekey to
             // open a forward-secret session to us, so it must not sit behind a burst of relay-bundle
@@ -14640,31 +14755,46 @@ mod tests {
         // already called `true_hops`, so the RECIPIENT's UI was right and the SENDER's was wrong by
         // the whole blind, with no way to correct it downstream: Alice never sees the recognition
         // secret. Two hops were reported as anything from 2 to 102.
-        let mut nodes = [
-            Node::new(Identity::generate()), // 0 Alice
-            Node::new(Identity::generate()), // 1 Carol (relay)
-            Node::new(Identity::generate()), // 2 Bob
-        ];
-        let mut net = Wire2::new();
-        net.connect(&mut nodes, 0, 1, 1, 1);
-        net.connect(&mut nodes, 1, 2, 2, 2);
-        exchange_prekeys(&mut net, &mut nodes);
-
-        let bob = nodes[2].address();
-        let id = nodes[0]
-            .send_message(bob, "t".into(), b"count my hops".to_vec(), true)
-            .unwrap();
         // The blind is what makes this test meaningful: with a zero blind the bug is invisible.
-        let blind = nodes[0]
-            .store
-            .get(&id)
-            .expect("sender holds its send")
-            .env
-            .hops;
-        assert!(
-            blind > 0,
-            "the send must carry a non-zero hop blind for this to prove anything"
-        );
+        // It is drawn per-bundle in 0..=MAX_HOP_BLIND (100), so about one run in 101 legitimately
+        // draws 0. That used to FAIL outright, reddening CI on a coin flip rather than a regression
+        // (observed: 1 failure in 25 full-suite runs, 0 in 60 isolated). Re-draw instead of
+        // asserting: the property under test does not depend on WHICH non-zero blind was drawn,
+        // only that one was, so retrying preserves the assertion's intent exactly. The attempt cap
+        // keeps a genuinely broken blind loud instead of hanging.
+        let (mut nodes, mut net, id) = {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                assert!(
+                    attempt <= 64,
+                    "64 consecutive zero hop blinds is not chance; the blind is broken"
+                );
+                let mut nodes = [
+                    Node::new(Identity::generate()), // 0 Alice
+                    Node::new(Identity::generate()), // 1 Carol (relay)
+                    Node::new(Identity::generate()), // 2 Bob
+                ];
+                let mut net = Wire2::new();
+                net.connect(&mut nodes, 0, 1, 1, 1);
+                net.connect(&mut nodes, 1, 2, 2, 2);
+                exchange_prekeys(&mut net, &mut nodes);
+
+                let bob = nodes[2].address();
+                let id = nodes[0]
+                    .send_message(bob, "t".into(), b"count my hops".to_vec(), true)
+                    .unwrap();
+                let blind = nodes[0]
+                    .store
+                    .get(&id)
+                    .expect("sender holds its send")
+                    .env
+                    .hops;
+                if blind > 0 {
+                    break (nodes, net, id);
+                }
+            }
+        };
         net.pump(&mut nodes);
 
         let received = nodes[2].inbox_items();
@@ -14817,15 +14947,26 @@ mod tests {
             "a recipient's mailbox-tag must differ across epochs"
         );
 
-        // With every node advanced into epoch 1, B's beacon lays a gradient for BOTH the current
+        // With every node advanced into epoch 1, B's beacons lay a gradient for BOTH the current
         // (epoch 1) and previous (epoch 0) mailbox tags, so a bundle addressed just before the
         // rotation boundary (sender a bit behind) still routes instead of being stranded.
+        //
+        // security-privacy-r19-06: the two epochs no longer ride ONE publish. The current epoch goes
+        // out on the refresh interval and the past window on its own, at least
+        // BEACON_EPOCH_STAGGER_MS later, so covering the window now takes two ticks instead of one.
+        // This test is the AVAILABILITY half of that change (the window is still served); the
+        // separation itself is pinned by `an_observer_never_sees_both_epoch_prefixes_co_arrive`, which
+        // controls the topology tightly enough to assert an absence without a 1-in-256 prefix
+        // collision against another node's own bucket turning into a flake.
         let (mut nodes, mut net) = gradient_topology(); // A, R, B, D ; prekeys already exchanged
         for n in nodes.iter_mut() {
-            n.tick(MAILBOX_EPOCH_MS); // all clocks in epoch 1
+            n.tick(MAILBOX_EPOCH_MS); // all clocks in epoch 1: the current-epoch beacon fires
+        }
+        net.pump(&mut nodes);
+        for n in nodes.iter_mut() {
+            n.tick(MAILBOX_EPOCH_MS + BEACON_EPOCH_STAGGER_MS); // the staggered window beacon fires
         }
         let baddr = nodes[2].address();
-        nodes[2].publish_recv_beacon();
         net.pump(&mut nodes);
 
         // sec-priv-04: gradient keys on the tag's routing prefix (route_key).
@@ -15176,66 +15317,336 @@ mod tests {
         );
     }
 
+    /// A route_to_me identity whose CURRENT and PREVIOUS epoch route prefixes differ at `now`, plus
+    /// those two prefixes. At a 1-byte prefix the two epochs collide 1 in 256 of the time, and a
+    /// colliding identity makes every overlap-window assertion below vacuously true (one prefix
+    /// because the pair is one byte, not because anything staggers it), so search for a
+    /// non-colliding one rather than asserting on whatever `generate` happens to hand back.
+    fn identity_with_distinct_epoch_prefixes(
+        now: u64,
+    ) -> (Identity, crypto::MailboxRoute, crypto::MailboxRoute) {
+        let epoch = mailbox_epoch(now);
+        assert!(
+            epoch >= MAILBOX_EPOCH_WINDOW && MAILBOX_EPOCH_WINDOW >= 1,
+            "the clock must sit far enough in for a past epoch to exist, or there is no pair to test"
+        );
+        for _ in 0..4096 {
+            let identity = Identity::generate();
+            let addr = identity.address();
+            let cur = crypto::mailbox_route(&crypto::mailbox_tag(&addr, epoch));
+            let prev = crypto::mailbox_route(&crypto::mailbox_tag(&addr, epoch - 1));
+            if cur != prev {
+                return (identity, cur, prev);
+            }
+        }
+        panic!("255 of 256 identities have distinct epoch prefixes; 4096 misses is a broken derivation");
+    }
+
     #[test]
     fn a_recipients_beacon_footprint_per_publish_is_pinned() {
         // security-privacy-r19-06 closure item 1: pin how many distinct route prefixes ONE route_to_me
         // recipient puts on one link per publish, because that count IS the anonymity claim.
         //
-        // `publish_recv_beacon_on` emits the current epoch AND MAILBOX_EPOCH_WINDOW past epochs, so the
-        // footprint is up to 1 + MAILBOX_EPOCH_WINDOW prefixes, not 1. Both are pure public functions
-        // of a public address, so an observer that can attribute the pair to one source and holds a
-        // candidate address tests it at 1/(256^footprint), not 1/256. DESIGN.md §39 now states that
-        // figure and the observer scope it applies to; this test is what stops the count drifting away
-        // from the stated figure unnoticed.
+        // It is exactly ONE, and it is the CURRENT epoch's. `publish_recv_beacon_on` used to loop
+        // 0..=MAILBOX_EPOCH_WINDOW and send a record per epoch, so one publish put H(addr, e)[0] and
+        // H(addr, e-1)[0] on the same link back to back. Both are pure public functions of a public
+        // address, so an observer that could attribute the pair tested a candidate at 1/(256^2)
+        // instead of the 1/256 DESIGN.md §39 quotes. The pair is gone from the publish; the past
+        // window rides publish_window_recv_beacon on its own clock.
+        //
         // Measured on the OBSERVER, from records that actually crossed the link, not recomputed from
         // the emitting loop: the observer lays one gradient bucket per distinct prefix it received.
+        let now = MAILBOX_EPOCH_MS * 5 + 1;
+        let (recipient, cur, prev) = identity_with_distinct_epoch_prefixes(now);
         let mut nodes = [
             Node::new(Identity::generate()), // 0 the direct link peer, i.e. the observer
-            Node::new(Identity::generate()), // 1 the route_to_me recipient
+            Node::new(recipient),            // 1 the route_to_me recipient
         ];
         let mut net = Wire2::new();
-        // A clock several epochs in, so a previous epoch genuinely exists. At epoch 0 the publish loop
-        // breaks early and the footprint really is 1, which would make this test vacuous.
-        let now = MAILBOX_EPOCH_MS * 5 + 1;
-        assert!(
-            mailbox_epoch(now) >= MAILBOX_EPOCH_WINDOW,
-            "a past epoch must exist for the overlap window to be observable"
-        );
         nodes[0].set_time(now);
         nodes[1].set_time(now);
         net.connect(&mut nodes, 0, 5, 1, 6);
+        assert_eq!(
+            nodes[0].recv_gradient.len(),
+            0,
+            "the observer starts with an empty gradient"
+        );
 
-        let before = nodes[0].recv_gradient.len();
         nodes[1].publish_recv_beacon();
         net.pump(&mut nodes);
-        let footprint = nodes[0]
+        let observed: Vec<Tag> = nodes[0]
             .recv_gradient
-            .values()
-            .filter(|e| e.links.iter().any(|(l, _)| *l == 5))
-            .count();
-        assert_eq!(before, 0, "the observer starts with an empty gradient");
-
-        let addr = nodes[1].address();
-        let epoch = mailbox_epoch(now);
-        let cur = crypto::mailbox_route(&crypto::mailbox_tag(&addr, epoch));
-        let prev = crypto::mailbox_route(&crypto::mailbox_tag(&addr, epoch - 1));
-        let distinct_epoch_prefixes = if cur == prev { 1 } else { 2 };
+            .iter()
+            .filter(|(_, e)| e.links.iter().any(|(l, _)| *l == 5))
+            .map(|(k, _)| *k)
+            .collect();
         assert_eq!(
-            footprint, distinct_epoch_prefixes,
-            "ONE publish puts {distinct_epoch_prefixes} distinct route prefix(es) on one link \
-             (current epoch + MAILBOX_EPOCH_WINDOW = {MAILBOX_EPOCH_WINDOW} past epochs, deduped). \
-             DESIGN.md §39 sizes the pair-attributing observer's anonymity set as \
-             N/(256^footprint); re-check that figure if this count changes."
+            observed.len(),
+            1,
+            "ONE publish puts exactly ONE route prefix on one link, so the §39 anonymity set stays \
+             N/256 rather than N/(256^(1 + MAILBOX_EPOCH_WINDOW)). Observed {} buckets.",
+            observed.len()
         );
-        // Not vacuous: at a 1-byte prefix the two epochs collide 1-in-256 of the time, so only assert
-        // the pair is really observable when the addresses did not collide.
-        if distinct_epoch_prefixes == 2 {
+        assert_eq!(
+            observed[0],
+            route_key_from_prefix(&cur),
+            "and the one prefix is the CURRENT epoch's, the one a sender actually stamps"
+        );
+        assert!(
+            !nodes[0]
+                .recv_gradient
+                .contains_key(&route_key_from_prefix(&prev)),
+            "the PREVIOUS epoch's prefix must not ride the same publish; that co-emission is the \
+             finding, and this identity's two epoch prefixes are known to differ"
+        );
+    }
+
+    #[test]
+    fn an_observer_never_sees_both_epoch_prefixes_co_arrive() {
+        // security-privacy-r19-06, the closure proof. The in-scope observer is at distance >= 1: it
+        // receives a forwarder's re-emissions, not the recipient's own records, so its only route to
+        // attributing two prefixes to ONE upstream recipient is their arriving TOGETHER, freshly
+        // changed, in one re-emission pass. (A direct Noise neighbour is out of scope by construction:
+        // link auth already tells it whose beacon this is, so it can compute both prefixes itself and
+        // the beacon adds nothing. DESIGN.md §39 states that scope.)
+        //
+        // Topology: observer F <- forwarder G <- recipient B. B is the ONLY beaconing node behind G,
+        // which is the WORST case for B, so a pass here is not an artefact of a busy forwarder.
+        //
+        // What is asserted: (1) no single pump ever delivers both of B's epoch prefixes to F,
+        // (2) both DO eventually arrive, so the overlap window still does its availability job and
+        // the test cannot pass by the window simply never being served, and (3) their first arrivals
+        // are at least BEACON_EPOCH_STAGGER_MS apart on the wall clock.
+        let start = MAILBOX_EPOCH_MS * 5 + 1;
+        let (recipient, cur, prev) = identity_with_distinct_epoch_prefixes(start);
+        let cur_key = route_key_from_prefix(&cur);
+        let prev_key = route_key_from_prefix(&prev);
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 F, the distance-1 observer
+            Node::new(Identity::generate()), // 1 G, the forwarder
+            Node::new(recipient),            // 2 B, the route_to_me recipient
+        ];
+        // Only B beacons. F and G are pure observers/forwarders here, so nothing of THEIR own can be
+        // mistaken for one of B's two prefixes.
+        nodes[0].set_route_to_me(false);
+        nodes[1].set_route_to_me(false);
+        let mut net = Wire2::new();
+        for node in nodes.iter_mut() {
+            node.set_time(start);
+        }
+        net.connect(&mut nodes, 1, 11, 0, 10); // G <-> F
+        net.connect(&mut nodes, 1, 12, 2, 20); // G <-> B
+
+        // Step at a realistic driver cadence, well under the refresh interval, for long enough that
+        // the window epoch has several chances to be served.
+        let step = 1_000;
+        let steps = (RECV_BEACON_REFRESH_MS * 6 / step) as usize;
+        let mut cur_first_seen: Option<u64> = None;
+        let mut prev_first_seen: Option<u64> = None;
+        for i in 1..=steps {
+            let now = start + step * i as u64;
+            let had_cur = nodes[0].recv_gradient.contains_key(&cur_key);
+            let had_prev = nodes[0].recv_gradient.contains_key(&prev_key);
+            for node in nodes.iter_mut() {
+                node.tick(now);
+            }
+            net.pump(&mut nodes);
+            let got_cur = nodes[0].recv_gradient.contains_key(&cur_key) && !had_cur;
+            let got_prev = nodes[0].recv_gradient.contains_key(&prev_key) && !had_prev;
             assert!(
-                footprint > 1,
-                "the overlap window is why the footprint is a PAIR; the single-prefix claim is the \
-                 one that would be false"
+                !(got_cur && got_prev),
+                "at t={now} the observer learned BOTH of the recipient's epoch prefixes in one pass; \
+                 that co-arrival IS the finding, because it is what lets a distance-1 observer treat \
+                 the pair as one recipient's 2-byte selector"
+            );
+            if got_cur {
+                cur_first_seen = Some(now);
+            }
+            if got_prev {
+                prev_first_seen = Some(now);
+            }
+        }
+
+        let cur_at =
+            cur_first_seen.expect("the current epoch's prefix must reach a distance-1 observer");
+        let prev_at = prev_first_seen.expect(
+            "the PAST window's prefix must still reach a distance-1 observer, or the overlap window \
+             has been closed by deleting the availability it exists for rather than by staggering it",
+        );
+        let gap = cur_at.abs_diff(prev_at);
+        assert!(
+            gap >= BEACON_EPOCH_STAGGER_MS,
+            "the two epoch prefixes reached the observer {gap} ms apart; the stagger promises at \
+             least {BEACON_EPOCH_STAGGER_MS} ms, which is what puts them in different re-emission \
+             passes at every forwarder rather than adjacent records in one"
+        );
+    }
+
+    #[test]
+    fn an_epoch_zero_clock_keeps_beaconing_the_current_epoch() {
+        // security-privacy-r19-06, the mirror image of the starvation above. The past window is
+        // UNSERVICEABLE while the clock sits inside epoch 0 (there is no earlier epoch), so if the
+        // window branch could win a tick and then emit nothing, its own clock would never advance, its
+        // age would grow without bound, it would win every subsequent tick on the more-overdue-wins
+        // rule, and the CURRENT epoch would stop being beaconed entirely after the first emission.
+        //
+        // The control is folding serviceability into the DUE test rather than only into the emission.
+        // A node on a low clock is not exotic: it is every node whose host has not yet supplied a real
+        // wall-clock time, and a node that silently stops beaconing is invisible until delivery fails.
+        let mut node = Node::new(Identity::generate());
+        assert_eq!(
+            mailbox_epoch(RECV_BEACON_REFRESH_MS * 8),
+            0,
+            "this test is only meaningful while the whole run stays inside epoch 0"
+        );
+        for i in 1..=8u64 {
+            node.tick(RECV_BEACON_REFRESH_MS * i);
+            assert!(
+                node.drain_beaconed(),
+                "refresh interval {i}: a route_to_me node must emit its CURRENT-epoch beacon on every \
+                 refresh interval. An unserviceable past window must never win the tick."
             );
         }
+    }
+
+    #[test]
+    fn a_slow_ticking_host_still_gets_the_past_window_served() {
+        // security-privacy-r19-06, the starvation edge the stagger introduced. Splitting the two
+        // epochs across separate ticks means one of them can be starved by a scheduling policy, and a
+        // permanently missing route is a worse bug than the co-emission this change closed. A host
+        // that ticks SLOWER than RECV_BEACON_REFRESH_MS leaves the current epoch due on every single
+        // tick, so a plain "current epoch first" rule would take every tick forever and the past
+        // window's bucket would never form at all.
+        //
+        // The control is the more-overdue-wins tie-break in `tick`. This pins the outcome, not the
+        // rule: both prefixes must reach the peer, and still never in one pass.
+        let start = MAILBOX_EPOCH_MS * 5 + 1;
+        let (recipient, cur, prev) = identity_with_distinct_epoch_prefixes(start);
+        let cur_key = route_key_from_prefix(&cur);
+        let prev_key = route_key_from_prefix(&prev);
+        let mut nodes = [
+            Node::new(Identity::generate()), // 0 the peer
+            Node::new(recipient),            // 1 the route_to_me recipient
+        ];
+        nodes[0].set_route_to_me(false);
+        let mut net = Wire2::new();
+        for node in nodes.iter_mut() {
+            node.set_time(start);
+        }
+        net.connect(&mut nodes, 0, 7, 1, 8);
+
+        // Deliberately pathological: three times the refresh interval between ticks, so the current
+        // epoch is over-due at every single one.
+        //
+        // Measured as "was it ever SERVED", not "is it present at the end". At this tick rate each
+        // epoch is emitted every second tick, i.e. every 6 x RECV_BEACON_REFRESH_MS, which is far past
+        // RECV_BEACON_TTL_MS, so both leases lapse between emissions and the end state is whichever
+        // one went out last. That expiry is the host's tick rate failing the beacon system, not the
+        // stagger: at this cadence the ORIGINAL code could not hold a lease either. What the stagger
+        // must not do is make one epoch permanently unreachable, and that is what this asserts.
+        let step = RECV_BEACON_REFRESH_MS * 3;
+        let mut served_cur = false;
+        let mut served_prev = false;
+        for i in 1..=8u64 {
+            let now = start + step * i;
+            let had_cur = nodes[0].recv_gradient.contains_key(&cur_key);
+            let had_prev = nodes[0].recv_gradient.contains_key(&prev_key);
+            for node in nodes.iter_mut() {
+                node.tick(now);
+            }
+            net.pump(&mut nodes);
+            let got_cur = nodes[0].recv_gradient.contains_key(&cur_key) && !had_cur;
+            let got_prev = nodes[0].recv_gradient.contains_key(&prev_key) && !had_prev;
+            assert!(
+                !(got_cur && got_prev),
+                "even under a starved schedule the two epochs must not arrive in one pass"
+            );
+            served_cur |= got_cur;
+            served_prev |= got_prev;
+        }
+        assert!(served_cur, "the current epoch reaches the peer");
+        assert!(
+            served_prev,
+            "and so does the past window: a tick slower than the refresh interval must not let the \
+             current epoch win every tick and starve the window's bucket out of existence entirely"
+        );
+    }
+
+    #[test]
+    fn a_fresh_link_never_receives_both_epoch_prefixes_back_to_back() {
+        // security-privacy-r19-06, the OTHER emission path. Link-up beacons immediately, outside the
+        // tick refresh, because a reconnecting peer would otherwise blind-flood everything addressed
+        // to us until the next refresh. That path is where the stagger is easiest to lose: the link-up
+        // record goes out on its own clock, so a link coming up a moment before a window emission was
+        // due would hand that fresh link the current epoch and then the past one milliseconds later,
+        // re-creating exactly the adjacent pair the tick path no longer emits.
+        //
+        // The control is that link-up moves `last_cur_beacon_emit_ms`, which is the stagger reference,
+        // so the window emission is pushed a full BEACON_EPOCH_STAGGER_MS past the link-up rather than
+        // past the last periodic refresh.
+        let start = MAILBOX_EPOCH_MS * 5 + 1;
+        let (recipient, cur, prev) = identity_with_distinct_epoch_prefixes(start);
+        let cur_key = route_key_from_prefix(&cur);
+        let prev_key = route_key_from_prefix(&prev);
+        let mut nodes = [
+            Node::new(recipient),            // 0 B, the route_to_me recipient
+            Node::new(Identity::generate()), // 1 an established peer
+            Node::new(Identity::generate()), // 2 the peer whose link comes up late
+        ];
+        nodes[1].set_route_to_me(false);
+        nodes[2].set_route_to_me(false);
+        let mut net = Wire2::new();
+        for node in nodes.iter_mut() {
+            node.set_time(start);
+        }
+        net.connect(&mut nodes, 0, 1, 1, 2); // B <-> established peer
+
+        // One periodic refresh, so B has beaconed at all (link-up stays silent before that) and the
+        // window emission is armed and pending.
+        let refreshed_at = start + RECV_BEACON_REFRESH_MS;
+        for node in nodes.iter_mut() {
+            node.tick(refreshed_at);
+        }
+        net.pump(&mut nodes);
+
+        // Bring the new link up one millisecond before the window emission would have been due
+        // against the PERIODIC clock. That is the worst case for the fresh link.
+        let link_up_at = refreshed_at + BEACON_EPOCH_STAGGER_MS - 1;
+        for node in nodes.iter_mut() {
+            node.set_time(link_up_at);
+        }
+        net.connect(&mut nodes, 0, 3, 2, 4); // B <-> the fresh peer
+        assert!(
+            nodes[2].recv_gradient.contains_key(&cur_key),
+            "link-up must still deliver the CURRENT epoch immediately, or a reconnecting peer \
+             blind-floods everything addressed to us until the next refresh"
+        );
+        assert!(
+            !nodes[2].recv_gradient.contains_key(&prev_key),
+            "and it must NOT carry the past window in the same breath"
+        );
+
+        // Step forward and find when the fresh link is told the past epoch.
+        let step = 500;
+        let mut prev_at: Option<u64> = None;
+        for i in 1..=((RECV_BEACON_REFRESH_MS * 3 / step) as usize) {
+            let now = link_up_at + step * i as u64;
+            for node in nodes.iter_mut() {
+                node.tick(now);
+            }
+            net.pump(&mut nodes);
+            if prev_at.is_none() && nodes[2].recv_gradient.contains_key(&prev_key) {
+                prev_at = Some(now);
+            }
+        }
+        let prev_at = prev_at.expect("the past window must still reach the fresh link eventually");
+        let gap = prev_at - link_up_at;
+        assert!(
+            gap >= BEACON_EPOCH_STAGGER_MS,
+            "the fresh link got the past epoch {gap} ms after the current one; the stagger promises \
+             at least {BEACON_EPOCH_STAGGER_MS} ms measured from the LINK-UP emission, not from the \
+             last periodic refresh"
+        );
     }
 
     #[test]

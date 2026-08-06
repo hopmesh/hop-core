@@ -20,7 +20,7 @@ use crate::session::{Header, RatchetMessage};
 use crate::store::HaveSet;
 
 pub const CORPUS_SCHEMA: u32 = 1;
-pub const CORPUS_FILE: &str = "vectors/bundle-v14.json";
+pub const CORPUS_FILE: &str = "vectors/bundle-v15.json";
 
 const CREATED_AT: u64 = 1_725_000_123_456;
 const LIFETIME_MS: u32 = 604_800_000;
@@ -1353,7 +1353,7 @@ mod tests {
         // Deliberately a LITERAL, not `BUNDLE_VERSION`: comparing the constant to itself would
         // pass through any bump unread. This line is the tripwire that makes a bump a decision,
         // so update it only after checking the corpus really was regenerated for that version.
-        assert_eq!(corpus.bundle_version, 14);
+        assert_eq!(corpus.bundle_version, 15);
         let destinations: BTreeSet<_> = corpus
             .destinations
             .iter()
