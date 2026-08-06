@@ -5,6 +5,7 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- rustfmt drift and two overstated lines in the sec-relay-p1 write-up (b25d258)
 - per-mirror repository, and retryable release artifacts (bf04449)
 - fmt drift, orphaned doc comments, and Android tests that raced the network (dc44ef4)
 - two bugs in my own one-time-prekey work, plus three CI breaks (93859f8)
@@ -38,6 +39,8 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- record the relay link-identity gap, and what sec-relay-p1 did and did not close (951093a)
+- regenerate from conventional commits (3b47a5f)
 - regenerate from conventional commits (ffb2acb)
 - regenerate from conventional commits (e19ed95)
 - regenerate from conventional commits (7a81fb6)
@@ -82,8 +85,11 @@ git-cliff. Do not edit by hand.
 - observe bundle-per-link transfers for the swarm viz (325a0ae)
 
 ### Other
+- key the presence index, de-fingerprint the delivery vaccine (e25fff5)
 - rustfmt the new relay-pool onion tests (28abe6c)
 - prove .onion relays flow through the pool, and add an Apple SOCKS hook (8a0d9f3)
+- narrow the mailbox-prefix guard's version scope to a real time claim (21f23df)
+- close PROTO-004 and PROTO-006 (wire v15) (47794bb)
 - bump our crates in every standalone/vendored Cargo.lock (aad3ff7)
 - scope two vaccine-budget claims to what they actually bound (bb5302b)
 - give the deferred vaccine drain its own pass budget so a flood cannot starve it (8d15430)
@@ -126,6 +132,7 @@ git-cliff. Do not edit by hand.
 - remove Destination::InternetEgress (mesh-visible internet-bound leak) (5dd64d3)
 
 ### Testing
+- re-draw the hop blind instead of failing when it lands on zero (40ae390)
 - replace a tautological custody assertion and correct two more overclaiming comments (890cba1)
 - close store.rs and hps.rs coverage gaps to 100 percent (#81) (0f9ad2d)
 
